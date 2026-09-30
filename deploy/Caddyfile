@@ -1,0 +1,27 @@
+(doh_upstream) {
+	reverse_proxy 127.0.0.1:8787 {
+		# The DoH decides the operator pool by the client address it sees in X-Real-IP. Direct
+		# connections: overwrite it with the TCP peer, so a client cannot claim another network.
+		# Behind a CDN that sets X-Real-IP to the real client, remove this line and let the CDN's
+		# value through (and only accept connections from the CDN).
+		header_up X-Real-IP {remote_host}
+		# A DoH restart (config change) closes the port for a second or two. Hold queries until it is
+		# back instead of answering 502: a browser in secure-DNS mode turns a failed DoH query into a
+		# failed page load and then backs off from the server for a while.
+		lb_try_duration 5s
+		lb_try_interval 100ms
+	}
+}
+
+doh.example.com {
+	# /dns-query is the RFC 8484 endpoint; /linuxdo is the same service under a friendlier name.
+	handle {
+		rewrite /linuxdo /dns-query
+		import doh_upstream
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		-Server
+	}
+}

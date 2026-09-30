@@ -1,0 +1,19 @@
+[Unit]
+Description=Edge Smart DoH Meta ECH key check (real handshake; recovers retry_configs on rotation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=echprobe
+Group=echprobe
+EnvironmentFile=/etc/echprobe/env
+ExecStart=/usr/local/bin/echprobe \
+  -doh ${DOH_URL} -doh-ip ${DOH_IP} \
+  -meta-check ${META_HOST} -timeout 8s \
+  -health ${HEALTH_URL} -report-source ${SOURCE} -meta-ttl ${META_TTL}
+TimeoutStartSec=2min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict

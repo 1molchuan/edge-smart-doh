@@ -1,0 +1,298 @@
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { dirname } from "node:path";
+import { handleRequest, type RequestRuntime, type WaitUntilContext } from "../src/index";
+
+const DEFAULTS = {
+  UPSTREAMS: "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query",
+  ECS_UPSTREAMS: "",
+  UPSTREAM_TIMEOUT_MS: "2500",
+  UPSTREAM_HEDGE_MS: "100",
+  CACHE_MIN_TTL: "30",
+  CACHE_MAX_TTL: "3600",
+  NEGATIVE_CACHE_MAX_TTL: "300",
+  CACHE_STALE_TTL: "86400",
+  CACHE_PREFETCH_PERCENT: "10",
+  ECS_MODE: "rules",
+  ECS_DOMAINS: ".cn",
+  ECS_IPV4_PREFIX: "24",
+  ECS_IPV6_PREFIX: "48",
+  EDGEONE_CLIENT_IP_HEADER: "X-EdgeOne-Client-IP-Configure-Me",
+  CF_REWRITE_ENABLED: "false",
+  CF_PREFERRED_DOMAIN: "",
+  CF_PREFERRED_IPV4: "",
+  CF_PREFERRED_IPV6: "",
+  CF_DROP_AAAA: "false",
+  ADMIN_TOKEN: "",
+  HUB_TOKEN: "",
+  ISP_TABLE_URL: "",
+  CF_IPV4_URL: "https://www.cloudflare.com/ips-v4/",
+  CF_IPV6_URL: "https://www.cloudflare.com/ips-v6/",
+  RULES_JSON: "[]",
+  RULES_URL: "",
+  ECH_ENABLED: "false",
+  ECH_CONFIG_BASE64: "",
+  ECH_DOMAINS: "",
+  ECH_SOURCE_DOMAIN: "cloudflare-ech.com",
+  META_ECH_CONFIG_BASE64: "",
+  META_DOMAINS: ".facebook.com,.facebook.net,.fbcdn.net,.fbsbx.com,.instagram.com,.cdninstagram.com,.threads.net,.whatsapp.com,.whatsapp.net,.messenger.com",
+  X_DOMAINS: "x.com,.x.com,twitter.com,.twitter.com,twimg.com,.twimg.com,t.co",
+  GITHUB_DOMAINS: "",
+  DYNAMIC_RULE_HOSTS: "paste.rs,raw.githubusercontent.com,gist.githubusercontent.com",
+  DYNAMIC_RULES_MAX_BYTES: "262144",
+  DEBUG: "false",
+  LOG_QUERIES: "false",
+  MAX_DNS_PACKET_SIZE: "4096",
+} as const;
+
+interface StoredResponse {
+  body: ArrayBuffer;
+  headers: [string, string][];
+  status: number;
+  statusText: string;
+  expiresAt: number;
+}
+
+class MemoryCache {
+  private readonly entries = new Map<string, StoredResponse>();
+  private readonly maximumEntries = numberFromEnvironment("CACHE_MAX_ENTRIES", 4096, 128, 65536);
+
+  /** Snapshot live entries as [key, headers, status, statusText, expiresAt, base64 body] rows. */
+  export(): unknown[] {
+    const now = Date.now();
+    const rows: unknown[] = [];
+    for (const [key, stored] of this.entries) {
+      if (stored.expiresAt <= now) continue;
+      rows.push([key, stored.headers, stored.status, stored.statusText, stored.expiresAt, Buffer.from(stored.body).toString("base64")]);
+    }
+    return rows;
+  }
+
+  import(rows: unknown[]): number {
+    const now = Date.now();
+    let loaded = 0;
+    for (const row of rows) {
+      if (!Array.isArray(row) || row.length !== 6) continue;
+      const [key, headers, status, statusText, expiresAt, body] = row as [string, [string, string][], number, string, number, string];
+      if (typeof key !== "string" || typeof expiresAt !== "number" || expiresAt <= now || typeof body !== "string") continue;
+      const bytes = Buffer.from(body, "base64");
+      this.entries.set(key, {
+        body: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+        headers,
+        status,
+        statusText,
+        expiresAt,
+      });
+      loaded += 1;
+      if (this.entries.size > this.maximumEntries) break;
+    }
+    return loaded;
+  }
+
+  async match(request: RequestInfo | URL): Promise<Response | undefined> {
+    const key = cacheKey(request);
+    const stored = this.entries.get(key);
+    if (!stored) return undefined;
+    if (stored.expiresAt <= Date.now()) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    this.entries.delete(key);
+    this.entries.set(key, stored);
+    return new Response(stored.body.slice(0), {
+      status: stored.status,
+      statusText: stored.statusText,
+      headers: stored.headers,
+    });
+  }
+
+  async put(request: RequestInfo | URL, response: Response): Promise<void> {
+    const maxAge = parseMaxAge(response.headers.get("Cache-Control"));
+    if (maxAge <= 0) return;
+    const key = cacheKey(request);
+    this.entries.delete(key);
+    this.entries.set(key, {
+      body: await response.clone().arrayBuffer(),
+      headers: [...response.headers.entries()],
+      status: response.status,
+      statusText: response.statusText,
+      expiresAt: Date.now() + maxAge * 1000,
+    });
+    while (this.entries.size > this.maximumEntries) {
+      const oldest = this.entries.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.entries.delete(oldest);
+    }
+  }
+}
+
+function cacheKey(request: RequestInfo | URL): string {
+  if (request instanceof Request) return `${request.method}:${request.url}`;
+  return `GET:${request instanceof URL ? request.href : request}`;
+}
+
+function parseMaxAge(value: string | null): number {
+  const match = value?.match(/(?:^|,)\s*(?:s-maxage|max-age)=(\d+)/i);
+  return match?.[1] ? Number.parseInt(match[1], 10) : 0;
+}
+
+function numberFromEnvironment(name: string, fallback: number, minimum: number, maximum: number): number {
+  const value = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(value) ? Math.max(minimum, Math.min(maximum, value)) : fallback;
+}
+
+const memoryCache = new MemoryCache();
+const cacheStorage = {
+  default: memoryCache,
+  open: async () => memoryCache,
+} as unknown as CacheStorage;
+Object.defineProperty(globalThis, "caches", { configurable: true, value: cacheStorage });
+
+const cachePersistPath = process.env.CACHE_PERSIST_PATH || "";
+
+function loadPersistedCache(): void {
+  if (!cachePersistPath) return;
+  try {
+    const rows: unknown = JSON.parse(readFileSync(cachePersistPath, "utf8"));
+    if (Array.isArray(rows)) console.log(JSON.stringify({ event: "cache_loaded", entries: memoryCache.import(rows), path: cachePersistPath }));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.warn(JSON.stringify({ event: "cache_load_error", message: String(error) }));
+  }
+}
+
+function persistCache(): void {
+  if (!cachePersistPath) return;
+  try {
+    mkdirSync(dirname(cachePersistPath), { recursive: true });
+    const rows = memoryCache.export();
+    const tmp = `${cachePersistPath}.tmp`;
+    writeFileSync(tmp, JSON.stringify(rows));
+    renameSync(tmp, cachePersistPath);
+    console.log(JSON.stringify({ event: "cache_saved", entries: rows.length, path: cachePersistPath }));
+  } catch (error) {
+    console.warn(JSON.stringify({ event: "cache_save_error", message: String(error) }));
+  }
+}
+
+const env = Object.fromEntries(
+  Object.entries(DEFAULTS).map(([name, fallback]) => [name, process.env[name] ?? fallback]),
+) as unknown as Env;
+
+function clientIp(request: Request): { value?: string; source?: string } {
+  const candidates: [string, string | null][] = [
+    ["X-Real-IP", request.headers.get("X-Real-IP")],
+    ["CF-Connecting-IP", request.headers.get("CF-Connecting-IP")],
+    ["X-Forwarded-For", request.headers.get("X-Forwarded-For")?.split(",", 1)[0]?.trim() ?? null],
+  ];
+  const match = candidates.find(([, value]) => Boolean(value));
+  return match ? { value: match[1]!, source: match[0] } : {};
+}
+
+const runtime: RequestRuntime = {
+  clientIp(request) {
+    return clientIp(request).value;
+  },
+  probe(request) {
+    const client = clientIp(request);
+    return {
+      provider: "azure-vps",
+      region: process.env.AZURE_REGION ?? "japanwest",
+      clientIp: client.value,
+      clientIpSource: client.source,
+    };
+  },
+};
+
+const waitUntilContext: WaitUntilContext = {
+  waitUntil(promise) {
+    void promise.catch((error: unknown) => console.error("waitUntil failure", error));
+  },
+};
+
+async function readBody(request: IncomingMessage): Promise<Uint8Array | undefined> {
+  if (request.method === "GET" || request.method === "HEAD") return undefined;
+  const maximum = numberFromEnvironment("MAX_DNS_PACKET_SIZE", 4096, 512, 65535);
+  const chunks: Buffer[] = [];
+  let length = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    length += buffer.byteLength;
+    if (length > maximum) throw new Response("Request body too large", { status: 413 });
+    chunks.push(buffer);
+  }
+  return Uint8Array.from(Buffer.concat(chunks));
+}
+
+function requestUrl(request: IncomingMessage): URL {
+  const host = request.headers.host ?? "localhost";
+  const forwardedProtocol = request.headers["x-forwarded-proto"];
+  const protocol = typeof forwardedProtocol === "string" ? forwardedProtocol.split(",", 1)[0]!.trim() : "http";
+  return new URL(request.url ?? "/", `${protocol}://${host}`);
+}
+
+const publicHostnames = new Set(
+  (process.env.PUBLIC_HOSTNAMES ?? process.env.PUBLIC_HOSTNAME ?? "")
+    .split(",")
+    .map((hostname) => hostname.trim().toLowerCase())
+    .filter(Boolean),
+);
+
+function validateHostname(url: URL): boolean {
+  const hostname = url.hostname.toLowerCase();
+  return publicHostnames.size === 0 || publicHostnames.has(hostname) || hostname === "127.0.0.1" || hostname === "localhost";
+}
+
+async function sendResponse(response: Response, target: ServerResponse): Promise<void> {
+  target.statusCode = response.status;
+  target.statusMessage = response.statusText;
+  response.headers.forEach((value, name) => target.setHeader(name, value));
+  target.end(Buffer.from(await response.arrayBuffer()));
+}
+
+const server = createServer(async (incoming, outgoing) => {
+  try {
+    const url = requestUrl(incoming);
+    if (!validateHostname(url)) {
+      await sendResponse(new Response("Misdirected request", { status: 421 }), outgoing);
+      return;
+    }
+    const body = await readBody(incoming);
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(incoming.headers)) {
+      if (Array.isArray(value)) value.forEach((item) => headers.append(name, item));
+      else if (value !== undefined) headers.set(name, value);
+    }
+    if (incoming.socket.remoteAddress && !headers.has("X-Real-IP")) headers.set("X-Real-IP", incoming.socket.remoteAddress);
+    const requestBody = body ? Uint8Array.from(body).buffer : undefined;
+    const request = new Request(url, { method: incoming.method, headers, body: requestBody });
+    await sendResponse(await handleRequest(request, env, waitUntilContext, runtime), outgoing);
+  } catch (error) {
+    if (error instanceof Response) await sendResponse(error, outgoing);
+    else {
+      console.error(error);
+      await sendResponse(new Response("Internal server error", { status: 500 }), outgoing);
+    }
+  }
+});
+
+const host = process.env.HOST ?? "127.0.0.1";
+const port = numberFromEnvironment("PORT", 8787, 1, 65535);
+loadPersistedCache();
+server.listen(port, host, () => console.log(JSON.stringify({ event: "listening", host, port })));
+
+// Periodic snapshot bounds the loss on an unclean exit (OOM kill, power loss).
+const persistTimer = cachePersistPath ? setInterval(persistCache, 5 * 60 * 1000) : undefined;
+persistTimer?.unref();
+
+function shutdown(signal: string): void {
+  console.log(JSON.stringify({ event: "shutdown", signal }));
+  if (persistTimer) clearInterval(persistTimer);
+  persistCache();
+  server.close((error) => {
+    if (error) console.error(error);
+    process.exit(error ? 1 : 0);
+  });
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

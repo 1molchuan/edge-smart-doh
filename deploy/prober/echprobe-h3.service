@@ -1,0 +1,23 @@
+[Unit]
+Description=Edge Smart DoH QUIC+ECH check (decides where h3 is advertised)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=echprobe
+Group=echprobe
+EnvironmentFile=/etc/echprobe/env
+# Recent per-host results: h3 is only reported after 3 consecutive passing runs, h2 after any failure.
+StateDirectory=echprobe
+# ECH-only QUIC handshakes to the addresses the DoH serves; verdicts go to /admin/h3. Run on every
+# prober: h3 is advertised for a host only while all of them report it working.
+ExecStart=/usr/local/bin/echprobe \
+  -doh ${DOH_URL} -doh-ip ${DOH_IP} \
+  -h3check ${H3_HOSTS} -rounds ${H3_ROUNDS} -timeout 4s \
+  -h3-report ${H3_URL} -report-source ${SOURCE} -h3-history /var/lib/echprobe/h3-history.json
+TimeoutStartSec=10min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict

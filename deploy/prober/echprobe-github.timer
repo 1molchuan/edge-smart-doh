@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the GitHub preferred-IP prober every 30 minutes
+
+[Timer]
+OnBootSec=6min
+OnUnitActiveSec=30min
+RandomizedDelaySec=3min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Check real site reachability through the DoH pool every 15 minutes
+
+[Timer]
+OnBootSec=3min
+# The override's TTL (-site-ttl 2700) spans three runs, so one failed run does not drop it.
+OnUnitActiveSec=15min
+RandomizedDelaySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Measure QUIC+ECH every 30 minutes
+
+[Timer]
+OnBootSec=6min
+OnUnitActiveSec=30min
+RandomizedDelaySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

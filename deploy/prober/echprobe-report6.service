@@ -1,0 +1,26 @@
+[Unit]
+Description=Edge Smart DoH preferred-IPv6 prober (ECH handshake ranking over IPv6)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=echprobe
+Group=echprobe
+Environment=BUDGET=20m
+EnvironmentFile=/etc/echprobe/env
+StateDirectory=echprobe
+# Same ranking as echprobe-report.service, over IPv6 only (-family 6): candidates are the AAAA
+# records of CANDIDATES6, the report goes to the ipv6 field under its own source name (SOURCE6) so it
+# never replaces this prober's IPv4 list. Needs a public IPv6 address on the box.
+ExecStart=/usr/local/bin/echprobe -family 6 \
+  -doh ${DOH_URL} -doh-ip ${DOH_IP} \
+  -resolve-doh ${RESOLVE_DOH} \
+  -rank ${CANDIDATES6} -rank-target ${RANK_TARGET} -rounds ${ROUNDS} -timeout 6s \
+  -report ${ADMIN_URL} -report-source ${SOURCE6} -report-top ${TOP_N} -report-min ${MIN_N} -report-ttl ${TTL} \
+  -history /var/lib/echprobe/history6.json -budget ${BUDGET}
+TimeoutStartSec=25min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict

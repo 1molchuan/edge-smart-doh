@@ -1,0 +1,11 @@
+[Unit]
+Description=Rank preferred Cloudflare IPv6 addresses every 30 minutes
+
+[Timer]
+OnBootSec=8min
+OnUnitActiveSec=30min
+RandomizedDelaySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

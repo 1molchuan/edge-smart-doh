@@ -1,0 +1,11 @@
+[Unit]
+Description=Self-check the DoH answers every 30 minutes
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=30min
+RandomizedDelaySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

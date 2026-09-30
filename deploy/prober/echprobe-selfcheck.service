@@ -1,0 +1,20 @@
+[Unit]
+Description=Edge Smart DoH self-check (answers must let Chromium use ECH)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=echprobe
+Group=echprobe
+EnvironmentFile=/etc/echprobe/env
+# Only DNS queries; no handshakes. Fails (exit 1) and reports to the server when any host breaks
+# a rule Chromium needs for ECH; the latest verdict shows up in /explain.
+ExecStart=/usr/local/bin/echprobe \
+  -doh ${DOH_URL} -doh-ip ${DOH_IP} \
+  -selfcheck ${SELFCHECK_HOSTS} -selfcheck-report ${SELFCHECK_URL} -report-source ${SOURCE}
+TimeoutStartSec=5min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict

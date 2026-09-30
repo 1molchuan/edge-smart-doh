@@ -1,0 +1,26 @@
+[Unit]
+Description=Edge Smart DoH site check (real pages through the pool; per-site override when an origin hangs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=echprobe
+Group=echprobe
+Environment=SITE_URLS=https://linux.do/srv/status,https://linux.do/about.json
+EnvironmentFile=/etc/echprobe/env
+# Reads history.json (echprobe-report) for alternative candidates; never writes it.
+StateDirectory=echprobe
+# Handshakes only reach the Cloudflare edge; this fetches pages that need each site's origin. When
+# too many hang (2026-09-26: linux.do through Singapore), it reports IPs in colos that reach the
+# origin to SITE_URL (/admin/site). Every run reports, so a recovered site loses its override.
+ExecStart=/usr/local/bin/echprobe \
+  -doh ${DOH_URL} -doh-ip ${DOH_IP} \
+  -sitecheck ${SITE_URLS} -site-report ${SITE_URL} -site-ttl 2700 -report-source ${SOURCE} \
+  -history /var/lib/echprobe/history.json -sample-cidrs ${SAMPLE_CIDRS} -sample-n 30 \
+  -timeout 10s -parallel 8 -budget 8m
+TimeoutStartSec=10min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict

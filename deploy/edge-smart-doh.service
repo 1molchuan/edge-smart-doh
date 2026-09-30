@@ -1,0 +1,27 @@
+[Unit]
+Description=Edge Smart DoH
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=edge-smart-doh
+Group=edge-smart-doh
+EnvironmentFile=/etc/edge-smart-doh/env
+StateDirectory=edge-smart-doh
+ExecStart=/usr/bin/node /opt/edge-smart-doh/node.mjs
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=160M
+
+[Install]
+WantedBy=multi-user.target

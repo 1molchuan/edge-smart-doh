@@ -1,0 +1,28 @@
+{
+  "name": "edge-smart-doh",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "build:edgeone": "esbuild src/edgeone.ts --bundle --format=iife --target=es2022 --minify --outfile=dist/edgeone.js",
+    "build:node": "esbuild server/node.ts --bundle --platform=node --format=esm --target=node18 --minify --outfile=dist/node.mjs",
+    "deploy": "wrangler deploy --minify",
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.tools.json --noEmit && tsc -p tsconfig.node.json --noEmit && wrangler types --check",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "benchmark": "tsx tools/benchmark/index.ts"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typescript": "latest",
+    "vitest": "3.2.4",
+    "wrangler": "latest"
+  },
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/1molchuan/edge-smart-doh.git"
+  }
+}

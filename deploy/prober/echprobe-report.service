@@ -1,0 +1,33 @@
+[Unit]
+Description=Edge Smart DoH preferred-IP prober (ECH handshake ranking)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=echprobe
+Group=echprobe
+# Defaults for settings added after the first deployments; /etc/echprobe/env overrides them.
+# Needs an echprobe with -per-domain/-parallel/-sample-* (2026-09-24 or later) and -budget (2026-09-26).
+# BUDGET stays a few minutes under TimeoutStartSec so a slow run still reports what it measured.
+Environment=PER_DOMAIN=4 PARALLEL=8 SAMPLE_N=0 SAMPLE_CIDRS=104.16.0.0/13 BUDGET=20m
+EnvironmentFile=/etc/echprobe/env
+# Per-IP results across runs; an IP must stay reliable over hours, not just pass one run.
+StateDirectory=echprobe
+# Candidates: community preferred-domain pools and a few stable CF-fronted sites.
+# The DoH host is dialed by IP because this box's system resolver is unreliable.
+ExecStart=/usr/local/bin/echprobe \
+  -doh ${DOH_URL} -doh-ip ${DOH_IP} \
+  -resolve-doh ${RESOLVE_DOH} \
+  -rank ${CANDIDATES} -rank-target ${RANK_TARGET} -rounds ${ROUNDS} -timeout 6s \
+  -per-domain ${PER_DOMAIN} -parallel ${PARALLEL} -sample-cidrs ${SAMPLE_CIDRS} -sample-n ${SAMPLE_N} \
+  -report ${ADMIN_URL} -report-source ${SOURCE} -report-top ${TOP_N} -report-min ${MIN_N} -report-ttl ${TTL} \
+  -history /var/lib/echprobe/history.json -budget ${BUDGET}
+# Tested sequentially, ~150 IPs took 20-25 min and Tencent's runs were killed here; in parallel a run
+# with ~250 candidates takes a few minutes. At the evening peak (2026-09-26) Tencent's 933 known IPs
+# ran past this limit on every run until -budget and -max-known (default 300) were added.
+TimeoutStartSec=25min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict

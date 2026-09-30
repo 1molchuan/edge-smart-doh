@@ -1,0 +1,30 @@
+[Unit]
+Description=Edge Smart DoH GitHub preferred-IP prober (per-host, from community hosts sources)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=echprobe
+Group=echprobe
+Environment=GITHUB_TTL=4200 GITHUB_PARALLEL=4 GITHUB_ROUNDS=3
+EnvironmentFile=/etc/echprobe/env
+# GitHub publishes no ECH; its China pain is IP reachability. Candidates come from community hosts
+# sources (GITHUB_SOURCES); each host's IPs are verified from this line with a cert-validated TLS
+# handshake (no ECH) and reported per host to /admin/github. Low parallelism and few rounds keep the
+# probe from bursting GitHub's edge, which throttled the whole line in testing.
+# Needs an echprobe with -github (2026-09-25 or later).
+# GITHUB_RESOLVER (host:port) resolves the source URLs on probers whose system DNS is unreliable
+# (Aliyun); empty uses the system resolver.
+Environment=GITHUB_RESOLVER=
+# -doh-ip dials the DoH/admin host by IP for the report POST, since some probers cannot resolve it.
+ExecStart=/usr/local/bin/echprobe \
+  -doh ${DOH_URL} -doh-ip ${DOH_IP} \
+  -github ${GITHUB_SOURCES} -github-hosts ${GITHUB_HOSTS} -github-resolver ${GITHUB_RESOLVER} \
+  -rounds ${GITHUB_ROUNDS} -parallel ${GITHUB_PARALLEL} -timeout 6s \
+  -github-report ${GITHUB_URL} -report-source ${SOURCE} -github-ttl ${GITHUB_TTL}
+TimeoutStartSec=15min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
