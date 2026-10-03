@@ -133,6 +133,82 @@ describe("upstream fallback", () => {
   });
 });
 
+describe("upstream answer validation", () => {
+  const wire = (flags: number) => new Response(
+    Uint8Array.from(encodeDnsPacket({ ...response(), header: { ...response().header, flags } })).buffer,
+    { headers: { "Content-Type": "application/dns-message" } },
+  );
+
+  it("treats SERVFAIL as a failure and falls through to the next upstream", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(wire(0x8182)).mockResolvedValueOnce(wire(0x8180));
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await queryUpstreams(new Uint8Array(12), config())).upstream).toContain("secondary");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps NXDOMAIN as an answer instead of trying the next upstream", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(wire(0x8183));
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await queryUpstreams(new Uint8Array(12), config())).upstream).toContain("primary");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a truncated response as a failure", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(wire(0x8380)).mockResolvedValueOnce(wire(0x8180));
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await queryUpstreams(new Uint8Array(12), config())).upstream).toContain("secondary");
+  });
+
+  it("reports the rcode when every upstream fails that way", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(wire(0x8182)));
+    await expect(queryUpstreams(new Uint8Array(12), config())).rejects.toThrow(/rcode 2/);
+  });
+
+  it("keeps NODATA (rcode 0, no answers) as an answer", async () => {
+    const noData = new Response(
+      Uint8Array.from(encodeDnsPacket({ ...response(), header: { ...response().header, ancount: 0 }, answers: [] })).buffer,
+      { headers: { "Content-Type": "application/dns-message" } },
+    );
+    const fetchMock = vi.fn().mockResolvedValue(noData);
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await queryUpstreams(new Uint8Array(12), config())).upstream).toContain("primary");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats an EDNS extended rcode (BADVERS) as a failure", async () => {
+    const badvers = new Response(
+      Uint8Array.from(encodeDnsPacket({
+        ...response(),
+        additionals: [{ name: "", type: DnsType.OPT, class: 4096, ttl: 0x01000000, rdata: { kind: "opt", options: [] } }],
+      })).buffer,
+      { headers: { "Content-Type": "application/dns-message" } },
+    );
+    const fetchMock = vi.fn().mockResolvedValueOnce(badvers).mockResolvedValueOnce(wire(0x8180));
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await queryUpstreams(new Uint8Array(12), config())).upstream).toContain("secondary");
+  });
+
+  it("falls through when an entry is not a usable URL", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "https://") return Promise.reject(new TypeError("Failed to parse URL"));
+      return Promise.resolve(wire(0x8180));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await queryUpstreams(new Uint8Array(12), config({ upstreams: ["https://", "https://secondary.example/dns-query"] }));
+    expect(result.upstream).toContain("secondary");
+  });
+
+  it("names a timed-out upstream as a timeout rather than a bare abort", async () => {
+    const fetchMock = vi.fn()
+      .mockImplementationOnce((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      }))
+      .mockResolvedValueOnce(new Response("bad", { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(queryUpstreams(new Uint8Array(12), config({ upstreamTimeoutMs: 10 }))).rejects.toThrow(/primary\.example: upstream timeout/);
+  });
+});
+
 describe("hedged upstream", () => {
   const ok = () => new Response(Uint8Array.from(encodeDnsPacket(response())).buffer, { headers: { "Content-Type": "application/dns-message" } });
   const hang = (_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {

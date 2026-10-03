@@ -182,6 +182,65 @@ const env = Object.fromEntries(
   Object.entries(DEFAULTS).map(([name, fallback]) => [name, process.env[name] ?? fallback]),
 ) as unknown as Env;
 
+/**
+ * Mirrors undici's NO_PROXY semantics — undici's EnvHttpProxyAgent is what actually decides
+ * reachability when fetch is put behind a proxy (see contrib/home), so the check must follow the same
+ * rules or it stays silent exactly where it matters: "*" bypasses everything, an entry may carry a
+ * ":port" suffix, and a leading "*." or "." makes it a suffix match. Returns null when nothing is
+ * bypassed. Ports are ignored, which can only over-report and never stay silent.
+ */
+function noProxyMatcher(entries: string[]): ((hostname: string) => boolean) | null {
+  if (entries.length === 0) return null;
+  if (entries.includes("*")) return () => true;
+  const exact = new Set<string>();
+  const suffixes: string[] = [];
+  for (const entry of entries) {
+    const bare = entry.replace(/:\d+$/, "");
+    if (bare.startsWith("*.") || bare.startsWith(".")) suffixes.push(bare.slice(1));
+    else exact.add(bare);
+  }
+  return (hostname) => exact.has(hostname) || suffixes.some((suffix) => hostname.endsWith(suffix));
+}
+
+/**
+ * `UPSTREAMS` is a trust list: every entry must be reached the same way. Anything named in `NO_PROXY`
+ * is dialed directly while the rest go through `HTTP(S)_PROXY`, and the direct one is typically an
+ * order of magnitude faster, so it wins the hedged race with exactly the answer the proxy exists to
+ * avoid (see contrib/home/README.md). Warn instead of refusing to start, so a misconfigured box keeps
+ * serving while the operator fixes it.
+ */
+function warnOnMixedUpstreamTrust(): void {
+  // Match undici's variable priority (lowercase wins) or the check reads a different configuration
+  // than the dispatcher does.
+  const proxy = process.env.https_proxy ?? process.env.HTTPS_PROXY ?? process.env.http_proxy ?? process.env.HTTP_PROXY;
+  if (!proxy) return;
+  const bypasses = noProxyMatcher(
+    (process.env.no_proxy ?? process.env.NO_PROXY ?? "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean),
+  );
+  if (!bypasses) return;
+  const direct: string[] = [];
+  for (const item of (process.env.UPSTREAMS ?? DEFAULTS.UPSTREAMS).split(",")) {
+    const value = item.trim();
+    // readConfig keeps only https:// entries; naming the rest would warn about upstreams the server
+    // never queries.
+    if (!value.startsWith("https://")) continue;
+    let hostname: string;
+    try {
+      hostname = new URL(value).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    } catch {
+      continue;
+    }
+    if (bypasses(hostname)) direct.push(hostname);
+  }
+  if (direct.length === 0) return;
+  console.warn(JSON.stringify({
+    event: "upstream_trust_warning",
+    message: "UPSTREAMS mixes proxied and direct (NO_PROXY) upstreams: the direct one answers first, and its answers are the ones the proxy was avoiding",
+    direct,
+    hint: "keep UPSTREAMS to proxied (trusted) resolvers; serve direct/domestic resolvers from ECS_UPSTREAMS instead",
+  }));
+}
+
 function clientIp(request: Request): { value?: string; source?: string } {
   const candidates: [string, string | null][] = [
     ["X-Real-IP", request.headers.get("X-Real-IP")],
@@ -282,6 +341,7 @@ const server = createServer(async (incoming, outgoing) => {
 const host = process.env.HOST ?? "127.0.0.1";
 const port = numberFromEnvironment("PORT", 8787, 1, 65535);
 loadPersistedCache();
+warnOnMixedUpstreamTrust();
 server.listen(port, host, () => console.log(JSON.stringify({ event: "listening", host, port })));
 
 // Periodic snapshot bounds the loss on an unclean exit (OOM kill, power loss).

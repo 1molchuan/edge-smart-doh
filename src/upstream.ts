@@ -1,4 +1,5 @@
 import { parseDnsPacket } from "./dns/packet";
+import { DnsType } from "./dns/types";
 import type { AppConfig } from "./config";
 
 export interface UpstreamResult {
@@ -9,6 +10,15 @@ export interface UpstreamResult {
 export interface UpstreamOptions {
   /** Use the ECS-capable upstream list instead of the default one. */
   ecs?: boolean;
+}
+
+/** Hostname for diagnostics; a malformed URL must not turn a failure path into a throw. */
+function upstreamLabel(upstream: string): string {
+  try {
+    return new URL(upstream).hostname;
+  } catch {
+    return upstream;
+  }
 }
 
 async function queryOne(upstream: string, query: Uint8Array, config: AppConfig, signal: AbortSignal): Promise<Uint8Array> {
@@ -25,7 +35,21 @@ async function queryOne(upstream: string, query: Uint8Array, config: AppConfig, 
   const packet = new Uint8Array(await response.arrayBuffer());
   if (packet.length > config.maxDnsPacketSize) throw new Error("response too large");
   const parsed = parseDnsPacket(packet);
-  if ((parsed.header.flags & 0x8000) === 0) throw new Error("not a DNS response");
+  const flags = parsed.header.flags;
+  if ((flags & 0x8000) === 0) throw new Error("not a DNS response");
+  // A resolver that failed is not an answer: SERVFAIL/REFUSED/NOTIMP and truncated replies must fall
+  // through to the next upstream instead of winning the race and starving it. NXDOMAIN (3) and
+  // NODATA (rcode 0 without answers) are legitimate answers and keep their negative-cache semantics.
+  const rcode = flags & 0x000f;
+  if (rcode !== 0 && rcode !== 3) throw new Error(`rcode ${rcode}`);
+  // BADVERS/BADCOOKIE and friends sit in the OPT record's TTL high byte while the header rcode stays
+  // 0, so they need their own check or such failures would count as answers.
+  if (parsed.additionals.some((record) => record.type === DnsType.OPT && (record.ttl >>> 24) !== 0)) {
+    throw new Error("extended rcode");
+  }
+  // Truncated replies are deliberately failures: the next upstream usually answers in full, and half
+  // an A/AAAA set must never reach the address-derived caches in rewrite.ts.
+  if ((flags & 0x0200) !== 0) throw new Error("truncated response");
   return packet;
 }
 
@@ -73,7 +97,12 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
           clearTimeout(timeout);
           pending -= 1;
           if (settled) return;
-          errors.push(`${new URL(upstream).hostname}: ${error instanceof Error ? error.message : String(error)}`);
+          // The abort reason ("upstream timeout") is the useful diagnostic: a fetch rejected by an
+          // abort only reports "This operation was aborted". Superseded attempts never reach here
+          // (finish() sets settled before aborting), so every entry below is a real failure.
+          const reason: unknown = controller.signal.reason;
+          const detail = typeof reason === "string" && reason.length > 0 ? reason : error instanceof Error ? error.message : String(error);
+          errors.push(`${upstreamLabel(upstream)}: ${detail}`);
           if (next < upstreams.length) launch();
           else if (pending === 0) finish();
         });
