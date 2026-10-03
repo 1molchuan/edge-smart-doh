@@ -174,6 +174,11 @@ export async function ispScopeOf(ip: string | undefined, config: AppConfig, cach
   return name ? `isp:${name}` : undefined;
 }
 
+/** Whether a table is loaded: an address missing from it is then known to be outside every operator. */
+export function ispTableReady(): boolean {
+  return current !== undefined;
+}
+
 /** Test hook: forget the loaded table. */
 export function resetIspTable(): void {
   current = undefined;

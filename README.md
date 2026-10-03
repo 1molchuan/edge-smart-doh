@@ -137,7 +137,20 @@ cfhub 是一个众包测速站：志愿者在自己的线路上运行探针 `cfp
 - `?cf=<域名>`：用这个域名解析出的地址作为优选池；
 - `?ip4=a,b&ip6=c,d`：直接指定优选地址（每种最多 16 个）；
 - `?ech=<域名>`：从这个域名的 HTTPS 记录取 ECH 配置；
-- `?rules=<URL>`：加载一份规则（只允许 `DYNAMIC_RULE_HOSTS` 里的主机）。
+- `?rules=<URL>`：加载一份规则（只允许 `DYNAMIC_RULE_HOSTS` 里的主机）；
+- `?safe=1`：拦截广告和诈骗网站，详见下文。
+
+### 广告和诈骗拦截（`?safe=1`）
+
+在 DoH 地址后加上 `?safe=1`（例如 `https://<你的域名>/dns-query?safe=1`），就会拦截 `SAFE_LIST_URLS` 名单里的域名，默认不开启。
+
+- **名单格式**：每行一个域名，同时拦截它的所有子域名。支持纯域名、hosts 格式（`0.0.0.0 example.com`）、adblock 格式（`||example.com^`，带 `$` 选项的规则会被跳过）和 `*.example.com`；`@@||example.com^` 是例外，表示放行。
+- **加载**：名单在后台下载，每天更新一次，下载期间不影响查询。名单必须全部下载成功才会替换旧表，第一次加载完成之前不拦截任何域名。
+- **被拦截的域名**：返回 NXDOMAIN，并附带一条 SOA（负缓存 600 秒），让 App 缓存这个结果，不会一直重试。
+- **误拦**：把域名加进 `SAFE_ALLOW`（同样包括它的子域名），不用重新加载名单。
+- **只拦截名单里的域名**：其他查询的结果和不加 `safe=1` 时完全一样，两者共用缓存。
+- **效果边界**：能拦第三方广告 SDK（开屏、弹窗广告）、网页里的第三方广告和恶意网站。和正常内容来自同一个域名的广告（比如短视频或社交 App 里的信息流广告）拦不了。
+- `/explain?name=<域名>&safe=1` 会显示命中了名单里的哪一条。
 
 ## 部署
 
@@ -180,6 +193,8 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 | `ECS_MODE` | `rules` | `off`、`always`，或 `rules`（只对 `ECS_DOMAINS` 和规则指定的域名） |
 | `ECS_DOMAINS` | `.cn` | 带 ECS 的域名后缀 |
 | `ECS_IPV4_PREFIX` / `ECS_IPV6_PREFIX` | 24 / 48 | ECS 子网长度 |
+| `ECS_DOMAIN_LIST_URLS` | 空 | 国内网站域名名单（如 Loyalsoldier 的 `direct-list.txt`），名单里的域名和 `ECS_DOMAINS` 一样带 ECS 走 `ECS_UPSTREAMS`，拿到国内 CDN 节点；每天更新 |
+| `ECS_FALLBACK_SUBNET` | 空 | 访客 IP 不属于任何国内运营商时（通常是 DoH 查询走了境外代理），ECS 改用这个国内子网，避免国内网站返回海外 CDN。需要配置 `ISP_TABLE_URL` |
 | `CF_REWRITE_ENABLED` | false | 有池子时会自动开启，一般不用设 |
 | `CF_PREFERRED_DOMAIN` | 空 | 优选域名，解析出的地址合并为第 5 层池子 |
 | `CF_PREFERRED_IPV4` / `CF_PREFERRED_IPV6` | 空 | 静态优选地址 |
@@ -194,6 +209,8 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 | `META_ECH_CONFIG_BASE64` / `META_DOMAINS` | 空 / Meta 的域名 | Meta 的 ECH 种子配置及其适用域名 |
 | `X_DOMAINS` | X 的域名 | 按多 CDN 方式判断、不返回 AAAA 的域名 |
 | `GITHUB_DOMAINS` | 空 | 使用按主机优选池的 GitHub 域名 |
+| `SAFE_LIST_URLS` | 空 | `?safe=1` 使用的拦截名单，逗号分隔，空则关闭这个功能 |
+| `SAFE_ALLOW` | 空 | `?safe=1` 永不拦截的域名（包括子域名） |
 | `RULES_JSON` / `RULES_URL` | `[]` / 空 | 应答规则 |
 | `DYNAMIC_RULE_HOSTS` / `DYNAMIC_RULES_MAX_BYTES` | paste.rs 等 / 262144 | `?rules=` 允许的主机和大小上限 |
 | `MAX_DNS_PACKET_SIZE` | 4096 | 请求和上游应答的大小上限 |

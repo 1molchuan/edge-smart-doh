@@ -1,33 +1,25 @@
 import { normalizedCacheIdentity, readCache, rotateAddressRecords, writeCache, type CacheHit, type CacheIdentity } from "./cache";
 import { inAnyCidr } from "./cidr";
 import { readConfig, type AppConfig } from "./config";
-import { addEcs, domainMatches, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
+import { addEcs, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
 import { encodeDnsPacket, makeServfail, parseDnsPacket, parseIpv4, patchTransactionId } from "./dns/packet";
 import { DnsType, type DnsPacket } from "./dns/types";
 import { chromiumEchVerdict, describeAnswers, dnsTypeName, selfCheckStatus, setSelfCheck } from "./explain";
-import { alpnFor, h3CacheTag, h3Status, setH3Verdicts } from "./h3";
-import { isIspName, ispScopeOf } from "./isp";
+import { h3Status, setH3Verdicts } from "./h3";
+import { isIspName, ispScopeOf, ispTableReady } from "./isp";
 import { applyResponseRules, ecsOverride, loadRules, shouldBlock, type RuleSet } from "./rules";
 import { parseRequestOptions, type RequestOptions } from "./request-options";
-import { clearMetaEch, githubPoolFor, githubPoolStatus, ispPoolStatus, learnedPoolStatus, metaEchCacheTag, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolCacheTag, sitePoolFor, sitePoolStatus } from "./preferred";
-import {
-  flattenAliases,
-  injectEch,
-  injectEchBytes,
-  loadCloudflareRanges,
-  pinAddresses,
-  pinHttpsHints,
-  resolveDomainAddresses,
-  resolveEchConfig,
-  responseUsesCloudflare,
-  servedByCloudflare,
-  rewriteCloudflareAddresses,
-  rewriteXAddresses,
-  validatedEchConfig,
-} from "./rewrite";
+import { clearMetaEch, githubPoolStatus, githubReports, ispPoolStatus, learnedPoolStatus, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolStatus, siteReports } from "./preferred";
+import { loadCloudflareRanges, validatedEchConfig } from "./rewrite";
+import { describePlan, makePlan, sortStrategies, strategyCacheTags, type RoutePlan } from "./plan";
+import { renderPlan } from "./render";
+import { PUBLIC_STRATEGIES } from "./strategies";
 import { queryUpstreams } from "./upstream";
+import { safeBlocked, safeBlockedResponse, safeStatus } from "./safe";
+import { chineseSiteStatus, isChineseSite } from "./cn-domains";
 
 const DNS_CONTENT_TYPE = "application/dns-message";
+const STRATEGIES = sortStrategies(PUBLIC_STRATEGIES);
 
 function dnsResponse(packet: Uint8Array, status = 200): Response {
   let body = packet;
@@ -143,6 +135,8 @@ interface DnsSetup {
   options: RequestOptions;
   cache: Cache;
   ip?: string;
+  /** The address ECS is built from: the client's, or ECS_FALLBACK_SUBNET for a client outside every operator. */
+  ecsIp?: string;
   scope?: string;
   rules: RuleSet;
 }
@@ -161,9 +155,10 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
     ipv4: options.preferredIpv4 ?? config.cfPreferredIpv4,
     ipv6: options.preferredIpv6 ?? config.cfPreferredIpv6,
   };
+  // The operator matters for the server default pool and for the ECS fallback.
+  const ispScope = options.cfDomainIsDefault === true || config.ecsFallbackSubnet ? await ispScopeOf(ip, config, cache) : undefined;
+  const ecsIp = config.ecsFallbackSubnet && ip && ispTableReady() && ispScope === undefined ? config.ecsFallbackSubnet : ip;
   try {
-    // The operator lookup only matters when the request relies on the server default pool.
-    const ispScope = options.cfDomainIsDefault === true ? await ispScopeOf(ip, config, cache) : undefined;
     preferred = await preferredPool(
       { ipv4: options.preferredIpv4, ipv6: options.preferredIpv6 },
       options.cfDomains,
@@ -171,7 +166,7 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
       config,
       cache,
       clientScopeKey(ip),
-      ispScope,
+      options.cfDomainIsDefault === true ? ispScope : undefined,
     );
   } catch (error) {
     // A server-wide default must fail open: answer without the rewrite rather than break every query.
@@ -189,28 +184,19 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
     cfPreferredIpv6: preferred.ipv6,
   };
   const rules = await loadRules(config, cache);
-  return { config, options, cache, ip, scope: preferred.scope, rules };
-}
-
-/** A site pool (see sitePoolFor) stands in for the server's default pool only; an explicit ?ip4= or ?cf= choice wins. */
-function sitePool(name: string, options: RequestOptions): string[] {
-  return options.cfDomainIsDefault === true ? sitePoolFor(name) : [];
+  return { config, options, cache, ip, ecsIp, scope: preferred.scope, rules };
 }
 
 /** ECS decision and cache key for one query. */
 function planQuery(query: DnsPacket, setup: DnsSetup): { upstreamQuery: DnsPacket; useEcs: boolean; ecsIdentity?: string; identity: CacheIdentity } {
-  const { config, options, rules, ip } = setup;
-  const ecs = ip ? makeEcsValue(ip, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined;
-  const useEcs = ecs ? shouldUseEcs(query, config, ecsOverride(rules, query)) : false;
+  const { config, options, rules, ecsIp } = setup;
+  const ecs = ecsIp ? makeEcsValue(ecsIp, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined;
+  // A rule decides first; then, in rules mode, the Chinese-site lists add to ECS_DOMAINS.
+  const override = ecsOverride(rules, query) ?? (config.ecsMode === "rules" && isChineseSite(query.questions[0]!.name, config) ? true : undefined);
+  const useEcs = ecs ? shouldUseEcs(query, config, override) : false;
   const upstreamQuery = useEcs && ecs ? addEcs(query, ecs) : removeEcs(query);
   const question = query.questions[0]!;
-  let variant = options.cacheVariant;
-  if (setup.scope) variant += `|pool=${setup.scope}`;
-  if (sitePool(question.name, options).length > 0) variant += `|${sitePoolCacheTag(question.name)}`;
-  if (config.echEnabled && question.type === DnsType.HTTPS) {
-    variant += `|${h3CacheTag()}`;
-    if (domainMatches(question.name, config.metaDomains)) variant += `|${metaEchCacheTag()}`;
-  }
+  const variant = options.cacheVariant + strategyCacheTags(STRATEGIES, { config, options, scope: setup.scope, name: question.name, type: question.type });
   const ecsIdentity = useEcs && ecs ? ecs.identity : undefined;
   return { upstreamQuery, useEcs, ecsIdentity, identity: normalizedCacheIdentity(query, ecsIdentity ?? "none", variant) };
 }
@@ -247,6 +233,8 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   if (setup instanceof Response) return setup;
   const { config, options, cache, rules } = setup;
   if (shouldBlock(rules, query)) return dnsResponse(makeBlockedResponse(query));
+  // Blocked before the cache: every other answer is the same with or without ?safe=1, so they share it.
+  if (options.safe && safeBlocked(query.questions[0]!.name, config)) return dnsResponse(encodeDnsPacket(safeBlockedResponse(query)));
 
   const { upstreamQuery, useEcs, identity } = planQuery(query, setup);
   const question = query.questions[0]!;
@@ -287,7 +275,10 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   }
 }
 
-/** `notes`, when given, collects one line per decision for /explain. */
+/**
+ * Asks upstream, then lets the strategies decide how the name is reached (plan.ts) and applies that
+ * plan to the answer (render.ts). `notes`, when given, collects one line per decision for /explain.
+ */
 async function resolveFresh(
   query: DnsPacket,
   upstreamQuery: DnsPacket,
@@ -297,7 +288,7 @@ async function resolveFresh(
   config: AppConfig,
   cache: Cache,
   notes?: string[],
-): Promise<{ wire: Uint8Array; upstream: string }> {
+): Promise<{ wire: Uint8Array; upstream: string; plan: RoutePlan }> {
   const upstreamWire = encodeDnsPacket(upstreamQuery);
   const result = await queryUpstreams(upstreamWire, config, { ecs: useEcs });
   const originalResponse = parseDnsPacket(result.packet);
@@ -306,127 +297,12 @@ async function resolveFresh(
     const answers = describeAnswers(originalResponse);
     notes.push(`upstream ${new URL(result.upstream).hostname}${useEcs ? " (with ECS)" : ""}: rcode ${originalResponse.header.flags & 0x0f}, ${answers.length > 0 ? answers.join("; ") : "no answers"}`);
   }
-  let transformed = applyResponseRules(rules, query, originalResponse);
-  if (transformed !== originalResponse) notes?.push("response rules changed the answer");
-  let cloudflareRanges: Awaited<ReturnType<typeof loadCloudflareRanges>> | undefined;
-  if (config.cfRewriteEnabled || (config.echEnabled && query.questions[0]?.type === 65)) {
-    try {
-      cloudflareRanges = await loadCloudflareRanges(config, cache);
-      if (config.cfRewriteEnabled) {
-        const before = transformed;
-        transformed = rewriteCloudflareAddresses(transformed, cloudflareRanges, config);
-        if (transformed !== before) notes?.push(`Cloudflare addresses rewritten to the preferred pool (${[...config.cfPreferredIpv4, ...config.cfPreferredIpv6].join(", ")})`);
-      }
-    } catch (error) {
-      notes?.push(`Cloudflare ranges unavailable: ${errorMessage(error)}`);
-      if (config.debug) console.warn(JSON.stringify({ event: "cf_ranges_error", message: errorMessage(error) }));
-    }
-  }
-  // X hosts are steered between Cloudflare and Fastly per resolver, and a few (abs-0/ton.twimg.com)
-  // live only on X's own network. A host counts as Cloudflare if it resolves there now or, for the
-  // multi-CDN X list, if Cloudflare serves it at all; only then is it pinned to the pool with ECH.
-  const question = query.questions[0]!;
-  const multiCdn = domainMatches(question.name, config.xDomains);
-  let onCloudflare: boolean | undefined;
-  const classify = async (): Promise<boolean> => {
-    if (onCloudflare !== undefined) return onCloudflare;
-    const ranges = cloudflareRanges;
-    if (!ranges) return (onCloudflare = false);
-    const checkCname = multiCdn;
-    const [direct, viaCname] = await Promise.all([
-      resolveDomainAddresses(question.name, config, cache).then((addresses) => responseUsesCloudflare(addresses, ranges), () => false),
-      checkCname ? servedByCloudflare(question.name, config, cache) : Promise.resolve(false),
-    ]);
-    notes?.push(`Cloudflare check: current answer ${direct ? "is" : "is not"} on Cloudflare${checkCname ? `; ${question.name}.cdn.cloudflare.net ${viaCname ? "exists" : "does not exist"}` : ""}`);
-    return (onCloudflare = direct || viaCname);
-  };
-  if (multiCdn) {
-    try {
-      if (await classify()) {
-        transformed = rewriteXAddresses(transformed, query, config);
-        notes?.push("X host served by Cloudflare: addresses pinned to the preferred pool");
-      } else {
-        notes?.push("X host not served by Cloudflare: answer left untouched");
-      }
-    } catch (error) {
-      notes?.push(`X classification failed: ${errorMessage(error)}`);
-      if (config.debug) console.warn(JSON.stringify({ event: "x_classify_error", message: errorMessage(error) }));
-    }
-  }
-  // A site whose origin hangs through the general pool's colos gets the IPs a prober verified end to
-  // end (see setSitePools). IPv6 is dropped: the site pools are IPv4, and a dual-stack client would
-  // otherwise prefer the untested IPv6 pool. The HTTPS hints are pinned below, after ECH injection.
-  const siteIps = sitePool(question.name, options);
-  if (siteIps.length > 0 && (question.type === DnsType.A || question.type === DnsType.AAAA)) {
-    try {
-      if (await classify()) {
-        transformed = pinAddresses(transformed, query, siteIps);
-        notes?.push(`site pool (origin unreachable through the general pool): pinned to ${siteIps.join(", ")}, IPv6 dropped`);
-      }
-    } catch (error) {
-      notes?.push(`site pool classification failed: ${errorMessage(error)}`);
-    }
-  }
-  // GitHub-family names: pin A to the host's own measured pool (no ECH — GitHub's China pain is IP
-  // reachability). AAAA is dropped (the pools are IPv4). Left untouched when nothing was measured.
-  if (domainMatches(question.name, config.githubDomains) && (question.type === DnsType.A || question.type === DnsType.AAAA)) {
-    const pool = githubPoolFor(question.name);
-    if (pool.length > 0) {
-      transformed = pinAddresses(transformed, query, pool);
-      notes?.push(`GitHub host pinned to its measured pool (${pool.join(", ")}), IPv6 dropped`);
-    } else {
-      notes?.push("GitHub host: no measured pool yet, answer left untouched");
-    }
-  }
-  const beforeConfiguredEch = transformed;
-  transformed = injectEch(transformed, config);
-  if (transformed !== beforeConfiguredEch) notes?.push("ECH injected from ECH_CONFIG_BASE64 (ECH_DOMAINS)");
-  if (config.echEnabled && question.type === DnsType.HTTPS) {
-    try {
-      if (domainMatches(question.name, config.metaDomains)) {
-        const override = metaEchOverride();
-        const metaEch = override === null ? undefined : override ?? validatedEchConfig(config.metaEchConfigBase64);
-        // Without a measurement, Meta gets h2 only: its QUIC times out in mainland China.
-        const { alpn, why } = alpnFor(question.name, ["h2"]);
-        if (metaEch) transformed = injectEchBytes(transformed, metaEch, alpn);
-        notes?.push(`Meta ECH: ${override === null ? "suspended by the prober, not injected" : override ? "learned key injected" : metaEch ? "seed key injected" : "no valid seed configured"}; ALPN ${alpn?.join(",")} (${why})`);
-      } else {
-        if (await classify()) {
-          const configured = validatedEchConfig(config.echConfigBase64);
-          const ech = configured ?? await resolveEchConfig(options.echDomain ?? config.echSourceDomain, config, cache);
-          // Without a measurement, X hosts get h2 only (X's zone rejects QUIC+ECH) and other
-          // Cloudflare sites keep whatever ALPN their own record published.
-          const { alpn, why } = alpnFor(question.name, multiCdn ? ["h2"] : undefined);
-          transformed = injectEchBytes(transformed, ech, alpn);
-          if (siteIps.length > 0) transformed = pinHttpsHints(transformed, siteIps);
-          notes?.push(`Cloudflare ECH injected (${ech.length}B); ALPN ${alpn ? alpn.join(",") : "as published upstream"} (${why})${siteIps.length > 0 ? `; hints pinned to the site pool` : ""}`);
-        } else {
-          notes?.push("not on Cloudflare: no ECH injected");
-        }
-      }
-    } catch (error) {
-      notes?.push(`ECH injection failed: ${errorMessage(error)}`);
-      if (config.debug) console.warn(JSON.stringify({ event: "ech_injection_error", message: errorMessage(error) }));
-    }
-  }
-  if (question.type === DnsType.A || question.type === DnsType.AAAA || question.type === DnsType.HTTPS) {
-    // Every answer type of an ECH host must sit at one canonical name, or Chromium drops the ECH
-    // config (see flattenAliases). ECH hosts: Cloudflare-served (by address or X classification),
-    // Meta, and explicitly configured ECH domains. Judged on the upstream addresses: the preferred
-    // pool the answer was rewritten to need not fall inside the published Cloudflare ranges.
-    const addresses = {
-      ipv4: originalResponse.answers.flatMap((record) => (record.rdata.kind === "a" ? [record.rdata.address] : [])),
-      ipv6: originalResponse.answers.flatMap((record) => (record.rdata.kind === "aaaa" ? [record.rdata.address] : [])),
-    };
-    const echHost = config.echEnabled && (domainMatches(question.name, config.metaDomains) || domainMatches(question.name, config.echDomains));
-    if (echHost || onCloudflare === true || (cloudflareRanges !== undefined && responseUsesCloudflare(addresses, cloudflareRanges))) {
-      const before = transformed;
-      transformed = flattenAliases(transformed);
-      if (transformed !== before) notes?.push(`CNAME chain flattened: every record now sits at ${question.name} (Chromium needs this to use ECH)`);
-    }
-  }
+  const ruled = applyResponseRules(rules, query, originalResponse);
+  if (ruled !== originalResponse) notes?.push("response rules changed the answer");
+  const { plan, ctx } = await makePlan(STRATEGIES, { config, options, query, rules, cache, notes });
+  const transformed = renderPlan(plan, ctx, config, originalResponse, ruled);
   const responseWire = transformed === originalResponse ? result.packet : encodeDnsPacket(transformed);
-  return { wire: patchTransactionId(responseWire, query.header.id), upstream: result.upstream };
+  return { wire: patchTransactionId(responseWire, query.header.id), upstream: result.upstream, plan };
 }
 
 const EXPLAIN_TYPES: Record<string, number> = { A: DnsType.A, AAAA: DnsType.AAAA, HTTPS: DnsType.HTTPS };
@@ -458,14 +334,18 @@ async function handleExplain(request: Request, env: Env, runtime: RequestRuntime
     };
     const label = dnsTypeName(type);
     if (shouldBlock(setup.rules, query)) return { type: label, blocked: true, packet: undefined };
+    const safeMatch = setup.options.safe ? safeBlocked(name, setup.config) : undefined;
+    if (safeMatch) return { type: label, blocked: true, steps: [`blocked by ?safe=1: ${safeMatch} is on the block lists (NXDOMAIN)`], packet: undefined };
     const plan = planQuery(query, setup);
     const cached = await readCache(setup.cache, plan.identity, setup.config);
     const notes: string[] = [];
     let fresh: DnsPacket | undefined;
+    let routePlan: Record<string, unknown> | undefined;
     let error: string | undefined;
     try {
       const resolved = await resolveFresh(query, plan.upstreamQuery, plan.useEcs, setup.rules, setup.options, setup.config, setup.cache, notes);
       fresh = parseDnsPacket(resolved.wire);
+      routePlan = describePlan(resolved.plan);
     } catch (caught) {
       error = errorMessage(caught);
     }
@@ -479,6 +359,7 @@ async function handleExplain(request: Request, env: Env, runtime: RequestRuntime
       servedFrom: fromCache ? "cache" : fresh ? "upstream" : "none",
       answer: packet ? describeAnswers(packet) : [],
       ...(fromCache && fresh ? { freshAnswer: describeAnswers(fresh) } : {}),
+      ...(routePlan ? { plan: routePlan } : {}),
       steps: notes,
       ...(error ? { error } : {}),
       packet,
@@ -564,7 +445,7 @@ async function preferredAuth(request: Request, env: Env): Promise<"admin" | "hub
 }
 
 function adminState(): Record<string, unknown> {
-  return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, metaEch: metaEchStatus() ?? null, selfcheck: selfCheckStatus(), h3: h3Status() };
+  return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, selfcheck: selfCheckStatus(), h3: h3Status() };
 }
 
 /**
@@ -575,7 +456,8 @@ function adminState(): Record<string, unknown> {
 async function handleAdminGithub(request: Request, env: Env): Promise<Response> {
   const denied = await adminAuth(request, env);
   if (denied) return denied;
-  if (request.method === "GET") return json({ ok: true, github: githubPoolStatus() ?? null });
+  // ?detail=1 adds every live report as posted, for deploy/restart-keep-state.sh to post back.
+  if (request.method === "GET") return json({ ok: true, github: githubPoolStatus() ?? null, ...(new URL(request.url).searchParams.get("detail") === "1" ? { reports: githubReports() } : {}) });
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
   const report = await readHostReport(request);
   if (report instanceof Response) return report;
@@ -595,7 +477,7 @@ async function handleAdminGithub(request: Request, env: Env): Promise<Response> 
 async function handleAdminSite(request: Request, env: Env): Promise<Response> {
   const denied = await adminAuth(request, env);
   if (denied) return denied;
-  if (request.method === "GET") return json({ ok: true, sites: sitePoolStatus() ?? null });
+  if (request.method === "GET") return json({ ok: true, sites: sitePoolStatus() ?? null, ...(new URL(request.url).searchParams.get("detail") === "1" ? { reports: siteReports() } : {}) });
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
   const report = await readHostReport(request);
   if (report instanceof Response) return report;

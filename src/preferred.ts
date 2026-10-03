@@ -177,6 +177,17 @@ class HostPools {
     for (const [, report] of active) for (const name of report.hosts.keys()) hosts[name] ??= this.poolFor(name);
     return { sources: active.map(([source, report]) => ({ source, hosts: report.hosts.size, expiresAt: report.expiresAt })), hosts };
   }
+
+  /** Every live report as posted, so a restart can post them back (deploy/restart-keep-state.sh). */
+  reports(): HostReport[] {
+    return this.active().map(([source, report]) => ({ source, hosts: Object.fromEntries(report.hosts), expiresAt: report.expiresAt }));
+  }
+}
+
+export interface HostReport {
+  source: string;
+  hosts: Record<string, string[]>;
+  expiresAt: number;
 }
 
 function normalHost(host: string): string {
@@ -211,6 +222,10 @@ export function githubPoolStatus(): ReturnType<HostPools["status"]> {
   return github.status();
 }
 
+export function githubReports(): HostReport[] {
+  return github.reports();
+}
+
 /**
  * Site pools: Cloudflare sites whose ORIGIN the general pool cannot reach from some line. The pool's
  * IPs are ranked by ECH handshakes, which end at the Cloudflare edge; a site can still hang when the
@@ -236,6 +251,10 @@ export function sitePoolFor(host: string): string[] {
 
 export function sitePoolStatus(): ReturnType<HostPools["status"]> {
   return sites.status();
+}
+
+export function siteReports(): HostReport[] {
+  return sites.reports();
 }
 
 /** Cache-key tag for a host with an active site pool (content hash: stable across restarts), else undefined. */

@@ -541,9 +541,9 @@ describe("GitHub per-host preferred pools", () => {
     } as unknown as Env;
   }
 
-  async function ghAsk(env: Env, name: string, type: number): Promise<DnsPacket> {
+  async function ghAsk(env: Env, name: string, type: number, query = ""): Promise<DnsPacket> {
     const body = encodeDnsPacket({ header: { id: 0x77, flags: 0x0100, qdcount: 1, ancount: 0, nscount: 0, arcount: 0 }, questions: [{ name, type, class: 1 }], answers: [], authorities: [], additionals: [] });
-    const res = await handleRequest(new Request("https://doh.example/dns-query", {
+    const res = await handleRequest(new Request(`https://doh.example/dns-query${query}`, {
       method: "POST", headers: { Accept: "application/dns-message", "Content-Type": "application/dns-message" }, body: Uint8Array.from(body).buffer,
     }), env, { waitUntil: () => undefined }, { clientIp: () => undefined, probe: () => ({}) });
     return parseDnsPacket(new Uint8Array(await res.arrayBuffer()));
@@ -570,6 +570,20 @@ describe("GitHub per-host preferred pools", () => {
     }), env, { waitUntil: () => undefined }, { clientIp: () => undefined, probe: () => ({}) });
     expect(post.status).toBe(200);
     expect(addrSet(await ghAsk(env, "raw.githubusercontent.com", DnsType.A))).toEqual(new Set(["185.199.110.133", "185.199.108.133"]));
+  });
+
+
+  it("GET /admin/github?detail=1 returns every report as posted, so a restart can post them back", async () => {
+    const env = githubEnv();
+    setGithubPools("aliyun", { "github.com": ["20.27.177.113"] }, 600);
+    setGithubPools("tencent", { "github.com": ["20.200.245.247"], "api.github.com": ["20.27.177.116"] }, 600);
+    const get = (query: string) => handleRequest(new Request(`https://doh.example/admin/github${query}`, { headers: { Authorization: "Bearer t" } }), env, { waitUntil: () => undefined }, { clientIp: () => undefined, probe: () => ({}) });
+    expect((await (await get("")).json() as { reports?: unknown }).reports).toBeUndefined();
+    const detail = await (await get("?detail=1")).json() as { reports: { source: string; hosts: Record<string, string[]> }[] };
+    expect(detail.reports.map((r) => [r.source, r.hosts])).toEqual([
+      ["aliyun", { "github.com": ["20.27.177.113"] }],
+      ["tencent", { "github.com": ["20.200.245.247"], "api.github.com": ["20.27.177.116"] }],
+    ]);
   });
 
   it("rejects a report with a non-IPv4 address", async () => {

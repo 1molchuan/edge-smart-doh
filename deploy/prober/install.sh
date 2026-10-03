@@ -10,6 +10,7 @@ id -u echprobe >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr
 install -d -m 0750 -o root -g echprobe /etc/echprobe
 install -m 0640 -o root -g echprobe env /etc/echprobe/env
 install -m 0755 echprobe /usr/local/bin/echprobe
+[ -f github-extra-hosts ] && install -m 0644 github-extra-hosts /etc/echprobe/github-extra-hosts
 timers=(echprobe-report.timer)
 install -m 0644 echprobe-report.service /etc/systemd/system/echprobe-report.service
 install -m 0644 echprobe-report.timer /etc/systemd/system/echprobe-report.timer

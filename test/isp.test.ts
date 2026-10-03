@@ -276,3 +276,45 @@ describe("DNS answers follow the client's operator", () => {
     expect(await pool("58.247.1.1")).toEqual(["104.17.1.1", "104.18.3.3"]); // telecom again, from its own cache entry
   });
 });
+
+describe("ECS for clients outside every operator (ECS_FALLBACK_SUBNET)", () => {
+  // 2026-10-03: users whose DoH query went through a Hong Kong proxy got Bilibili's overseas CDN, and
+  // their proxy's GeoIP rules then sent the video abroad too.
+  async function ecsSent(clientIp: string, fallback: string | undefined): Promise<string | undefined> {
+    let seen: string | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("isp-table")) return new Response(TABLE);
+      const query = parseDnsPacket(new Uint8Array(init!.body as ArrayBuffer));
+      const opt = query.additionals.find((record) => record.rdata.kind === "opt");
+      const ecs = opt?.rdata.kind === "opt" ? opt.rdata.options.find((option) => option.code === 8) : undefined;
+      seen = ecs ? Array.from(ecs.data.slice(4)).join(".") : undefined;
+      const answer = encodeDnsPacket({ header: { id: query.header.id, flags: 0x8180, qdcount: 1, ancount: 0, nscount: 0, arcount: 0 }, questions: query.questions, answers: [], authorities: [], additionals: [] });
+      return new Response(Uint8Array.from(answer).buffer, { headers: { "Content-Type": "application/dns-message" } });
+    }));
+    const cache = new MemoryCache();
+    vi.stubGlobal("caches", { open: async () => cache });
+    const env = {
+      UPSTREAMS: "https://up.example/dns-query",
+      ECS_DOMAINS: ".bilibili.com",
+      ISP_TABLE_URL: "http://127.0.0.1:8790/internal/isp-table",
+      ...(fallback ? { ECS_FALLBACK_SUBNET: fallback } : {}),
+    } as unknown as Env;
+    const body = encodeDnsPacket({ header: { id: 1, flags: 0x0100, qdcount: 1, ancount: 0, nscount: 0, arcount: 0 }, questions: [{ name: "www.bilibili.com", type: DnsType.A, class: 1 }], answers: [], authorities: [], additionals: [] });
+    await handleRequest(new Request("https://doh.example/dns-query", {
+      method: "POST", headers: { Accept: "application/dns-message", "Content-Type": "application/dns-message" }, body: Uint8Array.from(body).buffer,
+    }), env, { waitUntil: () => undefined }, { clientIp: () => clientIp, probe: () => ({}) });
+    return seen;
+  }
+
+  it("sends the fallback subnet for a client outside every operator", async () => {
+    expect(await ecsSent("47.243.223.74", "180.168.255.0")).toBe("180.168.255");
+  });
+
+  it("keeps a mainland client's own subnet", async () => {
+    expect(await ecsSent("58.247.1.1", "180.168.255.0")).toBe("58.247.1");
+  });
+
+  it("keeps the client's own subnet when no fallback is configured", async () => {
+    expect(await ecsSent("47.243.223.74", undefined)).toBe("47.243.223");
+  });
+});

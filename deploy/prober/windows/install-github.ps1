@@ -1,9 +1,10 @@
 # Add the GitHub prober scheduled task to a Windows prober already set up by install.ps1.
-# Run as Administrator from a directory holding the updated echprobe.exe and github-run.cmd:
+# Run as Administrator from a directory holding the updated echprobe.exe, github-run.cmd and
+# github-extra-hosts (deploy/prober/github-extra-hosts):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File install-github.ps1
 $ErrorActionPreference = 'Stop'
 $dir = 'C:\ProgramData\echprobe'
-Copy-Item -Force echprobe.exe, github-run.cmd $dir
+Copy-Item -Force echprobe.exe, github-run.cmd, github-extra-hosts $dir
 $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$dir\github-run.cmd`"" -WorkingDirectory $dir
 $every30 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(6) -RepetitionInterval (New-TimeSpan -Minutes 30)
 $boot = New-ScheduledTaskTrigger -AtStartup

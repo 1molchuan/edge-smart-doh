@@ -9,6 +9,8 @@ export interface RequestOptions {
   preferredIpv4?: string[];
   preferredIpv6?: string[];
   rulesUrl?: string;
+  /** ?safe=1: refuse names on the SAFE_LIST_URLS block lists (ads, scams, malware). */
+  safe?: boolean;
   cacheVariant: string;
 }
 
@@ -60,6 +62,9 @@ export function parseRequestOptions(url: URL, config: AppConfig): RequestOptions
   options.preferredIpv4 = addresses(url.searchParams, "ip4");
   options.preferredIpv6 = addresses(url.searchParams, "ip6");
   if (rules !== null) options.rulesUrl = dynamicRulesUrl(rules, config);
+  const safe = url.searchParams.get("safe");
+  if (safe !== null && safe !== "0" && safe !== "1") throw new Error("safe must be 0 or 1");
+  options.safe = safe === "1";
   // Explicit ip4/ip6 take precedence over any domain-based preference; ?cf= over the configured default.
   if (options.cfDomains.length === 0 && !options.preferredIpv4 && !options.preferredIpv6 && config.cfPreferredDomains.length > 0) {
     options.cfDomains = config.cfPreferredDomains;

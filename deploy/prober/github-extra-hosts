@@ -1,0 +1,45 @@
+# Extra GitHub candidates for echprobe -github (a local source next to the community hosts files).
+# GitHub's regional entry addresses, from Google DNS with ECS from each region (2026-10-03). Every
+# candidate is re-verified from the prober's own line; only the fast ones are reported.
+# github.com: JP KR HK/SG AU IN UK DE US-W US-E
+20.27.177.113 github.com
+20.200.245.247 github.com
+20.205.243.166 github.com
+4.237.22.38 github.com
+20.207.73.82 github.com
+20.26.156.215 github.com
+140.82.121.3 github.com
+140.82.114.4 github.com
+140.82.113.3 github.com
+# api.github.com
+20.27.177.116 api.github.com
+20.200.245.245 api.github.com
+20.205.243.168 api.github.com
+4.237.22.34 api.github.com
+20.207.73.85 api.github.com
+20.26.156.210 api.github.com
+140.82.121.5 api.github.com
+140.82.114.5 api.github.com
+140.82.113.6 api.github.com
+# codeload.github.com
+20.27.177.114 codeload.github.com
+20.200.245.246 codeload.github.com
+20.205.243.165 codeload.github.com
+4.237.22.35 codeload.github.com
+20.207.73.88 codeload.github.com
+20.26.156.216 codeload.github.com
+140.82.121.10 codeload.github.com
+140.82.113.10 codeload.github.com
+# Fastly user content (one shared family): release downloads, gist raw files, static assets
+185.199.108.133 release-assets.githubusercontent.com
+185.199.109.133 release-assets.githubusercontent.com
+185.199.110.133 release-assets.githubusercontent.com
+185.199.111.133 release-assets.githubusercontent.com
+185.199.108.133 gist.githubusercontent.com
+185.199.109.133 gist.githubusercontent.com
+185.199.110.133 gist.githubusercontent.com
+185.199.111.133 gist.githubusercontent.com
+185.199.108.215 github.githubassets.com
+185.199.109.215 github.githubassets.com
+185.199.110.215 github.githubassets.com
+185.199.111.215 github.githubassets.com

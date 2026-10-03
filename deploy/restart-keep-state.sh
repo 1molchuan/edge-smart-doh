@@ -3,24 +3,35 @@
 # self-check results live only in memory, so a plain restart falls back to the untested static pool
 # until every prober has run again (~10 min). This saves them from the admin API, restarts, and
 # posts each source back with its remaining TTL. Run as root on the DoH host, after editing the env.
-# Not restored (the API does not expose them): a learned Meta ECH key (the seed is used meanwhile) and
-# client-scoped pools; the next prober run brings those back.
+# GitHub and site pools are restored too. Not restored (the API does not expose them): a learned Meta
+# ECH key (the seed is used meanwhile) and client-scoped pools; the next prober run brings those back.
 set -euo pipefail
 command -v node >/dev/null || { echo "node not found: not restarting" >&2; exit 1; }
 ENV_FILE=${ENV_FILE:-/etc/edge-smart-doh/env}
 ADMIN=${ADMIN:-http://127.0.0.1:8787}
 TOKEN=$(grep '^ADMIN_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
-STATE=$(mktemp)
-trap 'rm -f "$STATE"' EXIT
+STATE=$(mktemp); HOSTPOOLS=$(mktemp)
+trap 'rm -f "$STATE" "$HOSTPOOLS"' EXIT
 curl -sf -H "Authorization: Bearer $TOKEN" "$ADMIN/admin/preferred" > "$STATE"
+# Per-host pools (GitHub, site pools): every report as posted. An older build without ?detail=1 just
+# returns no reports, and those pools refill on the next prober run as before.
+{ printf '{"github":'; curl -sf -H "Authorization: Bearer $TOKEN" "$ADMIN/admin/github?detail=1" || printf '{}'
+  printf ',"site":'; curl -sf -H "Authorization: Bearer $TOKEN" "$ADMIN/admin/site?detail=1" || printf '{}'
+  printf '}'; } > "$HOSTPOOLS"
 systemctl restart edge-smart-doh
 for _ in $(seq 1 30); do
   curl -sf -o /dev/null -H "Authorization: Bearer $TOKEN" "$ADMIN/admin/preferred" && break
   sleep 1
 done
-TOKEN="$TOKEN" ADMIN="$ADMIN" STATE="$STATE" node --input-type=module -e '
+TOKEN="$TOKEN" ADMIN="$ADMIN" STATE="$STATE" HOSTPOOLS="$HOSTPOOLS" node --input-type=module -e '
 import { readFileSync } from "node:fs";
 const state = JSON.parse(readFileSync(process.env.STATE, "utf8"));
+let hostPools = {};
+try {
+  hostPools = JSON.parse(readFileSync(process.env.HOSTPOOLS, "utf8"));
+} catch {
+  console.log("per-host pools not saved; they refill on the next prober run");
+}
 const now = Date.now();
 const post = async (path, body) => {
   const res = await fetch(process.env.ADMIN + path, {
@@ -41,6 +52,11 @@ for (const s of state.isp ?? []) {
 }
 for (const s of state.h3?.sources ?? []) {
   if (ttl(s.expiresAt) > 0) await post("/admin/h3", { source: s.source, verdicts: s.hosts, ttl: ttl(s.expiresAt) });
+}
+for (const [kind, path] of [["github", "/admin/github"], ["site", "/admin/site"]]) {
+  for (const r of hostPools[kind]?.reports ?? []) {
+    if (ttl(r.expiresAt) > 60 && Object.keys(r.hosts).length > 0) await post(path, { source: r.source, hosts: r.hosts, ttl: ttl(r.expiresAt) });
+  }
 }
 for (const s of state.selfcheck ?? []) {
   await post("/admin/selfcheck", { source: s.source, ok: s.ok, problems: s.problems ?? [], hosts: s.hosts ?? 0 });

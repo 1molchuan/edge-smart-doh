@@ -18,6 +18,14 @@ export interface AppConfig {
   ecsDomains: string[];
   ecsIpv4Prefix: number;
   ecsIpv6Prefix: number;
+  /**
+   * ECS subnet for clients outside every mainland operator network (needs ISP_TABLE_URL). Their DoH
+   * query arrived through a proxy, typically in Hong Kong; with their own address a Chinese site
+   * answers with its overseas CDN, which the proxy's GeoIP rules then send abroad. Unset = their own.
+   */
+  ecsFallbackSubnet?: string;
+  /** Chinese-site domain lists that get ECS like ECS_DOMAINS (see cn-domains.ts); empty = ECS_DOMAINS only. */
+  ecsDomainListUrls: string[];
   edgeOneClientIpHeader: string;
   cfRewriteEnabled: boolean;
   /** Preferred-IP source domains; all are resolved and merged into one pool. */
@@ -52,6 +60,10 @@ export interface AppConfig {
    * reachability, not SNI DPI. AAAA is dropped for these (the pools are IPv4).
    */
   githubDomains: string[];
+  /** Block lists for ?safe=1 (see safe.ts); empty disables the feature. */
+  safeListUrls: string[];
+  /** Domains (and their subdomains) ?safe=1 never blocks. */
+  safeAllow: string[];
   dynamicRuleHosts: string[];
   dynamicRulesMaxBytes: number;
   debug: boolean;
@@ -97,6 +109,8 @@ export function readConfig(env: Env): AppConfig {
     ecsDomains: list(env.ECS_DOMAINS).map((item) => item.toLowerCase()),
     ecsIpv4Prefix: integer(env.ECS_IPV4_PREFIX, 24, 0, 32),
     ecsIpv6Prefix: integer(env.ECS_IPV6_PREFIX, 48, 0, 128),
+    ecsFallbackSubnet: env.ECS_FALLBACK_SUBNET || undefined,
+    ecsDomainListUrls: list(env.ECS_DOMAIN_LIST_URLS).filter((item) => item.startsWith("https://") || item.startsWith("http://127.0.0.1")),
     edgeOneClientIpHeader: env.EDGEONE_CLIENT_IP_HEADER || "X-EdgeOne-Client-IP-Configure-Me",
     cfRewriteEnabled: enabled(env.CF_REWRITE_ENABLED),
     cfPreferredDomains: list(env.CF_PREFERRED_DOMAIN).map((item) => item.replace(/\.$/, "").toLowerCase()),
@@ -118,6 +132,8 @@ export function readConfig(env: Env): AppConfig {
     metaDomains: list(env.META_DOMAINS).map((item) => item.toLowerCase()),
     xDomains: list(env.X_DOMAINS).map((item) => item.toLowerCase()),
     githubDomains: list(env.GITHUB_DOMAINS).map((item) => item.toLowerCase()),
+    safeListUrls: list(env.SAFE_LIST_URLS).filter((item) => item.startsWith("https://") || item.startsWith("http://127.0.0.1")),
+    safeAllow: list(env.SAFE_ALLOW).map((item) => item.toLowerCase().replace(/^\*?\./, "").replace(/\.$/, "")),
     dynamicRuleHosts: list(env.DYNAMIC_RULE_HOSTS).map((item) => item.toLowerCase()),
     dynamicRulesMaxBytes: integer(env.DYNAMIC_RULES_MAX_BYTES, 262144, 1024, 1048576),
     debug: enabled(env.DEBUG),
