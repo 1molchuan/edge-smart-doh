@@ -130,3 +130,28 @@ cd ~/Projects/edge-smart-doh && git checkout -- src/upstream.ts server/node.ts t
 1. **cn 无代理模式**：`deploy-doh.sh` 在 `DEPLOY_ENV=cn` 且留空 `PROXY_ADDR` 时，`UPSTREAMS` 必然包含直连国内递归（无代理时 cloudflare 被墙），与「永不降级」原则冲突。当前只在文档/脚本里标注为"仅过渡"，未删分支。
 2. **「全都截断」的兜底**：TC=1 一律算失败，所有上游都截断时客户端拿到 SERVFAIL（而不是可自行重试的 TC 应答）。已按"有意为之"处理并注释，未做兜底。
 3. **Worker 目标未重新部署**：本次只更新了 Node 版（`/opt/edge-smart-doh`）。若线上还有 Cloudflare Worker / EdgeOne / ESA 形态，需要各自 `wrangler deploy` 等才带上这批修复。
+
+---
+
+## 六、后续简化（2026-10-03 晚）：所有 DNS 查询全部出境，去掉国内解析器
+
+「信任清单」修复后 UPSTREAMS 已全部经代理，但 ECS 路径（ECS_DOMAINS 命中的国内域名）仍配着
+`1.12.12.12` / `dns.alidns.com` 直连。进一步的认识：这套 DoH 的目的就是解析可能被污染的域名，
+国内视角不应该再依赖国内解析器——**dns.google 转发 ECS**，经代理查询照样带上客户端子网：
+
+实测（ECS = 客户端 /24，dns.google 经本地代理出境）：
+
+| 查询 | alidns 直连（原路径） | dns.google 经代理 + ECS |
+|---|---|---|
+| www.taobao.com | 123.235.x / 27.221.x / 119.167.x … | **同一批节点** |
+| www.baidu.com | 110.242.x（联通） | 45.113.192.x（国内电信段；对照组：无 ECS 时给香港 103.235.46.x） |
+| cdn.jsdelivr.net | 104.17.207/208.5 | 相同 |
+
+改动（cn+代理模式）：
+
+- `ECS_UPSTREAMS` 只留 `https://dns.google/dns-query`——cloudflare 不转发 ECS，不能进 ECS 列表；
+- `NO_PROXY` 收敛为 `localhost,127.0.0.1,::1,www.cloudflare.com`（后者是 CF 网段表拉取，非 DNS 解析）。
+
+代价与取舍：Google 的 ECS 地理映射比国内递归粗（按运营商选节点不如 alidns 精细），换取的是
+**零国内解析器**——污染面不再存在，只剩一种出境路径；mihomo 故障时 ECS 路径同样干净失败
+（stale 缓存按 RFC 8767 兜底），不再有"代理挂了国内还能解析"的部分可用性。

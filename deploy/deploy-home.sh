@@ -160,14 +160,18 @@ if [[ "$DEPLOY_ENV" == "cn" ]]; then
     read -rp "出境代理地址（国内环境需要，如 http://127.0.0.1:7890；留空=无代理降级，被污染域名将解析不到）: " PROXY_ADDR
   fi
 fi
+ECS_UPSTREAMS_CFG=""                 # 非空时写入 env 的 ECS_UPSTREAMS（仅 cn+代理模式设置）
 if [[ "$DEPLOY_ENV" != "cn" ]]; then
   UPSTREAMS_CFG="https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query"
 elif [[ -n "$PROXY_ADDR" ]]; then
   # UPSTREAMS 是「信任清单」：只放经代理出境的上游。直连国内递归对受污染域名返回假 IP，
   # 且只要几十 ms（经代理上游要数百 ms），在 hedge 竞速里必然先到并获胜，假 IP 还会被写进
   # 答案缓存与 ECH/CF 判定用的派生缓存（实测时间线见 docs/upstream-trust-fix.md）。
-  # 国内地理视角的需求由 ECS_DOMAINS/ECS_UPSTREAMS 承担。
+  # 国内地理视角由 ECS 承担而非国内解析器：dns.google 转发 ECS，经代理仍能按客户端子网
+  # 拿到国内 CDN 节点（实测 www.taobao.com 与 alidns 同池）——所有 DNS 查询全部出境。
+  # cloudflare 不转发 ECS，不能进 ECS 列表，故 ECS 路径只留 dns.google。
   UPSTREAMS_CFG="https://cloudflare-dns.com/dns-query,https://dns.google/dns-query"
+  ECS_UPSTREAMS_CFG="https://dns.google/dns-query"
 else
   # 无代理降级模式：没有出境路径，只能把直连国内递归放进 UPSTREAMS —— 这违反「信任清单」
   # 约定（见 docs/upstream-trust-fix.md），被污染域名必然拿到假 IP，仅作过渡用。
@@ -182,12 +186,14 @@ else
   ok "已生成新 ADMIN_TOKEN"
 fi
 
-sed -i \
-  -e "s/^HOST=.*/HOST=0.0.0.0/" \
-  -e "s/^PUBLIC_HOSTNAMES=.*/PUBLIC_HOSTNAMES=${DOH_DOMAIN},${LAN_IP}/" \
-  -e "s|^UPSTREAMS=.*|UPSTREAMS=${UPSTREAMS_CFG}|" \
-  -e "s/^MAX_DNS_PACKET_SIZE=.*/MAX_DNS_PACKET_SIZE=16384/" \
-  "$ENV_FILE"
+SED_ARGS=(
+  -e "s/^HOST=.*/HOST=0.0.0.0/"
+  -e "s/^PUBLIC_HOSTNAMES=.*/PUBLIC_HOSTNAMES=${DOH_DOMAIN},${LAN_IP}/"
+  -e "s|^UPSTREAMS=.*|UPSTREAMS=${UPSTREAMS_CFG}|"
+  -e "s/^MAX_DNS_PACKET_SIZE=.*/MAX_DNS_PACKET_SIZE=16384/"
+)
+[[ -n "$ECS_UPSTREAMS_CFG" ]] && SED_ARGS+=( -e "s|^ECS_UPSTREAMS=.*|ECS_UPSTREAMS=${ECS_UPSTREAMS_CFG}|" )
+sed -i "${SED_ARGS[@]}" "$ENV_FILE"
 # MAX_DNS_PACKET_SIZE=16384：node.ts 用它限制所有 POST 体（不止 DNS 包），
 # cfhub 大运营商池的 JSON 可超默认 4096 → 413 → 池同步失败退社区池
 
@@ -245,8 +251,9 @@ ${UNIT_DEP}
 [Service]
 Environment=HTTP_PROXY=${PROXY_ADDR}
 Environment=HTTPS_PROXY=${PROXY_ADDR}
-# 国内上游/优选社区域名必须直连：保住国内视角，不被境外出口的地理解析带偏
-Environment=NO_PROXY=localhost,127.0.0.1,::1,1.12.12.12,dns.alidns.com,cf.090227.xyz,skk.moe,www.cloudflare.com
+# 所有 DNS 查询（含 ECS 路径）经代理出境，无国内解析器；
+# 仅回环与 www.cloudflare.com（CF 网段表拉取，非 DNS 解析）保持直连
+Environment=NO_PROXY=localhost,127.0.0.1,::1,www.cloudflare.com
 ExecStart=
 ExecStart=/usr/bin/node --import /opt/edge-smart-doh/proxy-preload.mjs /opt/edge-smart-doh/node.mjs
 EOF
