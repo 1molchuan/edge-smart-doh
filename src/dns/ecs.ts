@@ -85,3 +85,51 @@ export function removeEcs(packet: DnsPacket): DnsPacket {
   });
   return { ...packet, additionals };
 }
+
+function routableV4(bytes: Uint8Array): boolean {
+  const [a = 0, b = 0] = bytes;
+  if (a === 0 || a === 10 || a === 127) return false;
+  if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT
+  if (a === 169 && b === 254) return false; // link-local
+  if (a === 172 && b >= 16 && b <= 31) return false;
+  if (a === 192 && b === 168) return false;
+  if (a >= 224) return false; // multicast, reserved, broadcast
+  return true;
+}
+
+function routableV6(bytes: Uint8Array): boolean {
+  if (bytes.slice(0, 15).every((value) => value === 0) && bytes[15]! <= 1) return false; // :: and ::1
+  if (bytes[0] === 0xff) return false; // multicast
+  if ((bytes[0]! & 0xfe) === 0xfc) return false; // ULA fc00::/7
+  if (bytes[0] === 0xfe && (bytes[1]! & 0xc0) === 0x80) return false; // link-local
+  return true;
+}
+
+/**
+ * Whether an address can stand for a client on the public internet. A loopback or RFC 1918 address
+ * cannot: public resolvers reject ECS built from it (dns.google answers REFUSED), so behind a home
+ * router every LAN client would fail Chinese-site queries outright. IPv4-mapped IPv6 counts as its
+ * IPv4; anything unparseable counts as non-routable (no ECS rather than a broken one).
+ */
+export function isGloballyRoutable(ip: string): boolean {
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped) return isGloballyRoutable(mapped[1]!);
+  try {
+    return ip.includes(".") ? routableV4(parseIpv4(ip)) : routableV6(parseIpv6(ip));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The address ECS is built from: the client's own, the configured fallback subnet when the client is
+ * known to sit outside every mainland operator (a non-routable LAN address always is — no ISP table
+ * needed), or none — a non-routable client address must never become the ECS source, it would turn
+ * every Chinese-site query into a REFUSED SERVFAIL instead of a plain overseas answer.
+ */
+export function ecsSourceIp(ip: string | undefined, fallback: string | undefined, clientOutsideOperators: boolean): string | undefined {
+  if (!ip) return undefined;
+  const routable = isGloballyRoutable(ip);
+  if (fallback && (!routable || clientOutsideOperators)) return fallback;
+  return routable ? ip : undefined;
+}

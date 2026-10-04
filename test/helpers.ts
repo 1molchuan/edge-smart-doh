@@ -16,6 +16,8 @@ export function config(overrides: Partial<AppConfig> = {}): AppConfig {
     ecsIpv4Prefix: 24,
     ecsIpv6Prefix: 48,
     ecsDomainListUrls: [],
+    cnUpstreams: [],
+    cnDomains: [],
     edgeOneClientIpHeader: "EO-Connecting-IP",
     cfRewriteEnabled: false,
     cfPreferredDomains: [],

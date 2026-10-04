@@ -1,4 +1,5 @@
 import type { AppConfig } from "./config";
+import { domainMatches } from "./dns/ecs";
 
 /**
  * Chinese-site domain lists (ECS_DOMAIN_LIST_URLS), on top of the static ECS_DOMAINS: names on them
@@ -79,6 +80,17 @@ export function isChineseSite(name: string, config: AppConfig): boolean {
       });
   }
   return current ? domainListMatch(current, name) : false;
+}
+
+/**
+ * The one domestic-name verdict: the static suffixes (ECS_DOMAINS, then the operator's CN_DOMAINS)
+ * or any of the loaded lists. It decides both upstream routing (CN_UPSTREAMS vs the proxied
+ * trust list) and, when no CN upstreams are configured, which names carry ECS.
+ */
+export function isDomesticSite(name: string, config: AppConfig): boolean {
+  return domainMatches(name, config.ecsDomains)
+    || domainMatches(name, config.cnDomains)
+    || isChineseSite(name, config);
 }
 
 export function chineseSiteStatus(): { suffix: number; exact: number; loadedAt: string } | undefined {

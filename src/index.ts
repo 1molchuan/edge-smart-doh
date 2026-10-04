@@ -1,7 +1,7 @@
 import { normalizedCacheIdentity, readCache, rotateAddressRecords, writeCache, type CacheHit, type CacheIdentity } from "./cache";
 import { inAnyCidr } from "./cidr";
 import { readConfig, type AppConfig } from "./config";
-import { addEcs, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
+import { addEcs, ecsSourceIp, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
 import { encodeDnsPacket, makeServfail, parseDnsPacket, parseIpv4, patchTransactionId } from "./dns/packet";
 import { DnsType, type DnsPacket } from "./dns/types";
 import { chromiumEchVerdict, describeAnswers, dnsTypeName, selfCheckStatus, setSelfCheck } from "./explain";
@@ -16,7 +16,7 @@ import { renderPlan } from "./render";
 import { PUBLIC_STRATEGIES } from "./strategies";
 import { queryUpstreams } from "./upstream";
 import { safeBlocked, safeBlockedResponse, safeStatus } from "./safe";
-import { chineseSiteStatus, isChineseSite } from "./cn-domains";
+import { chineseSiteStatus, isDomesticSite } from "./cn-domains";
 
 const DNS_CONTENT_TYPE = "application/dns-message";
 const STRATEGIES = sortStrategies(PUBLIC_STRATEGIES);
@@ -135,7 +135,7 @@ interface DnsSetup {
   options: RequestOptions;
   cache: Cache;
   ip?: string;
-  /** The address ECS is built from: the client's, or ECS_FALLBACK_SUBNET for a client outside every operator. */
+  /** The address ECS is built from: the client's, ECS_FALLBACK_SUBNET for a client outside every operator, or none (non-routable client). */
   ecsIp?: string;
   scope?: string;
   rules: RuleSet;
@@ -157,7 +157,7 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
   };
   // The operator matters for the server default pool and for the ECS fallback.
   const ispScope = options.cfDomainIsDefault === true || config.ecsFallbackSubnet ? await ispScopeOf(ip, config, cache) : undefined;
-  const ecsIp = config.ecsFallbackSubnet && ip && ispTableReady() && ispScope === undefined ? config.ecsFallbackSubnet : ip;
+  const ecsIp = ecsSourceIp(ip, config.ecsFallbackSubnet, ispTableReady() && ispScope === undefined);
   try {
     preferred = await preferredPool(
       { ipv4: options.preferredIpv4, ipv6: options.preferredIpv6 },
@@ -188,17 +188,21 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
 }
 
 /** ECS decision and cache key for one query. */
-function planQuery(query: DnsPacket, setup: DnsSetup): { upstreamQuery: DnsPacket; useEcs: boolean; ecsIdentity?: string; identity: CacheIdentity } {
+function planQuery(query: DnsPacket, setup: DnsSetup): { upstreamQuery: DnsPacket; useEcs: boolean; useCn: boolean; ecsIdentity?: string; identity: CacheIdentity } {
   const { config, options, rules, ecsIp } = setup;
   const ecs = ecsIp ? makeEcsValue(ecsIp, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined;
-  // A rule decides first; then, in rules mode, the Chinese-site lists add to ECS_DOMAINS.
-  const override = ecsOverride(rules, query) ?? (config.ecsMode === "rules" && isChineseSite(query.questions[0]!.name, config) ? true : undefined);
-  const useEcs = ecs ? shouldUseEcs(query, config, override) : false;
+  // A domestic name goes to the direct CN resolvers when configured — no ECS: dialed from inside
+  // China, they see the client's own operator by source IP, which is finer than any ECS /24.
+  // Otherwise a rule decides first, and in rules mode the domestic lists add to ECS_DOMAINS.
+  const domestic = isDomesticSite(query.questions[0]!.name, config);
+  const useCn = domestic && config.cnUpstreams.length > 0;
+  const override = ecsOverride(rules, query) ?? (config.ecsMode === "rules" && domestic ? true : undefined);
+  const useEcs = !useCn && ecs ? shouldUseEcs(query, config, override) : false;
   const upstreamQuery = useEcs && ecs ? addEcs(query, ecs) : removeEcs(query);
   const question = query.questions[0]!;
   const variant = options.cacheVariant + strategyCacheTags(STRATEGIES, { config, options, scope: setup.scope, name: question.name, type: question.type });
   const ecsIdentity = useEcs && ecs ? ecs.identity : undefined;
-  return { upstreamQuery, useEcs, ecsIdentity, identity: normalizedCacheIdentity(query, ecsIdentity ?? "none", variant) };
+  return { upstreamQuery, useEcs, useCn, ecsIdentity, identity: normalizedCacheIdentity(query, useCn ? "cn" : ecsIdentity ?? "none", variant) };
 }
 
 /**
@@ -236,12 +240,12 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   // Blocked before the cache: every other answer is the same with or without ?safe=1, so they share it.
   if (options.safe && safeBlocked(query.questions[0]!.name, config)) return dnsResponse(encodeDnsPacket(safeBlockedResponse(query)));
 
-  const { upstreamQuery, useEcs, identity } = planQuery(query, setup);
+  const { upstreamQuery, useEcs, useCn, identity } = planQuery(query, setup);
   const question = query.questions[0]!;
   const cached = await readCache(cache, identity, config);
 
   const resolveAndStore = async (): Promise<{ wire: Uint8Array; upstream: string }> => {
-    const resolved = await resolveFresh(query, upstreamQuery, useEcs, rules, options, config, cache);
+    const resolved = await resolveFresh(query, upstreamQuery, useEcs, useCn, rules, options, config, cache);
     ctx.waitUntil(writeCache(cache, identity, resolved.wire, config).catch((error: unknown) => {
       if (config.debug) console.warn(JSON.stringify({ event: "cache_write_error", message: errorMessage(error) }));
     }));
@@ -283,6 +287,7 @@ async function resolveFresh(
   query: DnsPacket,
   upstreamQuery: DnsPacket,
   useEcs: boolean,
+  useCn: boolean,
   rules: RuleSet,
   options: RequestOptions,
   config: AppConfig,
@@ -290,10 +295,11 @@ async function resolveFresh(
   notes?: string[],
 ): Promise<{ wire: Uint8Array; upstream: string; plan: RoutePlan }> {
   const upstreamWire = encodeDnsPacket(upstreamQuery);
-  const result = await queryUpstreams(upstreamWire, config, { ecs: useEcs });
+  const result = await queryUpstreams(upstreamWire, config, { ecs: useEcs, cn: useCn });
   const originalResponse = parseDnsPacket(result.packet);
   if (originalResponse.header.id !== upstreamQuery.header.id) throw new Error("Upstream transaction ID mismatch");
   if (notes) {
+    if (useCn) notes.push("domestic name: resolved through the direct CN upstreams (no ECS — the resolver sees the client's operator by source IP)");
     const answers = describeAnswers(originalResponse);
     notes.push(`upstream ${new URL(result.upstream).hostname}${useEcs ? " (with ECS)" : ""}: rcode ${originalResponse.header.flags & 0x0f}, ${answers.length > 0 ? answers.join("; ") : "no answers"}`);
   }
@@ -343,7 +349,7 @@ async function handleExplain(request: Request, env: Env, runtime: RequestRuntime
     let routePlan: Record<string, unknown> | undefined;
     let error: string | undefined;
     try {
-      const resolved = await resolveFresh(query, plan.upstreamQuery, plan.useEcs, setup.rules, setup.options, setup.config, setup.cache, notes);
+      const resolved = await resolveFresh(query, plan.upstreamQuery, plan.useEcs, plan.useCn, setup.rules, setup.options, setup.config, setup.cache, notes);
       fresh = parseDnsPacket(resolved.wire);
       routePlan = describePlan(resolved.plan);
     } catch (caught) {

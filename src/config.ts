@@ -19,6 +19,16 @@ export interface AppConfig {
   ecsIpv4Prefix: number;
   ecsIpv6Prefix: number;
   /**
+   * Upstreams for domestic (mainland Chinese) names when the domain-split module is on: resolvers
+   * dialed directly inside China. Empty = the module is off and domestic names keep using the ECS
+   * path (ECS_UPSTREAMS with the client subnet or ECS_FALLBACK_SUBNET). Their hostnames must bypass
+   * the egress proxy (server/node.ts warns otherwise): going through it both slows them down and
+   * hands them a foreign resolver's view.
+   */
+  cnUpstreams: string[];
+  /** Extra domestic domain suffixes on top of ECS_DOMAINS and the ECS_DOMAIN_LIST_URLS lists. */
+  cnDomains: string[];
+  /**
    * ECS subnet for clients outside every mainland operator network (needs ISP_TABLE_URL). Their DoH
    * query arrived through a proxy, typically in Hong Kong; with their own address a Chinese site
    * answers with its overseas CDN, which the proxy's GeoIP rules then send abroad. Unset = their own.
@@ -109,7 +119,10 @@ export function readConfig(env: Env): AppConfig {
     ecsDomains: list(env.ECS_DOMAINS).map((item) => item.toLowerCase()),
     ecsIpv4Prefix: integer(env.ECS_IPV4_PREFIX, 24, 0, 32),
     ecsIpv6Prefix: integer(env.ECS_IPV6_PREFIX, 48, 0, 128),
-    ecsFallbackSubnet: env.ECS_FALLBACK_SUBNET || undefined,
+    cnUpstreams: list(env.CN_UPSTREAMS).filter((item) => item.startsWith("https://")),
+    cnDomains: list(env.CN_DOMAINS).map((item) => item.toLowerCase()),
+    // A "/24" suffix is accepted and ignored: the prefix comes from ECS_IPV4_PREFIX/ECS_IPV6_PREFIX.
+    ecsFallbackSubnet: (env.ECS_FALLBACK_SUBNET ?? "").split("/", 1)[0] || undefined,
     ecsDomainListUrls: list(env.ECS_DOMAIN_LIST_URLS).filter((item) => item.startsWith("https://") || item.startsWith("http://127.0.0.1")),
     edgeOneClientIpHeader: env.EDGEONE_CLIENT_IP_HEADER || "X-EdgeOne-Client-IP-Configure-Me",
     cfRewriteEnabled: enabled(env.CF_REWRITE_ENABLED),

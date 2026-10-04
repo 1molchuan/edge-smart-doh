@@ -19,6 +19,8 @@ const DEFAULTS = {
   ECS_IPV6_PREFIX: "48",
   ECS_FALLBACK_SUBNET: "",
   ECS_DOMAIN_LIST_URLS: "",
+  CN_UPSTREAMS: "",
+  CN_DOMAINS: "",
   EDGEONE_CLIENT_IP_HEADER: "X-EdgeOne-Client-IP-Configure-Me",
   CF_REWRITE_ENABLED: "false",
   CF_PREFERRED_DOMAIN: "",
@@ -237,7 +239,40 @@ function warnOnMixedUpstreamTrust(): void {
     event: "upstream_trust_warning",
     message: "UPSTREAMS mixes proxied and direct (NO_PROXY) upstreams: the direct one answers first, and its answers are the ones the proxy was avoiding",
     direct,
-    hint: "keep UPSTREAMS to proxied (trusted) resolvers; serve direct/domestic resolvers from ECS_UPSTREAMS instead",
+    hint: "keep UPSTREAMS to proxied (trusted) resolvers; serve direct/domestic resolvers from CN_UPSTREAMS instead",
+  }));
+}
+
+/**
+ * CN_UPSTREAMS are the opposite of the trust list: they are dialed directly, so a proxy env var
+ * reaching them is exactly wrong — the query leaves through the proxy, the resolver sees the
+ * proxy's exit instead of the client's operator, and a domestic resolver is suddenly the slow
+ * path. Warn instead of refusing to start, so a misconfigured box keeps serving while fixed.
+ */
+function warnOnCnUpstreamProxy(): void {
+  const proxy = process.env.https_proxy ?? process.env.HTTPS_PROXY ?? process.env.http_proxy ?? process.env.HTTP_PROXY;
+  if (!proxy) return;
+  const bypasses = noProxyMatcher(
+    (process.env.no_proxy ?? process.env.NO_PROXY ?? "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean),
+  );
+  const proxied: string[] = [];
+  for (const item of (process.env.CN_UPSTREAMS ?? "").split(",")) {
+    const value = item.trim();
+    if (!value.startsWith("https://")) continue;
+    let hostname: string;
+    try {
+      hostname = new URL(value).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    } catch {
+      continue;
+    }
+    if (!bypasses?.(hostname)) proxied.push(hostname);
+  }
+  if (proxied.length === 0) return;
+  console.warn(JSON.stringify({
+    event: "cn_upstream_proxy_warning",
+    message: "CN_UPSTREAMS entries are not in NO_PROXY: they go through the egress proxy, losing the domestic view and the speed the split exists for",
+    proxied,
+    hint: "add their hostnames to NO_PROXY (see contrib/home/deploy-home.sh, which keeps the drop-in in sync)",
   }));
 }
 
@@ -342,6 +377,7 @@ const host = process.env.HOST ?? "127.0.0.1";
 const port = numberFromEnvironment("PORT", 8787, 1, 65535);
 loadPersistedCache();
 warnOnMixedUpstreamTrust();
+warnOnCnUpstreamProxy();
 server.listen(port, host, () => console.log(JSON.stringify({ event: "listening", host, port })));
 
 // Periodic snapshot bounds the loss on an unclean exit (OOM kill, power loss).

@@ -27,6 +27,13 @@ PROXY_UNIT=""                        # 代理在本机时的 systemd 单元名�
 CF_TOKEN=""                          # 留空 = 需要时交互输入（read -s，不进 history）
 ACME_EMAIL=""                        # 留空 = 首次安装 acme.sh 时交互输入，答案存 deploy.conf
 NPM_REGISTRY="https://registry.npmmirror.com"   # undici 安装源（仅 cn+代理路径用到）
+ECS_DOMAIN_LIST_URLS_CFG=""           # 国内域名名单 URL（国内站拿国内 CDN 节点靠它）；留空=默认
+                                      # Loyalsoldier direct-list；"none"=显式关闭（国内站将拿海外节点）
+ECS_FALLBACK_SUBNET_CFG=""            # 解析国内域名时的 ECS 出口子网（填家宽公网 IPv4）；
+                                      # 留空=每次重跑自动探测并更新（PPPoE 重拨换 IP 后重跑即可）
+CN_UPSTREAMS_CFG=""                   # 国内域名的直连解析器（国内 DNS 看到的源 IP 即家宽运营商，
+                                      # 比 ECS 更准且不依赖代理）；留空=默认阿里 DoH+腾讯 DoH；
+                                      # "none"=关闭国内直连，国内域名退回 ECS 路径（经代理）
 OPEN_PUBLIC=1                        # 1 = 完整公网部署(证书/Caddy/8443/DDNS)
                                      # 0 = 仅内网(服务+cfhub+8787)，公网零暴露，以后改 1 重跑
 SETUP_DDNS=1                         # OPEN_PUBLIC=1 时生效
@@ -46,6 +53,33 @@ log()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m  [ok] %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m  [!] %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31m  [x] %s\033[0m\n' "$*" >&2; exit 1; }
+
+# env 键值写入：键不存在则追加（旧版 env.example 的拷贝可能缺新键），存在则覆盖。
+# 替换文本先转义 sed 的特殊字符（& | \）：URL 带 query（?a=1&b=2）时 & 会展开成整行。
+set_env_value() {  # set_env_value KEY VALUE
+  local escaped
+  escaped="$(printf '%s' "$2" | sed -e 's/[\\|]/\\&/g' -e 's/&/\\&/g')"
+  if grep -q "^$1=" "$ENV_FILE"; then
+    sed -i "s|^$1=.*|$1=${escaped}|" "$ENV_FILE"
+  else
+    printf '%s=%s\n' "$1" "$2" >> "$ENV_FILE"
+  fi
+}
+env_has_value() { grep -qE "^$1=.+" "$ENV_FILE"; }
+
+# 出口公网 IPv4 探测：必须直连（--noproxy，走代理拿到的是代理出口）；国内源互为备份。
+# 拿到私网/CGNAT/回环段视为失败——代理 TUN 全局接管时会这样。
+probe_public_ipv4() {
+  local src ip
+  for src in https://ip.3322.net/ https://4.ipw.cn; do
+    ip="$(curl -4 --noproxy '*' -s --max-time 8 "$src" 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1 || true)"
+    case "$ip" in
+      ""|10.*|127.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) continue ;;
+      *) printf '%s\n' "$ip"; return 0 ;;
+    esac
+  done
+  return 1
+}
 
 # 持久化站点配置（只写白名单键；文件 root 0600，不进仓库）
 save_conf() {  # save_conf KEY VALUE
@@ -170,9 +204,9 @@ elif [[ -n "$PROXY_ADDR" ]]; then
   # UPSTREAMS 是「信任清单」：只放经代理出境的上游。直连国内递归对受污染域名返回假 IP，
   # 且只要几十 ms（经代理上游要数百 ms），在 hedge 竞速里必然先到并获胜，假 IP 还会被写进
   # 答案缓存与 ECH/CF 判定用的派生缓存（实测时间线见 contrib/home/README.md）。
-  # 国内地理视角由 ECS 承担而非国内解析器：dns.google 转发 ECS，经代理仍能按客户端子网
-  # 拿到国内 CDN 节点（实测 www.taobao.com 与 alidns 同池）——所有 DNS 查询全部出境。
-  # cloudflare 不转发 ECS，不能进 ECS 列表，故 ECS 路径只留 dns.google。
+  # 国内域名不进这个池子：由 CN_UPSTREAMS 直连国内解析器分流（见下方「国内网站的国内节点」），
+  # 两组上游各查各的域名，互不竞速。ECS 路径（CN 分流关闭时的回退）只留 dns.google：
+  # cloudflare 不转发 ECS，不能进 ECS 列表。
   UPSTREAMS_CFG="https://cloudflare-dns.com/dns-query,https://dns.google/dns-query"
   ECS_UPSTREAMS_CFG="https://dns.google/dns-query"
 else
@@ -197,6 +231,51 @@ SED_ARGS=(
 )
 [[ -n "$ECS_UPSTREAMS_CFG" ]] && SED_ARGS+=( -e "s|^ECS_UPSTREAMS=.*|ECS_UPSTREAMS=${ECS_UPSTREAMS_CFG}|" )
 sed -i "${SED_ARGS[@]}" "$ENV_FILE"
+
+# ---- 国内网站的国内节点（仅 cn+代理模式）：域名名单 + ECS 出口子网 ----
+# 不带国内子网去问 dns.google，它按查询来源（=代理出口，境外）选 CDN：developer.huawei.com
+# 拿到 Akamai 欧洲节点，浏览器分流再把海外 IP 送出国，国内站自然巨慢。两个键缺一不可：
+# 名单决定哪些域名带 ECS，子网决定 CDN 按哪段地址选节点（本机/局域网客户端地址是
+# 127.0.0.1/192.168.x.x，dns.google 对非公网子网一律 REFUSED，不能作为 ECS 源）。
+if [[ "$DEPLOY_ENV" == "cn" && -n "$PROXY_ADDR" ]]; then
+  if [[ "$ECS_DOMAIN_LIST_URLS_CFG" == "none" ]]; then
+    set_env_value ECS_DOMAIN_LIST_URLS ""
+    warn "ECS_DOMAIN_LIST_URLS_CFG=none：国内域名名单保持关闭（国内站将拿海外 CDN 节点）"
+  else
+    # CFG 非空时总是以它为准（换名单源改配置区即可）；CFG 留空时 env 里已有值不动（用户手填的
+    # 名单源），缺失/为空才补默认。与 CN_UPSTREAMS_CFG 的覆盖语义保持一致。
+    if [[ -n "$ECS_DOMAIN_LIST_URLS_CFG" ]] || ! env_has_value ECS_DOMAIN_LIST_URLS; then
+      set_env_value ECS_DOMAIN_LIST_URLS "${ECS_DOMAIN_LIST_URLS_CFG:-https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt}"
+      ok "国内域名名单：$(sed -n 's/^ECS_DOMAIN_LIST_URLS=//p' "$ENV_FILE" | head -1)"
+    else
+      ok "国内域名名单已配置：$(sed -n 's/^ECS_DOMAIN_LIST_URLS=//p' "$ENV_FILE" | head -1)"
+    fi
+  fi
+  if [[ -z "$ECS_FALLBACK_SUBNET_CFG" ]] && ECS_FALLBACK_SUBNET_CFG="$(probe_public_ipv4)"; then
+    ok "探测到出口公网 IPv4：$ECS_FALLBACK_SUBNET_CFG（作为 ECS 源，按 /24 截断）"
+  fi
+  if [[ -n "$ECS_FALLBACK_SUBNET_CFG" ]]; then
+    set_env_value ECS_FALLBACK_SUBNET "$ECS_FALLBACK_SUBNET_CFG"
+  else
+    ECS_FALLBACK_SUBNET_CFG="$(sed -n 's/^ECS_FALLBACK_SUBNET=//p' "$ENV_FILE" | head -1)"
+    if [[ -n "$ECS_FALLBACK_SUBNET_CFG" ]]; then
+      ok "出口 IPv4 探测失败，沿用已有 ECS_FALLBACK_SUBNET=$ECS_FALLBACK_SUBNET_CFG"
+    else
+      warn "出口 IPv4 探测失败：国内域名暂无 ECS 子网，将拿海外节点；下次重跑会再探测"
+    fi
+  fi
+  # 国内域名直连解析器：名单命中的域名不再经代理问 dns.google，而是直连国内 DNS——
+  # 国内 DNS 看到的查询源 IP 就是家宽出口（运营商级视角，比 ECS /24 更准），也不再依赖代理。
+  # 这些解析器的主机名必须绕过代理（drop-in 的 NO_PROXY，见步骤 3b），否则又变回代理路径。
+  if [[ "$CN_UPSTREAMS_CFG" == "none" ]]; then
+    set_env_value CN_UPSTREAMS ""
+    warn "CN_UPSTREAMS_CFG=none：国内域名退回 ECS 路径（经代理查 dns.google）"
+  else
+    CN_UPSTREAMS_CFG="${CN_UPSTREAMS_CFG:-https://dns.alidns.com/dns-query,https://doh.pub/dns-query}"
+    set_env_value CN_UPSTREAMS "$CN_UPSTREAMS_CFG"
+    ok "国内域名直连上游：$CN_UPSTREAMS_CFG"
+  fi
+fi
 # MAX_DNS_PACKET_SIZE=16384：node.ts 用它限制所有 POST 体（不止 DNS 包），
 # cfhub 大运营商池的 JSON 可超默认 4096 → 413 → 池同步失败退社区池
 
@@ -246,21 +325,28 @@ EOF
   fi
 
   install -d -m 0755 /etc/systemd/system/edge-smart-doh.service.d
+  # 国内直连解析器（CN_UPSTREAMS）的主机名进 NO_PROXY：它们必须绕过代理直连，否则又变回
+  # 代理路径（慢 + 解析器看到的是代理出口视角）。服务启动时也会自查（cn_upstream_proxy_warning）。
+  CN_NOPROXY=""
+  if [[ -n "$CN_UPSTREAMS_CFG" && "$CN_UPSTREAMS_CFG" != "none" ]]; then
+    CN_NOPROXY="$(printf '%s' "$CN_UPSTREAMS_CFG" | tr ',' '\n' | sed -E 's|^https?://([^/@]*@)?([^/]+).*|\2|' | paste -sd, -)"
+  fi
+  NO_PROXY_VALUE="localhost,127.0.0.1,::1,www.cloudflare.com${CN_NOPROXY:+,$CN_NOPROXY}"
   tee "$DROPIN_PROXY" > /dev/null <<EOF
-# 由 contrib/home/deploy-home.sh 生成：上游 fetch 经代理出境（国内环境）
+# 由 contrib/home/deploy-home.sh 生成：境外上游 fetch 经代理出境（国内环境）
 [Unit]
 ${UNIT_DEP}
 
 [Service]
 Environment=HTTP_PROXY=${PROXY_ADDR}
 Environment=HTTPS_PROXY=${PROXY_ADDR}
-# 所有 DNS 查询（含 ECS 路径）经代理出境，无国内解析器；
-# 仅回环与 www.cloudflare.com（CF 网段表拉取，非 DNS 解析）保持直连
-Environment=NO_PROXY=localhost,127.0.0.1,::1,www.cloudflare.com
+# 境外域名（默认上游、ECS 路径）经代理出境；国内域名走 CN_UPSTREAMS 直连。
+# 直连名单：回环、www.cloudflare.com（CF 网段表拉取，非 DNS 解析）与国内解析器主机名
+Environment=NO_PROXY=${NO_PROXY_VALUE}
 ExecStart=
 ExecStart=/usr/bin/node --import /opt/edge-smart-doh/proxy-preload.mjs /opt/edge-smart-doh/node.mjs
 EOF
-  ok "代理接线完成（Node fetch→代理；NO_PROXY 名单直连）"
+  ok "代理接线完成（境外上游走代理；NO_PROXY 名单直连${CN_NOPROXY:+：$CN_NOPROXY}）"
 else
   # 无代理模式：清掉历史 drop-in，避免旧的 ExecStart 覆盖/代理变量残留
   rm -f "$DROPIN_PROXY"
