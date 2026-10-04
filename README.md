@@ -172,7 +172,7 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 
 ### 在家里部署（社区贡献）
 
-家宽或国内小机上自用：`contrib/home/` 里有 [@liyu34](https://github.com/liyu34) 贡献的一键部署脚本和说明（代理出境、证书、DDNS、同步 cfhub 优选池）。在国内部署时上游必须全部经代理出境，原因见 [contrib/home/README.md](contrib/home/README.md)。
+家宽或国内小机上自用：`contrib/home/` 里有 [@liyu34](https://github.com/liyu34) 贡献的一键部署脚本和说明（代理出境、证书、DDNS、同步 cfhub 优选池）。境外上游必须经代理出境（信任清单），国内域名走直连分流，原因见 [contrib/home/README.md](contrib/home/README.md)。
 
 ### Cloudflare Worker
 
@@ -197,8 +197,10 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 | `ECS_MODE` | `rules` | `off`、`always`，或 `rules`（只对 `ECS_DOMAINS` 和规则指定的域名） |
 | `ECS_DOMAINS` | `.cn` | 带 ECS 的域名后缀 |
 | `ECS_IPV4_PREFIX` / `ECS_IPV6_PREFIX` | 24 / 48 | ECS 子网长度 |
-| `ECS_DOMAIN_LIST_URLS` | 空 | 国内网站域名名单（如 Loyalsoldier 的 `direct-list.txt`），名单里的域名和 `ECS_DOMAINS` 一样带 ECS 走 `ECS_UPSTREAMS`，拿到国内 CDN 节点；每天更新 |
-| `ECS_FALLBACK_SUBNET` | 空 | 访客 IP 不属于任何国内运营商时（通常是 DoH 查询走了境外代理），ECS 改用这个国内子网，避免国内网站返回海外 CDN。需要配置 `ISP_TABLE_URL` |
+| `ECS_DOMAIN_LIST_URLS` | 空 | 国内网站域名名单（如 Loyalsoldier 的 `direct-list.txt`），每天更新。名单里的域名是国内域名：配了 `CN_UPSTREAMS` 时直连国内解析器，否则带 ECS 走 `ECS_UPSTREAMS`，两种路径都拿到国内 CDN 节点 |
+| `ECS_FALLBACK_SUBNET` | 空 | 访客 IP 不属于任何国内运营商时（通常是 DoH 查询走了境外代理，或客户端在私网/回环地址上——本机或局域网部署就是这样），ECS 改用这个国内子网，避免国内网站返回海外 CDN。非公网客户端直接适用；公网客户端需配置 `ISP_TABLE_URL` 才能判定。容忍 `1.2.3.4/24` 写法 |
+| `CN_UPSTREAMS` | 空 | 域名分流模块：国内域名（`ECS_DOMAINS` + `CN_DOMAINS` + 名单）改走这些**直连的国内解析器**（如 `https://dns.alidns.com/dns-query,https://doh.pub/dns-query`），不带 ECS——国内解析器看到的查询源 IP 就是客户端运营商，比 ECS 更准；其余域名照旧走 `UPSTREAMS`。空 = 关闭，国内域名走 ECS 路径。国内判定优先于 `ECS_MODE` 与 per-domain 的 ECS 规则；关闭只能清空 `CN_UPSTREAMS`。给服务配了出境代理时，这些解析器的主机名必须在 `NO_PROXY` 里（否则被代理接管，`server/node.ts` 会告警） |
+| `CN_DOMAINS` | 空 | 在 `ECS_DOMAINS` 和名单之外自加的国内域名后缀（带前导点才是后缀语义，如 `.mycompany.example`；不带点只匹配该域名本身） |
 | `CF_REWRITE_ENABLED` | false | 有池子时会自动开启，一般不用设 |
 | `CF_PREFERRED_DOMAIN` | 空 | 优选域名，解析出的地址合并为第 5 层池子 |
 | `CF_PREFERRED_IPV4` / `CF_PREFERRED_IPV6` | 空 | 静态优选地址 |

@@ -10,6 +10,8 @@ export interface UpstreamResult {
 export interface UpstreamOptions {
   /** Use the ECS-capable upstream list instead of the default one. */
   ecs?: boolean;
+  /** Use the domestic-resolver list (CN_UPSTREAMS) instead of the default one. */
+  cn?: boolean;
 }
 
 /** Hostname for diagnostics; a malformed URL must not turn a failure path into a throw. */
@@ -60,7 +62,7 @@ async function queryOne(upstream: string, query: Uint8Array, config: AppConfig, 
  * degrades to plain sequential fallback.
  */
 export function queryUpstreams(query: Uint8Array, config: AppConfig, options: UpstreamOptions = {}): Promise<UpstreamResult> {
-  const upstreams = options.ecs ? config.ecsUpstreams : config.upstreams;
+  const upstreams = options.cn && config.cnUpstreams.length > 0 ? config.cnUpstreams : options.ecs ? config.ecsUpstreams : config.upstreams;
   if (upstreams.length === 0) return Promise.reject(new Error("No upstreams configured"));
 
   return new Promise<UpstreamResult>((resolve, reject) => {
