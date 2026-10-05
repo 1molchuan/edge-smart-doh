@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { handleRequest, type RequestRuntime, type WaitUntilContext } from "../src/index";
 
 const DEFAULTS = {
-  UPSTREAMS: "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query",
+  UPSTREAMS: "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://unfiltered.adguard-dns.com/dns-query",
   ECS_UPSTREAMS: "",
   UPSTREAM_TIMEOUT_MS: "2500",
   UPSTREAM_HEDGE_MS: "100",

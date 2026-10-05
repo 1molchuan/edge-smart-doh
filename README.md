@@ -25,7 +25,7 @@
 2. **确定访问者**：Node 版本从 `X-Real-IP`（没有就用 TCP 对端地址）取得客户端 IP，Worker 版本用 `CF-Connecting-IP`。IP 只用来选池和决定 ECS，不写日志、不落盘。
 3. **选出这次用的优选池**（见[优选池分层](#优选池分层)）。
 4. **查缓存**（见[缓存](#缓存)）。命中就直接返回。
-5. **查上游**：同时准备多个上游 DoH（默认 Cloudflare、Google、Quad9）。先问第一个，`UPSTREAM_HEDGE_MS` 毫秒内没回或者失败，就再问下一个，谁先给出合法应答用谁。“合法”指 HTTP 200 + `application/dns-message` + QR 位为响应，且 rcode 是 0（NOERROR）或 3（NXDOMAIN）、TC=0、OPT 记录的扩展 rcode 为 0；SERVFAIL/REFUSED/NOTIMP/截断一律算这次上游失败，交给下一个（否则它会赢下竞速并把并发的可信上游短路掉）。所有上游必须同样可信：竞速只比快慢，一个更快但被污染的上游会一直赢。命中 `ECS_DOMAINS` 的国内域名会带上客户端的 /24（IPv6 为 /48）子网信息（ECS），发给支持 ECS 的上游（`ECS_UPSTREAMS`），这样国内 CDN 能按你的位置返回节点。
+5. **查上游**：同时准备多个上游 DoH（默认 Cloudflare、Google、AdGuard 不过滤版）。先问第一个，`UPSTREAM_HEDGE_MS` 毫秒内没回或者失败，就再问下一个，谁先给出合法应答用谁。“合法”指 HTTP 200 + `application/dns-message` + QR 位为响应，且 rcode 是 0（NOERROR）或 3（NXDOMAIN）、TC=0、OPT 记录的扩展 rcode 为 0；SERVFAIL/REFUSED/NOTIMP/截断一律算这次上游失败，交给下一个（否则它会赢下竞速并把并发的可信上游短路掉）。所有上游必须同样可信：竞速只比快慢，一个更快但被污染的上游会一直赢。命中 `ECS_DOMAINS` 的国内域名会带上客户端的 /24（IPv6 为 /48）子网信息（ECS），发给支持 ECS 的上游（`ECS_UPSTREAMS`），这样国内 CDN 能按你的位置返回节点。
 6. **应用规则**：`RULES_JSON`、`RULES_URL` 或请求里的 `?rules=` 可以改写或屏蔽某些域名的应答。
 7. **判断是不是 Cloudflare**：应答里的地址落在 Cloudflare 公布的网段内（`https://www.cloudflare.com/ips-v4/` 等，每天刷新），就算 Cloudflare。X（Twitter）这类在多家 CDN 之间切换的域名，还会查 `<域名>.cdn.cloudflare.net` 是否存在，以判断 Cloudflare 是否也在服务它。
 8. **改写地址**：把应答里所有 Cloudflare 的 A/AAAA 记录换成整个优选池（每个地址族最多 6 个），HTTPS 记录的 `ipv4hint`/`ipv6hint` 同步改掉（Firefox 和 Safari 会直接用这些提示）。
@@ -186,7 +186,7 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `UPSTREAMS` | Cloudflare、Google、Quad9 | 上游 DoH，逗号分隔，只接受 https |
+| `UPSTREAMS` | Cloudflare、Google、AdGuard（不过滤版） | 上游 DoH，逗号分隔，只接受 https。Node 的 fetch 只发 HTTP/1.1，不支持 HTTP/1.1 的上游（如 Quad9，返回 505）用不了 |
 | `ECS_UPSTREAMS` | 同 `UPSTREAMS` | 带 ECS 的查询用的上游，应只放会转发 ECS 的解析器 |
 | `UPSTREAM_TIMEOUT_MS` | 2500 | 单次上游超时 |
 | `UPSTREAM_HEDGE_MS` | 100 | 多久没回就并发问下一个上游，0 表示不并发 |

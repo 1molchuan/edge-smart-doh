@@ -199,7 +199,7 @@ if [[ "$DEPLOY_ENV" == "cn" ]]; then
 fi
 ECS_UPSTREAMS_CFG=""                 # 非空时写入 env 的 ECS_UPSTREAMS（仅 cn+代理模式设置）
 if [[ "$DEPLOY_ENV" != "cn" ]]; then
-  UPSTREAMS_CFG="https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query"
+  UPSTREAMS_CFG="https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://unfiltered.adguard-dns.com/dns-query"
 elif [[ -n "$PROXY_ADDR" ]]; then
   # UPSTREAMS 是「信任清单」：只放经代理出境的上游。直连国内递归对受污染域名返回假 IP，
   # 且只要几十 ms（经代理上游要数百 ms），在 hedge 竞速里必然先到并获胜，假 IP 还会被写进
@@ -712,7 +712,7 @@ fi
 log "部署汇总"
 IP_ADDR="$LAN_IP"
 if [[ "$DEPLOY_ENV" != "cn" ]]; then
-  printf '  上游模式     : 境外直连（cloudflare/google/quad9）\n'
+  printf '  上游模式     : 境外直连（cloudflare/google/adguard）\n'
 elif [[ -n "$PROXY_ADDR" ]]; then
   printf '  上游模式     : 国内 + 代理出境（%s）\n' "$PROXY_ADDR"
 else
