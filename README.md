@@ -127,6 +127,7 @@ cfhub 是一个众包测速站：志愿者在自己的线路上运行探针 `cfp
 | `/admin/h3` | POST `{source, ttl, verdicts: {主机: true\|false}}`，需 `ADMIN_TOKEN` |
 | `/admin/health` | Meta ECH 的状态上报，需 `ADMIN_TOKEN` |
 | `/admin/selfcheck` | 自检结果上报，需 `ADMIN_TOKEN` |
+| `/admin/stats` | GET：运行指标（查询计数、缓存命中、回源延迟分位数、各上游成败、策略分布、Top 域名、最近查询、池状态），需 `ADMIN_TOKEN`。家庭部署的局域网监测站（`contrib/home/monitor`）以它为数据源 |
 
 没有设置 `ADMIN_TOKEN` 时，所有 `/admin/*` 都返回 404。令牌用常数时间比较。
 

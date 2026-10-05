@@ -7,6 +7,7 @@ import { DnsType, type DnsPacket } from "./dns/types";
 import { chromiumEchVerdict, describeAnswers, dnsTypeName, selfCheckStatus, setSelfCheck } from "./explain";
 import { h3Status, setH3Verdicts } from "./h3";
 import { isIspName, ispScopeOf, ispTableReady } from "./isp";
+import { recordQuery, statsSnapshot } from "./metrics";
 import { applyResponseRules, ecsOverride, loadRules, shouldBlock, type RuleSet } from "./rules";
 import { parseRequestOptions, type RequestOptions } from "./request-options";
 import { clearMetaEch, githubPoolStatus, githubReports, ispPoolStatus, learnedPoolStatus, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolStatus, siteReports } from "./preferred";
@@ -14,7 +15,7 @@ import { loadCloudflareRanges, validatedEchConfig } from "./rewrite";
 import { describePlan, makePlan, sortStrategies, strategyCacheTags, type RoutePlan } from "./plan";
 import { renderPlan } from "./render";
 import { PUBLIC_STRATEGIES } from "./strategies";
-import { queryUpstreams } from "./upstream";
+import { queryUpstreams, upstreamLabel } from "./upstream";
 import { safeBlocked, safeBlockedResponse, safeStatus } from "./safe";
 import { chineseSiteStatus, isChineseSite } from "./cn-domains";
 
@@ -232,15 +233,22 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   const setup = await prepareDns(request, env, runtime);
   if (setup instanceof Response) return setup;
   const { config, options, cache, rules } = setup;
-  if (shouldBlock(rules, query)) return dnsResponse(makeBlockedResponse(query));
+  const question = query.questions[0]!;
+  const sample = () => ({ name: question.name, type: dnsTypeName(question.type), latencyMs: Date.now() - started });
+  if (shouldBlock(rules, query)) {
+    recordQuery({ ...sample(), outcome: "blocked" });
+    return dnsResponse(makeBlockedResponse(query));
+  }
   // Blocked before the cache: every other answer is the same with or without ?safe=1, so they share it.
-  if (options.safe && safeBlocked(query.questions[0]!.name, config)) return dnsResponse(encodeDnsPacket(safeBlockedResponse(query)));
+  if (options.safe && safeBlocked(question.name, config)) {
+    recordQuery({ ...sample(), outcome: "blocked" });
+    return dnsResponse(encodeDnsPacket(safeBlockedResponse(query)));
+  }
 
   const { upstreamQuery, useEcs, identity } = planQuery(query, setup);
-  const question = query.questions[0]!;
   const cached = await readCache(cache, identity, config);
 
-  const resolveAndStore = async (): Promise<{ wire: Uint8Array; upstream: string }> => {
+  const resolveAndStore = async (): Promise<{ wire: Uint8Array; upstream: string; plan: RoutePlan }> => {
     const resolved = await resolveFresh(query, upstreamQuery, useEcs, rules, options, config, cache);
     ctx.waitUntil(writeCache(cache, identity, resolved.wire, config).catch((error: unknown) => {
       if (config.debug) console.warn(JSON.stringify({ event: "cache_write_error", message: errorMessage(error) }));
@@ -255,21 +263,26 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
         if (config.debug) console.warn(JSON.stringify({ event: "prefetch_error", message: errorMessage(error) }));
       }));
     }
-    logQuery(config, query, cached.state === "fresh" ? "hit" : cached.state === "refresh" ? "prefetch" : "stale", undefined, Date.now() - started);
+    const outcome = cached.state === "fresh" ? "hit" : cached.state === "refresh" ? "prefetch" : "stale";
+    recordQuery({ ...sample(), outcome });
+    logQuery(config, query, outcome, undefined, Date.now() - started);
     return dnsResponse(cached.packet);
   }
 
   try {
-    const { wire: clientWire, upstream } = await resolveAndStore();
-    logQuery(config, query, "miss", upstream, Date.now() - started);
-    return dnsResponse(clientWire);
+    const resolved = await resolveAndStore();
+    recordQuery({ ...sample(), outcome: "miss", upstream: upstreamLabel(resolved.upstream), strategy: resolved.plan.strategy });
+    logQuery(config, query, "miss", resolved.upstream, Date.now() - started);
+    return dnsResponse(resolved.wire);
   } catch (error) {
     console.error(JSON.stringify({ event: "upstream_failure", message: errorMessage(error) }));
     if (cached) {
       // RFC 8767: an expired answer beats SERVFAIL when every upstream is unreachable.
+      recordQuery({ ...sample(), outcome: "stale", error: errorMessage(error) });
       logQuery(config, query, "stale", undefined, Date.now() - started);
       return dnsResponse(cached.packet);
     }
+    recordQuery({ ...sample(), outcome: "error", error: errorMessage(error), servfail: true });
     logQuery(config, query, "miss", undefined, Date.now() - started);
     return dnsResponse(makeServfail(wire));
   }
@@ -412,6 +425,7 @@ export async function handleRequest(request: Request, env: Env, ctx: WaitUntilCo
   if (url.pathname === "/admin/health") return handleAdminHealth(request, env);
   if (url.pathname === "/admin/selfcheck") return handleAdminSelfCheck(request, env);
   if (url.pathname === "/admin/h3") return handleAdminH3(request, env);
+  if (url.pathname === "/admin/stats") return handleAdminStats(request, env);
   if (url.pathname === "/explain") return handleExplain(request, env, runtime);
   if (url.pathname !== "/dns-query") return new Response("Not found", { status: 404 });
   return handleDns(request, env, ctx, runtime);
@@ -446,6 +460,23 @@ async function preferredAuth(request: Request, env: Env): Promise<"admin" | "hub
 
 function adminState(): Record<string, unknown> {
   return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, selfcheck: selfCheckStatus(), h3: h3Status() };
+}
+
+/**
+ * Live operational metrics for the LAN monitor (contrib/home/monitor): query counters, cache mix,
+ * upstream latency and the pool state. Same bearer token as the other admin endpoints; the recent
+ * list carries query names, so it must never be exposed without one.
+ */
+async function handleAdminStats(request: Request, env: Env): Promise<Response> {
+  const denied = await adminAuth(request, env);
+  if (denied) return denied;
+  if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET" } });
+  return json({
+    ok: true,
+    ...statsSnapshot(),
+    pools: adminState(),
+    ...(typeof process !== "undefined" && typeof process.memoryUsage === "function" ? { memory: { rssBytes: process.memoryUsage().rss } } : {}),
+  });
 }
 
 /**
