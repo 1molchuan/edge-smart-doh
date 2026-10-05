@@ -489,6 +489,11 @@ function verdictOf(d) {
   const dead = (d.probes || []).filter((p) => p.ok === false);
   if (dead.length) return { cls: "bad", text: "解析异常", why: dead.map((p) => (p.label || p.name) + "：" + (p.error || "失败")).join("；") };
   if (d.statsError) return { cls: "warn", text: "统计不可用", why: d.statsError };
+  // 中转档开着但守护进程没上报：名单域名已回退直连（可能变慢/抖动），值得黄牌提醒
+  const relay = d.stats && d.stats.pools && d.stats.pools.relay;
+  if (relay && relay.mode && relay.mode !== "off" && !relay.healthy) {
+    return { cls: "warn", text: "中转离线", why: "SNI 中转未上报健康（relay 进程或代理出口故障）；名单域名已回退直连路径" };
+  }
   const s = d.stats;
   if (s && s.minutes.length) {
     const last = s.minutes[s.minutes.length - 1];
@@ -536,13 +541,20 @@ function setVerdict(d) {
   document.getElementById("v-sub").textContent = bits.join(" · ");
 }
 
-function pathHealth(probes) {
+function pathHealth(probes, relay) {
   const el = document.getElementById("path-health");
   if (!probes.length) { el.innerHTML = "未配置探测"; return; }
+  // 该探测域名此刻是否被中转接管（always=名单内即接管；auto=该主机状态机已切入）
+  const viaRelay = (name) => {
+    if (!relay || !relay.mode || relay.mode === "off" || !relay.healthy) return false;
+    if (relay.mode === "always") return /github/.test(name);
+    return (relay.hosts || []).some((h) => h.relayed && (name === h.host || name.endsWith("." + h.host)));
+  };
   el.innerHTML = probes.map((p) => {
     const cls = p.ok === null ? "" : p.ok ? "ok" : "bad";
     const val = p.ok === null ? "—" : p.ok ? fmtMs(p.latencyMs) : (p.error || "失败").slice(0, 26);
     return '<div class="path"><span class="pdot ' + cls + '"></span><span class="pl">' + esc(p.label || p.name) +
+      (viaRelay(p.name) ? ' <span class="warn2">中转</span>' : "") +
       '</span><span class="pv' + (p.ok === false ? " err" : "") + '" title="' + esc(p.name + (p.error ? " · " + p.error : "")) + '">' + esc(val) + "</span></div>";
   }).join("");
 }
@@ -656,6 +668,14 @@ function poolsTable(p) {
   const isps = p.isp || [];
   for (const isp of isps) rows.push(["运营商池 " + isp.scope, "IPv4×" + isp.ipv4.length + " · IPv6×" + isp.ipv6.length + (isp.active ? " · 剩余 " + inMinTxt(isp.expiresAt) : ' · <span class="err">已过期</span>')]);
   if (p.github) rows.push(["GitHub 池", Object.keys(p.github.hosts).length + " 主机 · 来源 " + p.github.sources.map((s) => s.source).join(", ") + " · 剩余 " + inMinTxt(Math.max.apply(null, p.github.sources.map((s) => s.expiresAt)))]);
+  if (p.relay && p.relay.mode && p.relay.mode !== "off") {
+    const rh = p.relay.hosts || [];
+    const relayed = rh.filter((h) => h.relayed);
+    rows.push(["SNI 中转", (p.relay.healthy ? "健康" : '<span class="err">未上报</span>') + " · 档位 " + esc(p.relay.mode) + (p.relay.ip ? " · " + esc(p.relay.ip) : "") + " · " + relayed.length + "/" + rh.length + " 主机走中转 · 上报 " + ago(p.relay.lastReportAt)]);
+    for (const h of rh) {
+      rows.push(["　" + esc(h.host), (h.relayed ? "走中转" : "直连") + " · 直连成功率 " + (h.enterRate == null ? "—" : Math.round(h.enterRate * 100) + "%") + " · 样本 " + h.samples + " · 测于 " + ago(h.lastSampleAt)]);
+    }
+  }
   if (p.sites) rows.push(["Site 池", Object.keys(p.sites.hosts).length + " 站点 · 来源 " + p.sites.sources.map((s) => s.source).join(", ")]);
   if (p.chineseSites) rows.push(["国内域名名单", "后缀 " + fmt(p.chineseSites.suffix) + " · 精确 " + fmt(p.chineseSites.exact) + " · 更新于 " + hhmmss(Date.parse(p.chineseSites.loadedAt))]);
   if (p.safe) rows.push(["安全过滤 ?safe=1", "拦截名单 " + fmt(p.safe.block) + " · 放行 " + fmt(p.safe.allow)]);
@@ -687,7 +707,7 @@ async function refresh() {
     } else {
       ["stat-total", "stat-rate", "stat-p50"].forEach((id) => { document.getElementById(id).textContent = "—"; });
     }
-    pathHealth(d.probes || []); probeChart(d.probes || []);
+    pathHealth(d.probes || [], d.stats && d.stats.pools ? d.stats.pools.relay : null); probeChart(d.probes || []);
   } catch (e) {
     fetchFails += 1;
     if (line) line.textContent = "取数据失败 ×" + fetchFails + "：" + (e && e.message ? e.message : e) + "（重试中）";

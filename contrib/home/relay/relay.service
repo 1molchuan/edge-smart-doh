@@ -1,6 +1,6 @@
 [Unit]
 Description=edge-smart-doh SNI relay (home)
-Documentation=file:///opt/edge-smart-doh/DESIGN.md
+Documentation=file:///opt/edge-smart-doh/relay-DESIGN.md
 After=network-online.target edge-smart-doh.service
 Wants=network-online.target
 

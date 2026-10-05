@@ -469,7 +469,7 @@ async function preferredAuth(request: Request, env: Env): Promise<"admin" | "hub
 }
 
 function adminState(): Record<string, unknown> {
-  return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, selfcheck: selfCheckStatus(), h3: h3Status() };
+  return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, relay: relayStatus(), selfcheck: selfCheckStatus(), h3: h3Status() };
 }
 
 /**
@@ -481,10 +481,14 @@ async function handleAdminStats(request: Request, env: Env): Promise<Response> {
   const denied = await adminAuth(request, env);
   if (denied) return denied;
   if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET" } });
+  const pools = adminState();
+  // The relay card distinguishes "not deployed" (mode off) from "deployed but not reporting".
+  const relayConfig = readConfig(env);
+  if (pools.relay && typeof pools.relay === "object") Object.assign(pools.relay as object, { mode: relayConfig.relayMode, ip: relayConfig.relayIp ?? null });
   return json({
     ok: true,
     ...statsSnapshot(),
-    pools: adminState(),
+    pools,
     ...(typeof process !== "undefined" && typeof process.memoryUsage === "function" ? { memory: { rssBytes: process.memoryUsage().rss } } : {}),
   });
 }
