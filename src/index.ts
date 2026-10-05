@@ -9,9 +9,10 @@ import { h3Status, setH3Verdicts } from "./h3";
 import { isIspName, ispScopeOf, ispTableReady } from "./isp";
 import { applyResponseRules, ecsOverride, loadRules, shouldBlock, type RuleSet } from "./rules";
 import { parseRequestOptions, type RequestOptions } from "./request-options";
-import { clearMetaEch, githubPoolStatus, githubReports, ispPoolStatus, learnedPoolStatus, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolStatus, siteReports } from "./preferred";
+import { clearMetaEch, githubPoolFor, githubPoolStatus, githubReports, ispPoolStatus, learnedPoolStatus, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolFor, sitePoolStatus, siteReports } from "./preferred";
 import { loadCloudflareRanges, validatedEchConfig } from "./rewrite";
 import { describePlan, makePlan, sortStrategies, strategyCacheTags, type RoutePlan } from "./plan";
+import { relayStatus, setRelayHealth } from "./relay";
 import { renderPlan } from "./render";
 import { PUBLIC_STRATEGIES } from "./strategies";
 import { queryUpstreams } from "./upstream";
@@ -409,6 +410,9 @@ export async function handleRequest(request: Request, env: Env, ctx: WaitUntilCo
   if (url.pathname === "/admin/preferred") return handleAdminPreferred(request, env, runtime);
   if (url.pathname === "/admin/github") return handleAdminGithub(request, env);
   if (url.pathname === "/admin/site") return handleAdminSite(request, env);
+  if (url.pathname === "/admin/relay") return handleAdminRelay(request, env);
+  if (url.pathname === "/admin/relay-health") return handleAdminRelayHealth(request, env);
+  if (url.pathname === "/admin/pool") return handleAdminPool(request, env);
   if (url.pathname === "/admin/health") return handleAdminHealth(request, env);
   if (url.pathname === "/admin/selfcheck") return handleAdminSelfCheck(request, env);
   if (url.pathname === "/admin/h3") return handleAdminH3(request, env);
@@ -516,6 +520,66 @@ async function readHostReport(request: Request): Promise<{ source: string; ttl: 
   return { source, ttl, hosts };
 }
 
+
+/**
+ * SNI relay state (contrib/home/relay): GET reports liveness and the per-host decisions; the relay
+ * daemon POSTs its self-check verdict {source, ttl, healthy[, direct]} so the server can withdraw
+ * the override the moment the relay or the egress proxy dies. State is in relay.ts.
+ */
+async function handleAdminRelay(request: Request, env: Env): Promise<Response> {
+  const denied = await adminAuth(request, env);
+  if (denied) return denied;
+  if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET" } });
+  const config = readConfig(env);
+  return json({ ok: true, relay: { mode: config.relayMode, ip: config.relayIp ?? null, domains: config.relayDomains.length, excludes: config.relayExcludeDomains.length, ...relayStatus() } });
+}
+
+async function handleAdminRelayHealth(request: Request, env: Env): Promise<Response> {
+  const denied = await adminAuth(request, env);
+  if (denied) return denied;
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "POST" } });
+  let body: { source?: unknown; ttl?: unknown; healthy?: unknown; direct?: unknown };
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+  const source = typeof body.source === "string" ? body.source.slice(0, 64) : "unknown";
+  const ttl = typeof body.ttl === "number" && Number.isFinite(body.ttl) ? Math.max(30, Math.min(3600, body.ttl)) : 120;
+  setRelayHealth({ source, ttlSeconds: ttl, healthy: body.healthy === true, direct: readRelayDirectSamples(body.direct) });
+  return json({ ok: true, relay: relayStatus() });
+}
+
+/** direct: {"github.com": {ok: true, rttMs: 120}} — per-host handshake samples from the relay's prober. */
+function readRelayDirectSamples(value: unknown): Record<string, { ok: boolean; rttMs?: number }> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const direct: Record<string, { ok: boolean; rttMs?: number }> = {};
+  for (const [host, sample] of Object.entries(value)) {
+    const name = host.toLowerCase().replace(/\.$/, "");
+    if (!HOSTNAME.test(name)) continue;
+    if (typeof sample !== "object" || sample === null) continue;
+    const ok = (sample as { ok?: unknown }).ok === true;
+    const rtt = (sample as { rttMs?: unknown }).rttMs;
+    direct[name] = { ok, ...(typeof rtt === "number" && Number.isFinite(rtt) && rtt >= 0 ? { rttMs: rtt } : {}) };
+  }
+  return direct;
+}
+
+/**
+ * The measured pool for one host, for the relay daemon to dial by address (githubPoolFor, else the
+ * site pool): a relay-pinned name's /dns-query answer is the relay IP itself, so the daemon needs
+ * this side channel to learn the addresses it should be dialing.
+ */
+async function handleAdminPool(request: Request, env: Env): Promise<Response> {
+  const denied = await adminAuth(request, env);
+  if (denied) return denied;
+  if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET" } });
+  const name = (new URL(request.url).searchParams.get("name") ?? "").toLowerCase().replace(/\.$/, "");
+  if (!HOSTNAME.test(name)) return new Response("invalid name", { status: 400 });
+  const github = githubPoolFor(name);
+  const pool = github.length > 0 ? github : sitePoolFor(name);
+  return json({ ok: true, name, source: github.length > 0 ? "github-pool" : pool.length > 0 ? "site-pool" : "none", pool });
+}
 
 /** Prober QUIC+ECH verdicts: {source, ttl, verdicts: {"linux.do": true, "x.com": false}}. */
 async function handleAdminH3(request: Request, env: Env): Promise<Response> {

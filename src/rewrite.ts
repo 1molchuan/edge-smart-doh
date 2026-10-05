@@ -230,9 +230,10 @@ export function rewriteXAddresses(packet: DnsPacket, query: DnsPacket, config: A
 /**
  * Replace the answer's addresses with `ipv4` whatever upstream returned (A) and drop IPv6 (AAAA),
  * for hosts whose endpoint this server chooses: X hosts pinned to the Cloudflare pool, site and
- * GitHub hosts pinned to their measured pools. HTTPS answers are left to the caller.
+ * GitHub hosts pinned to their measured pools. HTTPS answers are left to the caller. `maxTtl`
+ * caps the served TTL (the relay pins at 60 so a withdrawn relay stops being served quickly).
  */
-export function pinAddresses(packet: DnsPacket, query: DnsPacket, ipv4: string[]): DnsPacket {
+export function pinAddresses(packet: DnsPacket, query: DnsPacket, ipv4: string[], maxTtl?: number): DnsPacket {
   const question = query.questions[0];
   if (!question) return packet;
   if (question.type === DnsType.AAAA) {
@@ -241,7 +242,8 @@ export function pinAddresses(packet: DnsPacket, query: DnsPacket, ipv4: string[]
   }
   if (question.type !== DnsType.A || ipv4.length === 0) return packet;
   const existing = packet.answers.filter((record) => record.type === DnsType.A);
-  const ttl = existing.length > 0 ? Math.min(...existing.map((record) => record.ttl)) : 60;
+  let ttl = existing.length > 0 ? Math.min(...existing.map((record) => record.ttl)) : 60;
+  if (maxTtl !== undefined) ttl = Math.min(ttl, maxTtl);
   const owner = existing[0]?.name ?? question.name;
   const replacements: DnsRecord[] = ipv4.map((address) => {
     parseIpv4(address);
@@ -264,6 +266,30 @@ export function pinHttpsHints(packet: DnsPacket, ipv4: string[]): DnsPacket {
     return { ...record, rdata: { kind: "https" as const, value } };
   });
   return changed ? { ...packet, answers } : packet;
+}
+
+/**
+ * Prepare an HTTPS record for a relayed name (see the relay strategy): address hints point at the
+ * relay, ECH is dropped (the relay routes by the plaintext SNI, which ECH hides behind its public
+ * name) and ALPN is pinned to h2 (the relay forwards TCP only, so QUIC must not be offered).
+ */
+export function relayHttpsCleanup(packet: DnsPacket, ipv4: string[]): DnsPacket {
+  const hints = packAddresses(ipv4, parseIpv4);
+  const alpnH2 = Uint8Array.from([2, 0x68, 0x32]); // length-prefixed "h2"
+  const answers = packet.answers.map((record): DnsRecord => {
+    if (record.rdata.kind !== "https") return record;
+    const touches =
+      record.rdata.value.params.some((param) =>
+        param.key === SvcParamKey.ECH || param.key === SvcParamKey.ALPN || param.key === SvcParamKey.IPV4HINT || param.key === SvcParamKey.IPV6HINT
+      );
+    if (!touches) return record;
+    const stripped = record.rdata.value.params.filter((param) => param.key !== SvcParamKey.ECH && param.key !== SvcParamKey.IPV6HINT);
+    let value: HttpsRecord = { ...record.rdata.value, params: stripped };
+    value = upsertSvcParam(value, SvcParamKey.ALPN, alpnH2);
+    value = upsertSvcParam(value, SvcParamKey.IPV4HINT, hints);
+    return { ...record, rdata: { kind: "https" as const, value } };
+  });
+  return { ...packet, answers };
 }
 
 /**

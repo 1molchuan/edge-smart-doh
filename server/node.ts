@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname } from "node:path";
 import { handleRequest, type RequestRuntime, type WaitUntilContext } from "../src/index";
+import { parseIpv4 } from "../src/dns/packet";
 
 const DEFAULTS = {
   UPSTREAMS: "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query",
@@ -241,6 +242,37 @@ function warnOnMixedUpstreamTrust(): void {
   }));
 }
 
+/**
+ * RELAY_MODE without a usable private RELAY_IP degrades to off inside readConfig; naming that here
+ * keeps a typo from silently disabling the relay (the failure would look like "GitHub is flaky
+ * again", not like a configuration problem).
+ */
+function warnOnRelayConfig(): void {
+  const mode = (process.env.RELAY_MODE ?? "").toLowerCase();
+  if (mode !== "auto" && mode !== "always") return;
+  const ip = (process.env.RELAY_IP ?? "").trim();
+  if (!ip) {
+    console.warn(JSON.stringify({ event: "relay_config_warning", message: `RELAY_MODE=${mode} but RELAY_IP is empty: the relay path is disabled` }));
+    return;
+  }
+  const bytes = (() => {
+    try {
+      return parseIpv4(ip);
+    } catch {
+      return undefined;
+    }
+  })();
+  const [a, b] = bytes ? [bytes[0]!, bytes[1]!] : [undefined, undefined];
+  const priv = a === 10 || a === 127 || (a === 172 && b! >= 16 && b! <= 31) || (a === 192 && b === 168);
+  if (!priv) {
+    console.warn(JSON.stringify({
+      event: "relay_config_warning",
+      message: `RELAY_MODE=${mode} but RELAY_IP=${ip} is not a private address: the relay path is disabled`,
+      hint: "the relay must only ever point at an address a stranger cannot reach; use a second private IP on the LAN interface",
+    }));
+  }
+}
+
 function clientIp(request: Request): { value?: string; source?: string } {
   const candidates: [string, string | null][] = [
     ["X-Real-IP", request.headers.get("X-Real-IP")],
@@ -342,6 +374,7 @@ const host = process.env.HOST ?? "127.0.0.1";
 const port = numberFromEnvironment("PORT", 8787, 1, 65535);
 loadPersistedCache();
 warnOnMixedUpstreamTrust();
+warnOnRelayConfig();
 server.listen(port, host, () => console.log(JSON.stringify({ event: "listening", host, port })));
 
 // Periodic snapshot bounds the loss on an unclean exit (OOM kill, power loss).
