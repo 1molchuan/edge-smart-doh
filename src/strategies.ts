@@ -3,8 +3,9 @@ import { DnsType } from "./dns/types";
 import { alpnFor, h3CacheTag } from "./h3";
 import type { PlanContext, RequestContext, Strategy } from "./plan";
 import { githubPoolFor, metaEchCacheTag, metaEchOverride, sitePoolCacheTag, sitePoolFor } from "./preferred";
+import { RELAY_PIN_TTL, relayCacheTag, relayServes } from "./relay";
 import type { RequestOptions } from "./request-options";
-import { resolveEchConfig, validatedEchConfig } from "./rewrite";
+import { relayHttpsCleanup, resolveEchConfig, validatedEchConfig } from "./rewrite";
 
 /** A site pool (see sitePoolFor) stands in for the server's default pool only; an explicit ?ip4= or ?cf= choice wins. */
 export function sitePool(name: string, options: RequestOptions): string[] {
@@ -96,6 +97,35 @@ export const githubPool: Strategy = {
   },
 };
 
+/**
+ * The home SNI relay (contrib/home/relay, see its DESIGN.md): the name is answered with the LAN
+ * address of a local relay that forwards the TCP flow through the egress proxy by SNI, TLS staying
+ * end to end. "always" serves every name in RELAY_DOMAINS; "auto" only hosts whose measured direct
+ * path went bad (relay.ts); both step aside the moment the relay stops reporting healthy, so the
+ * worst case is the un-relayed answer of yesterday. Sits between the site-pool and GitHub-pool
+ * strategies: it takes the addresses decision for good (github-pool then leaves the name alone).
+ */
+export const relay: Strategy = {
+  name: "relay",
+  order: 45,
+  cacheTag: (ctx: RequestContext) => (relayServes(ctx.name, ctx.config) ? relayCacheTag() : undefined),
+  async apply(ctx: PlanContext, plan) {
+    if (!relayServes(ctx.name, ctx.config)) return;
+    const ip = ctx.config.relayIp!;
+    if (ctx.type === DnsType.A || ctx.type === DnsType.AAAA) {
+      plan.pin = [ip];
+      plan.pinTtl = RELAY_PIN_TTL;
+      plan.locked.addresses = true;
+      plan.strategy = "relay";
+      ctx.notes?.push(`relay: answer pinned to ${ip}, IPv6 dropped (mode ${ctx.config.relayMode})`);
+    } else if (ctx.type === DnsType.HTTPS) {
+      plan.locked.ech = true;
+      plan.strategy = "relay";
+      plan.post.push({ apply: (packet) => relayHttpsCleanup(packet, [ip]), note: `relay: HTTPS hints → ${ip}, ECH removed, ALPN → h2` });
+    }
+  },
+};
+
 /** Meta's own ECH key (learned by a prober, or the configured seed). */
 export const metaEch: Strategy = {
   name: "meta-ech",
@@ -147,4 +177,4 @@ export const cloudflareEch: Strategy = {
   },
 };
 
-export const PUBLIC_STRATEGIES: Strategy[] = [preferredIp, xMultiCdn, sitePools, githubPool, metaEch, cloudflareEch];
+export const PUBLIC_STRATEGIES: Strategy[] = [preferredIp, xMultiCdn, sitePools, relay, githubPool, metaEch, cloudflareEch];

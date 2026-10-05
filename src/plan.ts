@@ -59,6 +59,8 @@ export interface RoutePlan {
   xPool: boolean;
   /** Answer A with these and drop AAAA. */
   pin?: string[];
+  /** TTL ceiling for the pinned A records (the relay pins at 60 so a withdrawn relay recovers fast). */
+  pinTtl?: number;
   /** ECH for the HTTPS record, with its ALPN (undefined keeps what upstream published). */
   ech?: { config: Uint8Array; alpn?: string[]; source: EchSource };
   /** Point the HTTPS record's address hints here. */

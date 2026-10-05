@@ -1,0 +1,19 @@
+[Unit]
+Description=edge-smart-doh SNI relay (home)
+Documentation=file:///opt/edge-smart-doh/DESIGN.md
+After=network-online.target edge-smart-doh.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/node /opt/edge-smart-doh/relay.mjs
+EnvironmentFile=/etc/edge-smart-doh/relay.env
+Restart=always
+RestartSec=3
+PrivateTmp=yes
+ProtectHome=yes
+# Binding :443 needs CAP_NET_BIND_SERVICE; grant exactly that instead of running all-powerful.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
