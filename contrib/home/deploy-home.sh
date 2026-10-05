@@ -376,6 +376,13 @@ curl -fsS http://127.0.0.1:8787/health >/dev/null \
   || die "服务 15 秒内未就绪：journalctl -u edge-smart-doh -n 30（若见 --import 报错=undici/Node 版本问题）"
 ok "edge-smart-doh 运行中；ADMIN_TOKEN 在 $TOKEN_FILE"
 
+# ---- 局域网监测站（http://LAN_IP:8788；应用层只放行私网来源，详见 contrib/home/monitor/）----
+if [[ -f "$PROJECT_DIR/contrib/home/install-monitor.sh" ]]; then
+  bash "$PROJECT_DIR/contrib/home/install-monitor.sh" || warn "监测站安装失败（不影响主服务，可稍后单独重跑 install-monitor.sh）"
+else
+  warn "缺少 contrib/home/install-monitor.sh，跳过监测站安装"
+fi
+
 # ---------------------------------------------------------------------------
 # 4. cfhub → 本机 同步（纯出站）
 # ---------------------------------------------------------------------------
@@ -616,6 +623,8 @@ table inet home_firewall {
 ${FIREWALL_8443}
     # 8787：明文 DoH 仅内网直连，绝不放公网
     ip saddr ${LAN_CIDR} tcp dport 8787 accept
+    # 8788：局域网监测站（应用层另有私网来源过滤，这里在网络层再限一次）
+    ip saddr ${LAN_CIDR} tcp dport 8788 accept
 
     # 其余入站：丢弃并计数
     counter drop
@@ -718,7 +727,7 @@ elif [[ -n "$PROXY_ADDR" ]]; then
 else
   printf '  上游模式     : 国内无代理（降级：被污染域名解析不到）\n'
 fi
-for S in edge-smart-doh cfhub-sync.timer caddy cf-ddns.timer; do
+for S in edge-smart-doh edge-smart-doh-monitor cfhub-sync.timer caddy cf-ddns.timer; do
   printf '  %-18s %s\n' "$S" "$(systemctl is-active "$S" 2>/dev/null || true)"
 done
 [[ -f /etc/ssl/doh/fullchain.pem ]] \
@@ -728,6 +737,7 @@ if [[ "$OPEN_PUBLIC" == "1" ]]; then
   cat <<EOF
 
   内网 DoH   : http://$IP_ADDR:8787/dns-query
+  内网监测   : http://$IP_ADDR:8788  （局域网监测站，仅内网可访问）
   公网 DoH   : https://$DOH_DOMAIN:8443/dns-query
 
   待办（脚本做不了的）：
@@ -742,6 +752,7 @@ else
   cat <<EOF
 
   内网 DoH   : http://$IP_ADDR:8787/dns-query
+  内网监测   : http://$IP_ADDR:8788  （局域网监测站，仅内网可访问）
   公网入口未开（OPEN_PUBLIC=0）。想开公网：改配置区 OPEN_PUBLIC=1 后重跑本脚本
 EOF
 fi
