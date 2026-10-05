@@ -242,6 +242,21 @@ describe("hedged upstream", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("gives the first ECS upstream its own, longer head start", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("primary")) return new Promise<Response>((resolve) => setTimeout(() => resolve(ok()), 60));
+      return hang(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const tuned = config({ upstreamHedgeMs: 10, ecsUpstreamHedgeMs: 500, upstreamTimeoutMs: 2000 });
+    expect((await queryUpstreams(new Uint8Array(12), tuned, { ecs: true })).upstream).toContain("primary");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // The non-ECS group keeps the short delay and races the secondary.
+    fetchMock.mockClear();
+    await queryUpstreams(new Uint8Array(12), tuned);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("takes a late primary success if the hedged secondary fails first", async () => {
     let releasePrimary: (() => void) | undefined;
     const fetchMock = vi.fn((input: RequestInfo | URL) => {

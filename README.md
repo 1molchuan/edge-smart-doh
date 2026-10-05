@@ -102,7 +102,9 @@ cfhub 是一个众包测速站：志愿者在自己的线路上运行探针 `cfp
 ## 缓存
 
 - 缓存键是规范化后的查询（域名小写、去掉事务 ID）加上影响应答的因素：使用的池子、ECS 子网、请求参数、h3 结论和站点池的版本。
-- TTL 限制在 `CACHE_MIN_TTL`～`CACHE_MAX_TTL` 之间，否定应答最多 `NEGATIVE_CACHE_MAX_TTL`。
+- TTL 限制在 `CACHE_MIN_TTL`～`CACHE_MAX_TTL` 之间，否定应答最多 `NEGATIVE_CACHE_MAX_TTL`。命中缓存时返回的 TTL 会减去应答已经在缓存里待的秒数。
+- 问题部分按客户端发来的大小写原样返回（缓存不区分大小写，但用 0x20 大小写随机化的解析器会丢弃大小写不符的应答）。
+- **DNSSEC**：这个 DoH 不做验证。改写过的应答（换了地址、注入了 ECH 等）会去掉其中的 RRSIG 并清除 AD 位，因为原签名已经对不上；没改写的应答原样返回。需要自己做 DNSSEC 验证的系统不适合用它当系统 DNS。
 - **预取**：剩余 TTL 低于原 TTL 的 `CACHE_PREFETCH_PERCENT`% 时，先返回缓存，再在后台刷新。
 - **过期仍可用**（RFC 8767）：所有上游都失败时，`CACHE_STALE_TTL` 内的过期应答比 SERVFAIL 好。HTTPS 记录更进一步：只要有缓存就立即返回再后台刷新，因为 Chromium 在拿到 A/AAAA 后只等 HTTPS 记录约 50 毫秒，超时就不用 ECH 直接连了。
 - Node 版本的缓存在内存里（最多 `CACHE_MAX_ENTRIES` 条），设置 `CACHE_PERSIST_PATH` 后每 5 分钟和退出时写盘，启动时读回。
@@ -190,6 +192,7 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 | `ECS_UPSTREAMS` | 同 `UPSTREAMS` | 带 ECS 的查询用的上游，应只放会转发 ECS 的解析器 |
 | `UPSTREAM_TIMEOUT_MS` | 2500 | 单次上游超时 |
 | `UPSTREAM_HEDGE_MS` | 100 | 多久没回就并发问下一个上游，0 表示不并发 |
+| `ECS_UPSTREAM_HEDGE_MS` | 同 `UPSTREAM_HEDGE_MS` | `ECS_UPSTREAMS` 这一组自己的并发间隔。国内 CDN 对不同解析器转来的 ECS 认可程度不一样（实测 Google 带 ECS 查百度、华为大多仍给海外节点，阿里 DNS 给国内节点），可以把阿里 DNS 排第一、这里设 1000 左右，让它先答 |
 | `CACHE_MIN_TTL` / `CACHE_MAX_TTL` | 30 / 3600 | 缓存 TTL 的上下限（秒） |
 | `NEGATIVE_CACHE_MAX_TTL` | 300 | 否定应答最多缓存多久 |
 | `CACHE_STALE_TTL` | 86400 | 过期应答在上游全挂时还能用多久，0 关闭 |
@@ -205,6 +208,7 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 | `CF_PREFERRED_DOMAIN` | 空 | 优选域名，解析出的地址合并为第 5 层池子 |
 | `CF_PREFERRED_IPV4` / `CF_PREFERRED_IPV6` | 空 | 静态优选地址 |
 | `CF_DROP_AAAA` | false | 改写后去掉 AAAA（给 IPv6 不通的网络） |
+| `CF_REWRITE_EXCLUDE` | 空 | 不做任何改写、原样返回上游应答的域名（含子域名）。Cloudflare 自己的非网页服务总是排除在外：`argotunnel.com`、`cftunnel.com`（cloudflared 隧道，7844 端口）和 `cloudflareclient.com`（WARP），因为优选 IP 只服务 HTTP/HTTPS |
 | `CF_IPV4_URL` / `CF_IPV6_URL` | Cloudflare 官方列表 | Cloudflare 网段来源 |
 | `ADMIN_TOKEN` | 空 | 管理接口令牌，空则关闭 `/admin/*` |
 | `HUB_TOKEN` | 空 | cfhub 的令牌，只能写运营商池 |

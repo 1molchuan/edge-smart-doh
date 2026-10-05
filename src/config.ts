@@ -7,6 +7,12 @@ export interface AppConfig {
   upstreamTimeoutMs: number;
   /** Delay before racing the next upstream while the previous one is still pending. 0 disables hedging. */
   upstreamHedgeMs: number;
+  /**
+   * The same delay for the ECS group. Resolvers differ in how well Chinese GSLBs honour ECS from them
+   * (Google often gets Baidu's and Huawei's overseas nodes, AliDNS the domestic ones), so the first
+   * ECS upstream should get time to answer before the next races it. Defaults to UPSTREAM_HEDGE_MS.
+   */
+  ecsUpstreamHedgeMs: number;
   cacheMinTtl: number;
   cacheMaxTtl: number;
   negativeCacheMaxTtl: number;
@@ -44,6 +50,12 @@ export interface AppConfig {
   cfPreferredIpv6: string[];
   /** Strip AAAA from rewritten Cloudflare answers (for clients on broken IPv6 paths). */
   cfDropAaaa: boolean;
+  /**
+   * Names answered exactly as upstream gave them: Cloudflare's own non-web services (CF_SERVICE_DOMAINS)
+   * and CF_REWRITE_EXCLUDE. Preferred IPs only serve HTTP/HTTPS, so a tunnel or WARP endpoint
+   * rewritten to them stops working.
+   */
+  cfRewriteExclude: string[];
   /** Bearer token for POST /admin/preferred; empty disables the endpoint. */
   adminToken?: string;
   /**
@@ -100,16 +112,25 @@ function list(value: string | undefined): string[] {
   return (value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
 }
 
+/**
+ * Cloudflare's own services that are not websites: cloudflared tunnels reach the edge on port 7844
+ * (argotunnel.com, cftunnel.com) and WARP on 2408 and MASQUE (cloudflareclient.com). Their addresses
+ * sit in Cloudflare's ranges, but the preferred IPs do not serve those ports.
+ */
+const CF_SERVICE_DOMAINS = [".argotunnel.com", ".cftunnel.com", ".cloudflareclient.com"];
+
 export function readConfig(env: Env): AppConfig {
   const rawMode: string = env.ECS_MODE;
   const mode = rawMode === "off" || rawMode === "always" ? rawMode : "rules";
   const upstreams = list(env.UPSTREAMS).filter((item) => item.startsWith("https://"));
   const ecsUpstreams = list(env.ECS_UPSTREAMS).filter((item) => item.startsWith("https://"));
+  const upstreamHedgeMs = integer(env.UPSTREAM_HEDGE_MS, 100, 0, 5000);
   return {
     upstreams,
     ecsUpstreams: ecsUpstreams.length > 0 ? ecsUpstreams : upstreams,
     upstreamTimeoutMs: integer(env.UPSTREAM_TIMEOUT_MS, 2500, 250, 15000),
-    upstreamHedgeMs: integer(env.UPSTREAM_HEDGE_MS, 100, 0, 5000),
+    upstreamHedgeMs,
+    ecsUpstreamHedgeMs: integer(env.ECS_UPSTREAM_HEDGE_MS, upstreamHedgeMs, 0, 5000),
     cacheMinTtl: integer(env.CACHE_MIN_TTL, 30, 0, 3600),
     cacheMaxTtl: integer(env.CACHE_MAX_TTL, 3600, 1, 86400),
     negativeCacheMaxTtl: integer(env.NEGATIVE_CACHE_MAX_TTL, 300, 0, 3600),
@@ -130,6 +151,7 @@ export function readConfig(env: Env): AppConfig {
     cfPreferredIpv4: list(env.CF_PREFERRED_IPV4),
     cfPreferredIpv6: list(env.CF_PREFERRED_IPV6),
     cfDropAaaa: enabled(env.CF_DROP_AAAA),
+    cfRewriteExclude: [...CF_SERVICE_DOMAINS, ...list(env.CF_REWRITE_EXCLUDE).map((item) => item.toLowerCase())],
     adminToken: optionalSecret(env, "ADMIN_TOKEN"),
     hubToken: optionalSecret(env, "HUB_TOKEN"),
     ispTableUrl: env.ISP_TABLE_URL || undefined,

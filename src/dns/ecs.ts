@@ -36,6 +36,16 @@ export function makeEcsValue(ip: string, ipv4Prefix: number, ipv6Prefix: number)
   }
 }
 
+/**
+ * The client sent ECS with a source prefix of 0: RFC 7871 §7.1.2 asks that no subnet be added for it.
+ * (Any other client ECS is replaced by the server's own choice, as before.)
+ */
+export function ecsOptedOut(packet: DnsPacket): boolean {
+  return packet.additionals.some((record) =>
+    record.rdata.kind === "opt" && record.rdata.options.some((option) => option.code === ECS_OPTION_CODE && option.data.length >= 3 && option.data[2] === 0),
+  );
+}
+
 function encodeEcs(value: EcsValue): Uint8Array {
   const output = new Uint8Array(4 + value.address.length);
   const view = new DataView(output.buffer);

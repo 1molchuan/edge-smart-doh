@@ -1,8 +1,8 @@
 import { normalizedCacheIdentity, readCache, rotateAddressRecords, writeCache, type CacheHit, type CacheIdentity } from "./cache";
 import { inAnyCidr } from "./cidr";
 import { readConfig, type AppConfig } from "./config";
-import { addEcs, ecsSourceIp, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
-import { encodeDnsPacket, makeServfail, parseDnsPacket, parseIpv4, patchTransactionId } from "./dns/packet";
+import { addEcs, ecsOptedOut, ecsSourceIp, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
+import { encodeDnsPacket, makeBadvers, makeServfail, matchQuestionCase, parseDnsPacket, parseIpv4, patchTransactionId } from "./dns/packet";
 import { DnsType, type DnsPacket } from "./dns/types";
 import { chromiumEchVerdict, describeAnswers, dnsTypeName, selfCheckStatus, setSelfCheck } from "./explain";
 import { h3Status, setH3Verdicts } from "./h3";
@@ -21,13 +21,15 @@ import { chineseSiteStatus, isDomesticSite } from "./cn-domains";
 const DNS_CONTENT_TYPE = "application/dns-message";
 const STRATEGIES = sortStrategies(PUBLIC_STRATEGIES);
 
-function dnsResponse(packet: Uint8Array, status = 200): Response {
+/** `query`, when given, is the client's wire query: its question spelling is restored in the answer. */
+function dnsResponse(packet: Uint8Array, query?: Uint8Array, status = 200): Response {
   let body = packet;
   try {
     body = rotateAddressRecords(packet);
   } catch {
     // A packet we cannot re-encode (unknown RDATA with compression) is served as-is.
   }
+  if (query) body = matchQuestionCase(body, query);
   return new Response(Uint8Array.from(body).buffer, {
     status,
     headers: {
@@ -190,7 +192,8 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
 /** ECS decision and cache key for one query. */
 function planQuery(query: DnsPacket, setup: DnsSetup): { upstreamQuery: DnsPacket; useEcs: boolean; useCn: boolean; ecsIdentity?: string; identity: CacheIdentity } {
   const { config, options, rules, ecsIp } = setup;
-  const ecs = ecsIp ? makeEcsValue(ecsIp, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined;
+  // A client that sent ECS with source prefix 0 asked that no subnet be passed on (RFC 7871 §7.1.2).
+  const ecs = ecsIp && !ecsOptedOut(query) ? makeEcsValue(ecsIp, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined;
   // A domestic name goes to the direct CN resolvers when configured — no ECS: dialed from inside
   // China, they see the client's own operator by source IP, which is finer than any ECS /24.
   // Otherwise a rule decides first, and in rules mode the domestic lists add to ECS_DOMAINS.
@@ -232,13 +235,15 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   } catch (error) {
     return new Response(error instanceof Error ? error.message : "Malformed DNS packet", { status: 400 });
   }
+  const opt = query.additionals.find((record) => record.type === DnsType.OPT);
+  if (opt && ((opt.ttl >>> 16) & 0xff) !== 0) return dnsResponse(makeBadvers(query), wire);
 
   const setup = await prepareDns(request, env, runtime);
   if (setup instanceof Response) return setup;
   const { config, options, cache, rules } = setup;
-  if (shouldBlock(rules, query)) return dnsResponse(makeBlockedResponse(query));
+  if (shouldBlock(rules, query)) return dnsResponse(makeBlockedResponse(query), wire);
   // Blocked before the cache: every other answer is the same with or without ?safe=1, so they share it.
-  if (options.safe && safeBlocked(query.questions[0]!.name, config)) return dnsResponse(encodeDnsPacket(safeBlockedResponse(query)));
+  if (options.safe && safeBlocked(query.questions[0]!.name, config)) return dnsResponse(encodeDnsPacket(safeBlockedResponse(query)), wire);
 
   const { upstreamQuery, useEcs, useCn, identity } = planQuery(query, setup);
   const question = query.questions[0]!;
@@ -260,22 +265,22 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
       }));
     }
     logQuery(config, query, cached.state === "fresh" ? "hit" : cached.state === "refresh" ? "prefetch" : "stale", undefined, Date.now() - started);
-    return dnsResponse(cached.packet);
+    return dnsResponse(cached.packet, wire);
   }
 
   try {
     const { wire: clientWire, upstream } = await resolveAndStore();
     logQuery(config, query, "miss", upstream, Date.now() - started);
-    return dnsResponse(clientWire);
+    return dnsResponse(clientWire, wire);
   } catch (error) {
     console.error(JSON.stringify({ event: "upstream_failure", message: errorMessage(error) }));
     if (cached) {
       // RFC 8767: an expired answer beats SERVFAIL when every upstream is unreachable.
       logQuery(config, query, "stale", undefined, Date.now() - started);
-      return dnsResponse(cached.packet);
+      return dnsResponse(cached.packet, wire);
     }
     logQuery(config, query, "miss", undefined, Date.now() - started);
-    return dnsResponse(makeServfail(wire));
+    return dnsResponse(makeServfail(wire), wire);
   }
 }
 

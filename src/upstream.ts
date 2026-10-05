@@ -57,12 +57,14 @@ async function queryOne(upstream: string, query: Uint8Array, config: AppConfig, 
 
 /**
  * Hedged upstream query: the next upstream is started either when the previous one fails
- * or after `upstreamHedgeMs` without an answer, whichever comes first. The first valid
- * response wins and every other in-flight attempt is aborted. With hedging disabled this
- * degrades to plain sequential fallback.
+ * or after `upstreamHedgeMs` (`ecsUpstreamHedgeMs` for the ECS group) without an answer,
+ * whichever comes first. The first valid response wins and every other in-flight attempt is
+ * aborted. With hedging disabled this degrades to plain sequential fallback.
  */
 export function queryUpstreams(query: Uint8Array, config: AppConfig, options: UpstreamOptions = {}): Promise<UpstreamResult> {
-  const upstreams = options.cn && config.cnUpstreams.length > 0 ? config.cnUpstreams : options.ecs ? config.ecsUpstreams : config.upstreams;
+  const cn = options.cn === true && config.cnUpstreams.length > 0;
+  const upstreams = cn ? config.cnUpstreams : options.ecs ? config.ecsUpstreams : config.upstreams;
+  const hedgeMs = !cn && options.ecs ? config.ecsUpstreamHedgeMs : config.upstreamHedgeMs;
   if (upstreams.length === 0) return Promise.reject(new Error("No upstreams configured"));
 
   return new Promise<UpstreamResult>((resolve, reject) => {
@@ -90,8 +92,8 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
       pending += 1;
       const timeout = setTimeout(() => controller.abort("upstream timeout"), config.upstreamTimeoutMs);
       timers.push(timeout);
-      if (config.upstreamHedgeMs > 0 && next < upstreams.length) {
-        timers.push(setTimeout(launch, config.upstreamHedgeMs));
+      if (hedgeMs > 0 && next < upstreams.length) {
+        timers.push(setTimeout(launch, hedgeMs));
       }
       queryOne(upstream, query, config, controller.signal)
         .then((packet) => finish({ packet, upstream }))

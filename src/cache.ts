@@ -74,6 +74,19 @@ export function rotateAddressRecords(packet: Uint8Array): Uint8Array {
   return encodeDnsPacket({ ...parsed, answers });
 }
 
+/** Each record's TTL less the seconds the answer has sat in the cache (at least 1), as a resolver should. */
+function aged(packet: Uint8Array, elapsed: number): Uint8Array {
+  if (elapsed < 1) return packet;
+  const parsed = parseDnsPacket(packet);
+  const patch = (records: DnsPacket["answers"]) => records.map((record) => (record.type === DnsType.OPT ? record : { ...record, ttl: Math.max(1, record.ttl - elapsed) }));
+  return encodeDnsPacket({
+    ...parsed,
+    answers: patch(parsed.answers),
+    authorities: patch(parsed.authorities),
+    additionals: patch(parsed.additionals),
+  });
+}
+
 function withTtl(packet: Uint8Array, ttl: number): Uint8Array {
   const parsed = parseDnsPacket(packet);
   const patch = (records: DnsPacket["answers"]) => records.map((record) => (record.type === DnsType.OPT ? record : { ...record, ttl }));
@@ -101,7 +114,13 @@ export async function readCache(cache: Cache, identity: CacheIdentity, config: A
     return { packet: patchTransactionId(withTtl(packet, STALE_RESPONSE_TTL), identity.transactionId), state: "stale" };
   }
   const state: CacheState = config.cachePrefetchPercent > 0 && remaining <= originalTtl * (config.cachePrefetchPercent / 100) ? "refresh" : "fresh";
-  return { packet: patchTransactionId(packet, identity.transactionId), state };
+  let served: Uint8Array = packet;
+  try {
+    served = aged(packet, Math.floor(originalTtl - remaining));
+  } catch {
+    // A packet we cannot re-encode is served with its stored TTLs.
+  }
+  return { packet: patchTransactionId(served, identity.transactionId), state };
 }
 
 export async function writeCache(

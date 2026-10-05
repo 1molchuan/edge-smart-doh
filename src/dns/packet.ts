@@ -295,6 +295,44 @@ export function makeServfail(query: Uint8Array): Uint8Array {
   }
 }
 
+/**
+ * BADVERS (RFC 6891 §6.1.3) for a query with an EDNS version above 0, the only one spoken here: the
+ * extended rcode 16 is header rcode 0 with 1 in the OPT record's upper TTL byte, and version 0.
+ */
+export function makeBadvers(query: DnsPacket): Uint8Array {
+  return encodeDnsPacket({
+    header: { ...query.header, flags: 0x8000 | (query.header.flags & 0x7910) | 0x0080 },
+    questions: query.questions,
+    answers: [],
+    authorities: [],
+    additionals: [{ name: "", type: DnsType.OPT, class: 1232, ttl: 1 << 24, rdata: { kind: "opt", options: [] } }],
+  });
+}
+
+const lower = (byte: number) => (byte >= 0x41 && byte <= 0x5a ? byte | 0x20 : byte);
+
+/**
+ * The response with its question name spelled exactly as the query spelled it. Answers are cached
+ * and shared case-insensitively, but a resolver using 0x20 case randomisation drops a reply whose
+ * question differs in case from what it sent. Anything other than the same name is left alone.
+ */
+export function matchQuestionCase(response: Uint8Array, query: Uint8Array): Uint8Array {
+  let offset = HEADER_LENGTH;
+  for (;;) {
+    const length = query[offset];
+    if (length === undefined || length > 63 || response[offset] !== length) return response;
+    if (length === 0) break;
+    if (offset + 1 + length > query.length || offset + 1 + length > response.length) return response;
+    for (let index = offset + 1; index <= offset + length; index++) {
+      if (lower(query[index]!) !== lower(response[index]!)) return response;
+    }
+    offset += 1 + length;
+  }
+  const output = response.slice();
+  output.set(query.subarray(HEADER_LENGTH, offset), HEADER_LENGTH);
+  return output;
+}
+
 export function patchTransactionId(packet: Uint8Array, id: number): Uint8Array {
   if (packet.length < HEADER_LENGTH) throw new Error("Truncated DNS packet");
   const output = packet.slice();

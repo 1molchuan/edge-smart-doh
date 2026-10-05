@@ -18,6 +18,21 @@ function errorMessage(error: unknown): string {
 const isAddressQuery = (ctx: PlanContext) => ctx.type === DnsType.A || ctx.type === DnsType.AAAA;
 const isEchQuery = (ctx: RequestContext) => ctx.config.echEnabled && ctx.type === DnsType.HTTPS;
 
+/**
+ * Cloudflare's own non-web services (tunnels, WARP) and CF_REWRITE_EXCLUDE are answered exactly as
+ * upstream gave them: the preferred IPs serve HTTP/HTTPS only, not cloudflared's 7844 or WARP's ports.
+ */
+export const untouched: Strategy = {
+  name: "untouched",
+  order: -10,
+  prepare(ctx, plan) {
+    if (!domainMatches(ctx.name, ctx.config.cfRewriteExclude)) return;
+    plan.passthrough = (packet) => packet;
+    plan.strategy = "untouched";
+    ctx.notes?.push("excluded from rewriting (Cloudflare non-web service or CF_REWRITE_EXCLUDE): answer left untouched");
+  },
+};
+
 /** Cloudflare addresses go to the preferred pool (the pool scope is part of the cache key). */
 export const preferredIp: Strategy = {
   name: "preferred-ip",
@@ -147,4 +162,4 @@ export const cloudflareEch: Strategy = {
   },
 };
 
-export const PUBLIC_STRATEGIES: Strategy[] = [preferredIp, xMultiCdn, sitePools, githubPool, metaEch, cloudflareEch];
+export const PUBLIC_STRATEGIES: Strategy[] = [untouched, preferredIp, xMultiCdn, sitePools, githubPool, metaEch, cloudflareEch];
