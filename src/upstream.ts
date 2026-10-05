@@ -1,6 +1,7 @@
 import { parseDnsPacket } from "./dns/packet";
 import { DnsType } from "./dns/types";
 import type { AppConfig } from "./config";
+import { recordUpstream, type UpstreamRole } from "./metrics";
 
 export interface UpstreamResult {
   packet: Uint8Array;
@@ -15,7 +16,7 @@ export interface UpstreamOptions {
 }
 
 /** Hostname for diagnostics; a malformed URL must not turn a failure path into a throw. */
-function upstreamLabel(upstream: string): string {
+export function upstreamLabel(upstream: string): string {
   try {
     return new URL(upstream).hostname;
   } catch {
@@ -64,6 +65,7 @@ async function queryOne(upstream: string, query: Uint8Array, config: AppConfig, 
 export function queryUpstreams(query: Uint8Array, config: AppConfig, options: UpstreamOptions = {}): Promise<UpstreamResult> {
   const upstreams = options.cn && config.cnUpstreams.length > 0 ? config.cnUpstreams : options.ecs ? config.ecsUpstreams : config.upstreams;
   if (upstreams.length === 0) return Promise.reject(new Error("No upstreams configured"));
+  const role: UpstreamRole = options.cn && config.cnUpstreams.length > 0 ? "cn" : options.ecs ? "ecs" : "default";
 
   return new Promise<UpstreamResult>((resolve, reject) => {
     const errors: string[] = [];
@@ -85,6 +87,7 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
     const launch = () => {
       if (settled || next >= upstreams.length) return;
       const upstream = upstreams[next++]!;
+      const attemptStart = Date.now();
       const controller = new AbortController();
       controllers.push(controller);
       pending += 1;
@@ -94,8 +97,15 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
         timers.push(setTimeout(launch, config.upstreamHedgeMs));
       }
       queryOne(upstream, query, config, controller.signal)
-        .then((packet) => finish({ packet, upstream }))
+        .then((packet) => {
+          // Only race winners count as successes: an attempt aborted because another upstream
+          // answered first (or hit the timeout after the race settled) is neither — its catch runs
+          // with settled already true and is skipped there.
+          recordUpstream({ label: upstreamLabel(upstream), role, latencyMs: Date.now() - attemptStart, ok: true });
+          finish({ packet, upstream });
+        })
         .catch((error: unknown) => {
+          const latencyMs = Date.now() - attemptStart;
           clearTimeout(timeout);
           pending -= 1;
           if (settled) return;
@@ -104,6 +114,7 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
           // (finish() sets settled before aborting), so every entry below is a real failure.
           const reason: unknown = controller.signal.reason;
           const detail = typeof reason === "string" && reason.length > 0 ? reason : error instanceof Error ? error.message : String(error);
+          recordUpstream({ label: upstreamLabel(upstream), role, latencyMs, ok: false, error: detail });
           errors.push(`${upstreamLabel(upstream)}: ${detail}`);
           if (next < upstreams.length) launch();
           else if (pending === 0) finish();
