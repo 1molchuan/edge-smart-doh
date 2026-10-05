@@ -41,6 +41,14 @@ const ADMIN_TOKEN = process.env.RELAY_ADMIN_TOKEN ?? "";
 const REPORT_TTL_SECONDS = integer("RELAY_REPORT_TTL", 120, 30, 3600); // server withdraws ~3 missed reports later
 const CHECK_INTERVAL_SECONDS = integer("RELAY_CHECK_INTERVAL", 30, 5, 600);
 const SELF_CHECK_HOST = process.env.RELAY_SELF_CHECK_HOST || "github.com";
+// Auto mode's direct-path measurement: handshake the measured pool IPs straight from this line and
+// report per-host verdicts; the server's hysteresis (relay.ts) decides when a host moves to the
+// relay. Hosts without a measured pool cannot be judged and stay on the direct path.
+const PROBE_HOSTS = (process.env.RELAY_PROBE_HOSTS
+  ?? "github.com,api.github.com,codeload.github.com,raw.githubusercontent.com,objects.githubusercontent.com,avatars.githubusercontent.com,gist.github.com"
+).split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const PROBE_INTERVAL_SECONDS = integer("RELAY_PROBE_INTERVAL", 180, 30, 3600);
+const PROBE_TIMEOUT_MS = integer("RELAY_PROBE_TIMEOUT", 3000, 500, 15000);
 const MAX_CONNECTIONS = integer("RELAY_MAX_CONNECTIONS", 512, 1, 65536);
 const PEEK_TIMEOUT_MS = integer("RELAY_PEEK_TIMEOUT", 3000, 500, 30000);
 const IDLE_TIMEOUT_MS = integer("RELAY_IDLE_TIMEOUT", 30000, 1000, 3600000);
@@ -241,6 +249,64 @@ server.listen(LISTEN_PORT, LISTEN_IP, () => {
   console.log(JSON.stringify({ event: "listening", ip: LISTEN_IP, port: LISTEN_PORT, domains: DOMAINS.length, proxy: `${PROXY_HOST}:${PROXY_PORT}` }));
 });
 
+// ---------------------------------------------------------------- direct-path prober
+
+function timedTls(ip, servername, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const socket = tls.connect({ host: ip, servername, rejectUnauthorized: false, timeout: timeoutMs }, () => {
+      const rttMs = Date.now() - startedAt;
+      socket.destroy();
+      resolve(rttMs);
+    });
+    socket.once("error", (error) => reject(error));
+    socket.once("timeout", () => {
+      socket.destroy();
+      reject(new Error("probe timeout"));
+    });
+  });
+}
+
+/**
+ * One host's direct-path verdict: ok when any measured pool IP completes a TLS handshake directly
+ * from this line (rttMs = the fastest one). No pool → no sample: the server never judges an
+ * unmeasured host.
+ */
+async function probeDirect(host) {
+  const ips = await poolFor(host);
+  if (ips.length === 0) return undefined;
+  let rttMs;
+  for (const ip of ips) {
+    try {
+      const rtt = await timedTls(ip, host, PROBE_TIMEOUT_MS);
+      if (rttMs === undefined || rtt < rttMs) rttMs = rtt;
+    } catch {
+      // try the next candidate IP
+    }
+  }
+  return rttMs === undefined ? { ok: false } : { ok: true, rttMs };
+}
+
+async function probeAndReport() {
+  const healthy = consecutiveFailures < 3;
+  const entries = await Promise.all(PROBE_HOSTS.map(async (host) => [host, await probeDirect(host)]));
+  const direct = Object.fromEntries(entries.filter(([, sample]) => sample !== undefined));
+  if (!ADMIN_TOKEN) {
+    console.log(JSON.stringify({ event: "probe", healthy, hosts: Object.keys(direct).length }));
+    return;
+  }
+  try {
+    await fetch(`${ADMIN_URL}/admin/relay-health`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ source: `relay@${LISTEN_IP}`, ttl: REPORT_TTL_SECONDS, healthy, direct }),
+    });
+    console.log(JSON.stringify({ event: "probe", healthy, hosts: Object.keys(direct).length }));
+  } catch (error) {
+    log("report_error", { error: String(error) });
+  }
+}
+
 // ---------------------------------------------------------------- self-check + reporting
 // Dial our own listener with a real SNI: the full path (us → proxy → real server, TLS handshake
 // included) must work before the DoH server pins anyone to us. Three consecutive failures mark us
@@ -287,6 +353,12 @@ setTimeout(async () => {
   consecutiveFailures = ok ? 0 : consecutiveFailures + 1;
   await report();
 }, 2000).unref();
+
+// The self-check loop keeps liveness fresh between probes; the prober adds the per-host direct
+// samples that drive auto mode. Cadences are independent (30s vs 180s) on purpose: liveness must
+// withdraw fast, judgment must not flap.
+setInterval(probeAndReport, PROBE_INTERVAL_SECONDS * 1000).unref();
+setTimeout(probeAndReport, 10_000).unref();
 
 process.on("SIGTERM", () => {
   console.log(JSON.stringify({ event: "shutdown" }));

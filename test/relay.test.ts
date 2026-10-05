@@ -4,7 +4,7 @@ import { DnsType, type DnsPacket } from "../src/dns/types";
 import { describeHttpsParams } from "../src/dns/https-rr";
 import { readConfig } from "../src/config";
 import { handleRequest } from "../src/index";
-import { relayServes, resetRelayState, setRelayHealth } from "../src/relay";
+import { relayCacheTag, relayServes, relayStatus, resetRelayState, setRelayHealth } from "../src/relay";
 import { clearGithubPools, setGithubPools } from "../src/preferred";
 import { strategyCacheTags } from "../src/plan";
 import { PUBLIC_STRATEGIES } from "../src/strategies";
@@ -181,6 +181,70 @@ describe("relay answers over /dns-query", () => {
     const onCtx = { config: config({ relayMode: "always" as const, relayIp: RELAY_IP, relayDomains: ["*.github.com"], githubDomains: ["github.com"] }), options, name: "github.com", type: DnsType.A };
     expect(strategyCacheTags(PUBLIC_STRATEGIES, onCtx)).toMatch(/^\|relay=v\d+$/);
     expect(strategyCacheTags(PUBLIC_STRATEGIES, { ...onCtx, name: "example.com" })).toBe("");
+  });
+});
+
+describe("auto-mode hysteresis", () => {
+  const autoCfg = config({ relayMode: "auto" as const, relayIp: RELAY_IP, relayDomains: ["*.github.com"] });
+
+  function reportAt(minutes: number, direct: Record<string, { ok: boolean; rttMs?: number }>, healthy = true): void {
+    vi.setSystemTime(Date.now() + minutes * 60_000);
+    setRelayHealth({ source: "t", ttlSeconds: 600, healthy, direct });
+  }
+
+  it("hands a host over only after a persistently bad direct path, and back after a persistently good one", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-05T12:00:00Z"));
+    reportAt(0, {});
+    expect(relayServes("github.com", autoCfg)).toBe(false);
+    // 60% success is not bad enough to hand over.
+    reportAt(1, { "github.com": { ok: true, rttMs: 120 } });
+    reportAt(2, { "github.com": { ok: true, rttMs: 120 } });
+    reportAt(3, { "github.com": { ok: false } });
+    reportAt(4, { "github.com": { ok: false } });
+    expect(relayServes("github.com", autoCfg)).toBe(false);
+    // Now everything fails within the 15-minute enter window: 4/4 bad.
+    reportAt(5, { "github.com": { ok: false } });
+    reportAt(6, { "github.com": { ok: false } });
+    expect(relayServes("github.com", autoCfg)).toBe(true);
+    expect(relayServes("api.github.com", autoCfg)).toBe(false); // unmeasured host stays on the direct path
+    // Recovery: good samples until the 30-minute exit window is >80% good.
+    for (let i = 0; i < 12; i++) reportAt(3, { "github.com": { ok: true, rttMs: 90 } });
+    expect(relayServes("github.com", autoCfg)).toBe(false);
+  });
+
+  it("bumps the cache tag on every decision change", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-05T12:00:00Z"));
+    reportAt(0, {});
+    const before = relayCacheTag();
+    for (let i = 0; i < 3; i++) reportAt(1, { "github.com": { ok: false } });
+    const entered = relayCacheTag();
+    expect(entered).not.toBe(before);
+    for (let i = 0; i < 12; i++) reportAt(3, { "github.com": { ok: true, rttMs: 90 } });
+    expect(relayCacheTag()).not.toBe(entered);
+  });
+
+  it("a relay going unhealthy hands every host back immediately", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-05T12:00:00Z"));
+    reportAt(0, {});
+    for (let i = 0; i < 4; i++) reportAt(1, { "github.com": { ok: false }, "api.github.com": { ok: false } });
+    expect(relayServes("github.com", autoCfg)).toBe(true);
+    reportAt(1, {}, false);
+    expect(relayServes("github.com", autoCfg)).toBe(false);
+    expect(relayStatus().hosts.every((host) => !host.relayed)).toBe(true);
+  });
+
+  it("reports per-host rates for the monitor", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-05T12:00:00Z"));
+    reportAt(0, {});
+    reportAt(1, { "github.com": { ok: true, rttMs: 100 } });
+    reportAt(2, { "github.com": { ok: false } });
+    const host = relayStatus().hosts.find((entry) => entry.host === "github.com");
+    expect(host).toMatchObject({ relayed: false, samples: 2 });
+    expect(host!.enterRate).toBeCloseTo(0.5);
   });
 });
 
