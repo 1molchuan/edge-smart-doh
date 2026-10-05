@@ -38,17 +38,24 @@ async function ask(wire: Uint8Array, clientIp?: string): Promise<Uint8Array> {
   return new Uint8Array(await res.arrayBuffer());
 }
 
-/** An upstream answering every A query with 192.0.2.1 (TTL 300), recording the ECS it was sent. */
-function stubUpstream(seen: { ecs?: boolean }[] = []) {
+/**
+ * An upstream answering every A query with 192.0.2.1 (TTL 300), recording the ECS it was sent and,
+ * like a real resolver, echoing that ECS back with a scope of /20.
+ */
+function stubUpstream(seen: { ecs?: boolean; subnet?: string }[] = []) {
   const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
     const query = parseDnsPacket(new Uint8Array(init!.body as ArrayBuffer));
     const opt = query.additionals.find((record) => record.rdata.kind === "opt");
-    seen.push({ ecs: opt?.rdata.kind === "opt" && opt.rdata.options.some((option) => option.code === 8) });
+    const ecs = opt?.rdata.kind === "opt" ? opt.rdata.options.find((option) => option.code === 8) : undefined;
+    seen.push({ ecs: ecs !== undefined, ...(ecs ? { subnet: `${Array.from(ecs.data.subarray(4)).join(".")}/${ecs.data[2]}` } : {}) });
+    const echoed = ecs ? Uint8Array.from(ecs.data) : undefined;
+    if (echoed) echoed[3] = 20;
     const packet = encodeDnsPacket({
       header: { id: query.header.id, flags: 0x8180, qdcount: 1, ancount: 1, nscount: 0, arcount: 0 },
       questions: query.questions,
       answers: [{ name: query.questions[0]!.name, type: DnsType.A, class: 1, ttl: 300, rdata: { kind: "a", address: "192.0.2.1" } }],
-      authorities: [], additionals: [],
+      authorities: [],
+      additionals: opt ? [{ name: "", type: DnsType.OPT, class: 1232, ttl: 0, rdata: { kind: "opt", options: echoed ? [{ code: 8, data: echoed }] : [] } }] : [],
     });
     return new Response(Uint8Array.from(packet).buffer, { headers: { "Content-Type": "application/dns-message" } });
   });
@@ -83,7 +90,41 @@ describe("protocol compliance", () => {
     await ask(queryWire("a.example.cn"), "58.247.1.1");
     const optOut = { name: "", type: DnsType.OPT, class: 1232, ttl: 0, rdata: { kind: "opt" as const, options: [{ code: 8, data: Uint8Array.from([0, 1, 0, 0]) }] } };
     await ask(queryWire("b.example.cn", { additionals: [optOut] }), "58.247.1.1");
-    expect(seen).toEqual([{ ecs: true }, { ecs: false }]);
+    expect(seen.map((item) => item.ecs)).toEqual([true, false]);
+  });
+
+  const ecsIn = (packet: Uint8Array) => {
+    const opt = parseDnsPacket(packet).additionals.find((record) => record.rdata.kind === "opt");
+    const option = opt?.rdata.kind === "opt" ? opt.rdata.options.find((item) => item.code === 8) : undefined;
+    return option ? `${Array.from(option.data.subarray(4)).join(".")}/${option.data[2]} scope /${option.data[3]}` : undefined;
+  };
+  const withEcs = (subnet: number[], prefix: number) => ({
+    additionals: [{ name: "", type: DnsType.OPT, class: 1232, ttl: 0, rdata: { kind: "opt" as const, options: [{ code: 8, data: Uint8Array.from([0, 1, prefix, 0, ...subnet]) }] } }],
+  });
+
+  it("does not show the server's own subnet to a client that sent none (RFC 7871 §7.2.2)", async () => {
+    const seen: { ecs?: boolean; subnet?: string }[] = [];
+    stubUpstream(seen);
+    const plainOpt = { additionals: [{ name: "", type: DnsType.OPT, class: 1232, ttl: 0, rdata: { kind: "opt" as const, options: [] } }] };
+    const withOpt = await ask(queryWire("c.example.cn", plainOpt), "58.247.1.1");
+    expect(seen[0]).toEqual({ ecs: true, subnet: "58.247.1/24" });
+    expect(ecsIn(withOpt)).toBeUndefined();
+    expect(parseDnsPacket(withOpt).additionals.some((record) => record.type === DnsType.OPT)).toBe(true);
+    // No OPT in the query: none in the answer either, though one carried the subnet upstream.
+    const noOpt = await ask(queryWire("d.example.cn"), "58.247.1.1");
+    expect(parseDnsPacket(noOpt).additionals.some((record) => record.type === DnsType.OPT)).toBe(false);
+  });
+
+  it("uses a client's own ECS (cut to /24) and echoes it back with upstream's scope", async () => {
+    const seen: { ecs?: boolean; subnet?: string }[] = [];
+    stubUpstream(seen);
+    const reply = await ask(queryWire("e.example.cn", withEcs([8, 8, 8, 8], 32)), "58.247.1.1");
+    expect(seen[0]).toEqual({ ecs: true, subnet: "8.8.8/24" });
+    expect(ecsIn(reply)).toBe("8.8.8.8/32 scope /20");
+    // A name that does not get ECS still echoes the client's option, with scope 0.
+    const foreign = await ask(queryWire("www.example.org", withEcs([8, 8, 8], 24)), "58.247.1.1");
+    expect(seen[1]).toEqual({ ecs: false });
+    expect(ecsIn(foreign)).toBe("8.8.8/24 scope /0");
   });
 });
 

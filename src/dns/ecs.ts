@@ -1,5 +1,5 @@
 import { canonicalName } from "./name";
-import { parseIpv4, parseIpv6 } from "./packet";
+import { encodeDnsPacket, parseDnsPacket, parseIpv4, parseIpv6 } from "./packet";
 import { DnsType, type DnsPacket, type DnsRecord, type EdnsOption } from "./types";
 import type { AppConfig } from "../config";
 
@@ -36,14 +36,67 @@ export function makeEcsValue(ip: string, ipv4Prefix: number, ipv6Prefix: number)
   }
 }
 
-/**
- * The client sent ECS with a source prefix of 0: RFC 7871 §7.1.2 asks that no subnet be added for it.
- * (Any other client ECS is replaced by the server's own choice, as before.)
- */
+/** The ECS option the client sent itself, if any. */
+export function clientEcsOption(packet: DnsPacket): EdnsOption | undefined {
+  for (const record of packet.additionals) {
+    if (record.rdata.kind !== "opt") continue;
+    const option = record.rdata.options.find((item) => item.code === ECS_OPTION_CODE);
+    if (option) return option;
+  }
+  return undefined;
+}
+
+/** The client sent ECS with a source prefix of 0: RFC 7871 §7.1.2 asks that no subnet be added for it. */
 export function ecsOptedOut(packet: DnsPacket): boolean {
-  return packet.additionals.some((record) =>
-    record.rdata.kind === "opt" && record.rdata.options.some((option) => option.code === ECS_OPTION_CODE && option.data.length >= 3 && option.data[2] === 0),
-  );
+  const option = clientEcsOption(packet);
+  return option !== undefined && option.data.length >= 3 && option.data[2] === 0;
+}
+
+/**
+ * The subnet the client asked for in its own ECS option, cut to the server's own prefix length (it
+ * never sends more of an address than it would of the client's own). Undefined when there is none,
+ * an opt-out (source prefix 0), or one that does not parse: the server then picks the subnet itself.
+ */
+export function clientEcsValue(option: EdnsOption | undefined, ipv4Prefix: number, ipv6Prefix: number): EcsValue | undefined {
+  if (!option || option.data.length < 4) return undefined;
+  const family = (option.data[0]! << 8) | option.data[1]!;
+  const source = option.data[2]!;
+  const bytes = option.data.subarray(4);
+  const width = family === 1 ? 4 : family === 2 ? 16 : 0;
+  if (width === 0 || source === 0 || source > width * 8 || bytes.length !== Math.ceil(source / 8)) return undefined;
+  const full = new Uint8Array(width);
+  full.set(bytes);
+  const ip = family === 1
+    ? Array.from(full).join(".")
+    : Array.from({ length: 8 }, (_, index) => ((full[index * 2]! << 8) | full[index * 2 + 1]!).toString(16)).join(":");
+  return makeEcsValue(ip, Math.min(source, ipv4Prefix), Math.min(source, ipv6Prefix));
+}
+
+/**
+ * The response's EDNS made to match the query (RFC 7871 §7.2.2, RFC 6891): the server's own ECS is
+ * not shown to a client that sent none; a client that sent one gets its own option back, with the
+ * scope upstream gave the answer (never wider than the client's source prefix); and a query without
+ * OPT gets no OPT, even though one was added upstream to carry the subnet.
+ */
+export function alignResponseEdns(wire: Uint8Array, query: DnsPacket): Uint8Array {
+  const parsed = parseDnsPacket(wire);
+  if (!parsed.additionals.some((record) => record.type === DnsType.OPT)) return wire;
+  if (!query.additionals.some((record) => record.type === DnsType.OPT)) {
+    return encodeDnsPacket({ ...parsed, additionals: parsed.additionals.filter((record) => record.type !== DnsType.OPT) });
+  }
+  const client = clientEcsOption(query);
+  const additionals = parsed.additionals.map((record) => {
+    if (record.rdata.kind !== "opt") return record;
+    const upstream = record.rdata.options.find((item) => item.code === ECS_OPTION_CODE);
+    const options = record.rdata.options.filter((item) => item.code !== ECS_OPTION_CODE);
+    if (client && client.data.length >= 4) {
+      const echo = Uint8Array.from(client.data);
+      echo[3] = Math.min(upstream && upstream.data.length >= 4 ? upstream.data[3]! : 0, echo[2]!);
+      options.push({ code: ECS_OPTION_CODE, data: echo });
+    }
+    return { ...record, rdata: { kind: "opt" as const, options } };
+  });
+  return encodeDnsPacket({ ...parsed, additionals });
 }
 
 function encodeEcs(value: EcsValue): Uint8Array {

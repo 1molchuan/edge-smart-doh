@@ -1,7 +1,7 @@
 import { normalizedCacheIdentity, readCache, rotateAddressRecords, writeCache, type CacheHit, type CacheIdentity } from "./cache";
 import { inAnyCidr } from "./cidr";
 import { readConfig, type AppConfig } from "./config";
-import { addEcs, ecsOptedOut, ecsSourceIp, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
+import { addEcs, alignResponseEdns, clientEcsOption, clientEcsValue, ecsOptedOut, ecsSourceIp, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
 import { encodeDnsPacket, makeBadvers, makeServfail, matchQuestionCase, parseDnsPacket, parseIpv4, patchTransactionId } from "./dns/packet";
 import { DnsType, type DnsPacket } from "./dns/types";
 import { chromiumEchVerdict, describeAnswers, dnsTypeName, selfCheckStatus, setSelfCheck } from "./explain";
@@ -192,8 +192,11 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
 /** ECS decision and cache key for one query. */
 function planQuery(query: DnsPacket, setup: DnsSetup): { upstreamQuery: DnsPacket; useEcs: boolean; useCn: boolean; ecsIdentity?: string; identity: CacheIdentity } {
   const { config, options, rules, ecsIp } = setup;
-  // A client that sent ECS with source prefix 0 asked that no subnet be passed on (RFC 7871 §7.1.2).
-  const ecs = ecsIp && !ecsOptedOut(query) ? makeEcsValue(ecsIp, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined;
+  // A client that sent ECS with source prefix 0 asked that no subnet be passed on (RFC 7871 §7.1.2);
+  // one that sent a subnet gets that subnet used; otherwise the server picks it from the client address.
+  const ecs = ecsOptedOut(query)
+    ? undefined
+    : clientEcsValue(clientEcsOption(query), config.ecsIpv4Prefix, config.ecsIpv6Prefix) ?? (ecsIp ? makeEcsValue(ecsIp, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined);
   // A domestic name goes to the direct CN resolvers when configured — no ECS: dialed from inside
   // China, they see the client's own operator by source IP, which is finer than any ECS /24.
   // Otherwise a rule decides first, and in rules mode the domestic lists add to ECS_DOMAINS.
@@ -248,6 +251,20 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   const { upstreamQuery, useEcs, useCn, identity } = planQuery(query, setup);
   const question = query.questions[0]!;
   const cached = await readCache(cache, identity, config);
+  // The subnet sent upstream is not echoed to a client that sent none; one that sent its own gets that
+  // back (RFC 7871 §7.2.2). Only answers that went out with ECS, or to a client with ECS, need the pass.
+  const clientEcs = clientEcsOption(query) !== undefined;
+  const reply = (packet: Uint8Array): Response => {
+    let body = packet;
+    if (useEcs || clientEcs) {
+      try {
+        body = alignResponseEdns(packet, query);
+      } catch {
+        // A packet we cannot re-encode is served as-is.
+      }
+    }
+    return dnsResponse(body, wire);
+  };
 
   const resolveAndStore = async (): Promise<{ wire: Uint8Array; upstream: string }> => {
     const resolved = await resolveFresh(query, upstreamQuery, useEcs, useCn, rules, options, config, cache);
@@ -265,19 +282,19 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
       }));
     }
     logQuery(config, query, cached.state === "fresh" ? "hit" : cached.state === "refresh" ? "prefetch" : "stale", undefined, Date.now() - started);
-    return dnsResponse(cached.packet, wire);
+    return reply(cached.packet);
   }
 
   try {
     const { wire: clientWire, upstream } = await resolveAndStore();
     logQuery(config, query, "miss", upstream, Date.now() - started);
-    return dnsResponse(clientWire, wire);
+    return reply(clientWire);
   } catch (error) {
     console.error(JSON.stringify({ event: "upstream_failure", message: errorMessage(error) }));
     if (cached) {
       // RFC 8767: an expired answer beats SERVFAIL when every upstream is unreachable.
       logQuery(config, query, "stale", undefined, Date.now() - started);
-      return dnsResponse(cached.packet, wire);
+      return reply(cached.packet);
     }
     logQuery(config, query, "miss", undefined, Date.now() - started);
     return dnsResponse(makeServfail(wire), wire);
