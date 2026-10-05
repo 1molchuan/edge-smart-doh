@@ -62,6 +62,30 @@ sudo mv /var/lib/edge-smart-doh/cache.bin /var/lib/edge-smart-doh/cache.bin.poll
 sudo systemctl start edge-smart-doh
 ```
 
+## 局域网监测站（:8788）
+
+`deploy-home.sh` 会顺带装一个监测站（也可单独装/升级：`sudo bash contrib/home/install-monitor.sh`），手机或电脑浏览器打开 `http://<内网IP>:8788`。图表由 **ECharts**（Apache-2.0）渲染，库文件在 `contrib/home/monitor/vendor/` 里随安装复制到本机、由监测站自己提供——**不依赖公网 CDN**，纯内网环境可用；vendor 文件缺失时图表面板会提示加载失败，表格不受影响。
+
+页面按"打开的人想问什么"排序：
+
+1. **健康判定（首屏大字）**：绿"运行正常" / 黄"统计不可用、失败率偏高" / 红"服务不可达、解析异常"，异常时直接给出原因（哪条链路、什么错误）；
+2. **解析链路健康 + 核心数字**：国内直连 / GitHub 池 / 境外代理三条链路各自的当前延迟，以及总查询、缓存命中率、回源 P50；
+3. **查询量曲线**（近 2 小时每分钟堆叠柱状）与**链路延迟趋势**（每 10 秒真实 DoH 探测）；
+4. **诊断区（默认折叠）**：高频域名、最近查询、优选池与规则状态（池子剩余 TTL 少于 30 分钟会标黄）。
+
+探测域名的链路名称默认按域名特征推导（国内大站=国内直连、github=GitHub 池、其余=境外/代理），可用 `MONITOR_PROBE_LABELS`（逗号分隔，与 `MONITOR_PROBE_NAMES` 一一对应）整体覆盖。
+
+- **服务状态**：DoH 可达性、探测延迟、运行时长、内存；
+- **查询统计**：总量、每分钟曲线（近 2 小时）、缓存命中率、回源延迟分位数（P50/P90/P99）、失败数；
+- **上游解析器**：默认 / ECS（CN 分流启用时还有国内直连组）各自的成败、平均与峰值延迟、最近一次错误；
+- **解析策略**：回源时 direct / preferred-ip / github-pool 等的分布；
+- **主动探测**：对几个域名（默认淘宝/GitHub/Google，`MONITOR_PROBE_NAMES` 可改）定期发真实 DoH 查询，看国内直连、GitHub 池、代理出境三条链路是否各自正常；
+- **Top 域名 / 最近查询**、**优选池与名单状态**（cfhub 运营商池、GitHub 池、国内域名名单、?safe=1 名单、Meta ECH）。
+
+数据来自主服务新增的 `GET /admin/stats`（`ADMIN_TOKEN` 鉴权）和监测站自己的探测；统计存在内存里，主服务重启后从零开始。
+
+**只在局域网访问**是两层防线：监测站按 TCP 对端地址过滤（只放行回环与私网网段，可 `MONITOR_ALLOW` 覆盖，绝不信任 `X-Forwarded-For` 一类可伪造头）；`SETUP_FIREWALL=1` 时 nftables 只对内网网段放行 8788。`ADMIN_TOKEN` 只存在于监测进程里，页面不带任何凭据。
+
 ## 回滚
 
 - 环境变量：脚本每次改 env 前会备份成 `/etc/edge-smart-doh/env.bak-<时间>`，拷回去再 `systemctl restart edge-smart-doh`。
