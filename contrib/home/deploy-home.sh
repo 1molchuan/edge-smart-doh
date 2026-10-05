@@ -33,6 +33,11 @@ SETUP_DDNS=1                         # OPEN_PUBLIC=1 时生效
 SKIP_BUILD=0                         # 1 = dist/node.mjs 已存在时跳过 npm ci/build（快速重跑）
 SETUP_FIREWALL=0                     # 1 = 用 nftables 整体替换 /etc/nftables.conf：入站默认丢弃，只放行
                                      #     SSH/mosh/DoH。NAS 或跑着其他服务的机器上会挡掉它们，确认后再开
+RELAY_ENABLED=0                      # 1 = 安装 SNI 中转（contrib/home/relay/DESIGN.md）：名单域名的 DNS
+                                     #     答案指向第二内网 IP，本机按 SNI 经代理转发 TCP（TLS 端到端），
+                                     #     auto 档在直连质量差时自动接管；0 = 完全不装
+RELAY_IP_CFG=""                      # 中转监听的第二内网 IP（如 192.168.1.250）；留空=首跑询问并持久化
+RELAY_DOMAINS_CFG=""                 # 走中转的域名（支持 *. 通配）；留空=GitHub 族默认四条通配
 # ==========================================================
 
 LOG_FILE="/var/log/deploy-home.log"
@@ -110,6 +115,8 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 FIREWALL_8443=""
 [[ "$OPEN_PUBLIC" == "1" ]] && FIREWALL_8443=$'    # 8443：公网 DoH 入口（经路由器转发，主机上无法区分来源，全放）\n    tcp dport 8443 accept'
+FIREWALL_RELAY=""
+[[ "$RELAY_ENABLED" == "1" && -n "$RELAY_IP_CFG" ]] && FIREWALL_RELAY=$'    # 443 SNI 中转：仅本机第二 IP、仅内网来源\n    ip saddr '"$LAN_CIDR"' ip daddr '"$RELAY_IP_CFG"' tcp dport 443 accept'
 
 log "edge-smart-doh 部署开始（日志：$LOG_FILE）OPEN_PUBLIC=$OPEN_PUBLIC  DOMAIN=$DOH_DOMAIN"
 
@@ -266,6 +273,89 @@ else
   rm -f "$DROPIN_PROXY"
 fi
 
+# ---- 3c：SNI 中转（可选，RELAY_ENABLED=1；见 contrib/home/relay/DESIGN.md）----
+# 给网卡加第二个内网 IP，DNS 把名单域名答成它，relay 进程按 SNI 把 TCP 经代理转出去。
+# 必须放在服务 restart 之前：RELAY_* env 要随这次重启一起生效。
+if [[ "$RELAY_ENABLED" != "1" ]]; then
+  log "步骤 3c：SNI 中转（跳过：RELAY_ENABLED=0）"
+elif [[ -z "$PROXY_ADDR" ]]; then
+  warn "中转需要出境代理（PROXY_ADDR），本次跳过"
+else
+  log "步骤 3c：SNI 中转（GitHub 族域名经本机中转出境）"
+  if [[ -z "$RELAY_IP_CFG" ]]; then
+    read -rp "中转监听的第二内网 IP（建议 ${LAN_IP%.*}.250；回车=暂不启用中转）: " RELAY_IP_CFG
+    [[ -n "$RELAY_IP_CFG" ]] && save_conf RELAY_IP_CFG "$RELAY_IP_CFG"
+  fi
+  if [[ -z "$RELAY_IP_CFG" ]]; then
+    warn "未提供 RELAY_IP，跳过中转（想要时设 RELAY_ENABLED=1 重跑）"
+  else
+    [[ "$RELAY_IP_CFG" =~ ^(10\.|127\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]] \
+      || die "RELAY_IP 必须是私网地址（服务端也会拒绝公网地址）"
+
+    # --- 3c-1 第二内网 IP：本次立即生效 + 按网络后端持久化 ---
+    RELAY_PREFIX="${LAN_CIDR##*/}"
+    RELAY_DEV="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+    if ip -4 addr show 2>/dev/null | grep -q "inet ${RELAY_IP_CFG}/"; then
+      ok "第二 IP ${RELAY_IP_CFG} 已在位"
+    elif [[ -n "$RELAY_DEV" ]]; then
+      ip addr add "${RELAY_IP_CFG}/${RELAY_PREFIX}" dev "$RELAY_DEV" \
+        && ok "已添加 ${RELAY_IP_CFG}/${RELAY_PREFIX} → ${RELAY_DEV}（本次生效）" \
+        || warn "ip addr add 失败（地址可能被占用？）"
+    else
+      warn "找不到默认路由网卡，请手工：ip addr add ${RELAY_IP_CFG}/${RELAY_PREFIX} dev <网卡>"
+    fi
+    if command -v nmcli >/dev/null 2>&1; then
+      RELAY_CONN="$(nmcli -g NAME,DEVICE con show --active 2>/dev/null | awk -F: -v d="${RELAY_DEV:-x}" '$2==d{print $1; exit}')"
+      if [[ -n "$RELAY_CONN" ]]; then
+        nmcli con mod "$RELAY_CONN" +ipv4.addresses "${RELAY_IP_CFG}/${RELAY_PREFIX}" 2>/dev/null \
+          && ok "NetworkManager 已持久化（连接 ${RELAY_CONN}）" \
+          || warn "nmcli 持久化失败，请手工给连接 ${RELAY_CONN} 加 ${RELAY_IP_CFG}/${RELAY_PREFIX}"
+      fi
+    elif [[ -f /etc/network/interfaces ]] && grep -qE '^iface .+ inet ' /etc/network/interfaces; then
+      warn "ifupdown 持久化请手工：在对应 iface 段加一行 'up ip addr add ${RELAY_IP_CFG}/${RELAY_PREFIX} dev ${RELAY_DEV:-<网卡>}'"
+    elif systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+      warn "networkd 持久化请手工：对应 .network 的 [Network] 加 'Address=${RELAY_IP_CFG}/${RELAY_PREFIX}'"
+    else
+      warn "未识别网络后端，重启后请手工补：ip addr add ${RELAY_IP_CFG}/${RELAY_PREFIX} dev ${RELAY_DEV:-<网卡>}"
+    fi
+
+    # --- 3c-2 主服务 env：RELAY_*（RELAY_MODE 尊重已改过的值，其余随配置区刷新）---
+    RELAY_DOMAINS_CFG="${RELAY_DOMAINS_CFG:-*.github.com,*.githubusercontent.com,*.githubassets.com,*.github.io}"
+    env_has_value RELAY_MODE || set_env_value RELAY_MODE auto
+    set_env_value RELAY_IP "$RELAY_IP_CFG"
+    set_env_value RELAY_DOMAINS "$RELAY_DOMAINS_CFG"
+    env_has_value RELAY_EXCLUDE_DOMAINS || set_env_value RELAY_EXCLUDE_DOMAINS "ssh.github.com"
+    ok "主服务 env：RELAY_MODE=$(sed -n 's/^RELAY_MODE=//p' "$ENV_FILE") RELAY_IP=$RELAY_IP_CFG"
+
+    # --- 3c-3 relay 守护进程（独立最小 env，不读主 env 的解析配置）---
+    install -D -m 0755 "$PROJECT_DIR/contrib/home/relay/relay.mjs" /opt/edge-smart-doh/relay.mjs
+    install -D -m 0644 "$PROJECT_DIR/contrib/home/relay/DESIGN.md" /opt/edge-smart-doh/relay-DESIGN.md
+    RELAY_ADMIN_TOKEN_VALUE="$(sed -n 's/^ADMIN_TOKEN=//p' "$ENV_FILE")"
+    [[ -n "$RELAY_ADMIN_TOKEN_VALUE" ]] || die "主 env 缺 ADMIN_TOKEN（中转上报健康需要它）"
+    RELAY_PROXY_HOSTPORT="${PROXY_ADDR#http://}"
+    # 探测主机 = GITHUB_DOMAINS（具体主机名；去掉可能的 *. 前缀；无池的主机采不到样，自动保持直连）
+    RELAY_PROBE_HOSTS_VALUE="$(sed -n 's/^GITHUB_DOMAINS=//p' "$ENV_FILE" | sed 's/\*\.//g')"
+    umask 077
+    {
+      printf 'RELAY_LISTEN_IP=%s\n' "$RELAY_IP_CFG"
+      printf 'RELAY_PROXY=%s\n' "$RELAY_PROXY_HOSTPORT"
+      printf 'RELAY_DOMAINS=%s\n' "$RELAY_DOMAINS_CFG"
+      printf 'RELAY_EXCLUDE_DOMAINS=ssh.github.com\n'
+      printf 'RELAY_ADMIN_URL=http://127.0.0.1:8787\n'
+      printf 'RELAY_ADMIN_TOKEN=%s\n' "$RELAY_ADMIN_TOKEN_VALUE"
+      [[ -n "$RELAY_PROBE_HOSTS_VALUE" ]] && printf 'RELAY_PROBE_HOSTS=%s\n' "$RELAY_PROBE_HOSTS_VALUE"
+    } > /etc/edge-smart-doh/relay.env
+    umask 022
+    install -m 0644 "$PROJECT_DIR/contrib/home/relay/relay.service" /etc/systemd/system/edge-smart-doh-relay.service
+    ok "relay.env 已生成（最小权限：只含监听/代理/名单/token）"
+
+    # --- 3c-4 前置条件：mihomo 的 DOMAIN 规则（无池回退按域名 CONNECT 时靠它远程解析防回环）---
+    warn "请确认代理配置里有名单域名的 DOMAIN 规则（如 DOMAIN-SUFFIX,github.com,<代理组>），并执行
+      curl -x ${PROXY_ADDR} -sI https://github.com -o /dev/null -w '%{http_code}' 验证走代理（期望 200）。
+      缺这条规则时 relay 仍可用（按实测池 IP 拨号），但池空的域名会依赖本地解析路径。"
+  fi
+fi
+
 systemctl daemon-reload
 systemctl enable edge-smart-doh >/dev/null 2>&1
 # 重跑场景：服务已在运行时 enable 不会重启——env/代理 drop-in 的改动必须 restart 才生效
@@ -289,6 +379,25 @@ for _ in $(seq 1 15); do curl -fsS http://127.0.0.1:8787/health >/dev/null 2>&1 
 curl -fsS http://127.0.0.1:8787/health >/dev/null \
   || die "服务 15 秒内未就绪：journalctl -u edge-smart-doh -n 30（若见 --import 报错=undici/Node 版本问题）"
 ok "edge-smart-doh 运行中；ADMIN_TOKEN 在 $TOKEN_FILE"
+
+# ---- 3c-5：启动 relay 守护进程并验收（主服务已就绪，健康上报才有接收方）----
+if [[ "$RELAY_ENABLED" == "1" && -n "$PROXY_ADDR" && -n "$RELAY_IP_CFG" && -f /etc/edge-smart-doh/relay.env ]]; then
+  systemctl enable edge-smart-doh-relay >/dev/null 2>&1
+  systemctl restart edge-smart-doh-relay
+  RELAY_UP=0
+  for _ in $(seq 1 10); do ss -tln 2>/dev/null | grep -q "${RELAY_IP_CFG}:443 " && RELAY_UP=1 && break; sleep 1; done
+  if [[ "$RELAY_UP" != "1" ]]; then
+    warn "relay 未在 ${RELAY_IP_CFG}:443 监听：journalctl -u edge-smart-doh-relay -n 20（DNS 侧会在健康上报到达前保持直连，不影响现有解析）"
+  else
+    ok "relay 监听 ${RELAY_IP_CFG}:443（auto 档：直连质量差的域名会自动切到中转）"
+    if curl -s --noproxy '*' --connect-to "github.com:443:${RELAY_IP_CFG}:443" --max-time 15 \
+         https://github.com/ -o /dev/null; then
+      ok "中转链路验收通过：https://github.com 经 ${RELAY_IP_CFG} → ${PROXY_ADDR} 出境"
+    else
+      warn "经中转访问 github.com 未通过（线路抖动或代理侧规则问题）——auto 档会在健康自检失败时自动回退直连，可稍后看监测站"
+    fi
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 4. cfhub → 本机 同步（纯出站）
@@ -530,6 +639,7 @@ table inet home_firewall {
 ${FIREWALL_8443}
     # 8787：明文 DoH 仅内网直连，绝不放公网
     ip saddr ${LAN_CIDR} tcp dport 8787 accept
+${FIREWALL_RELAY}
 
     # 其余入站：丢弃并计数
     counter drop

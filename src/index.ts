@@ -449,7 +449,7 @@ async function preferredAuth(request: Request, env: Env): Promise<"admin" | "hub
 }
 
 function adminState(): Record<string, unknown> {
-  return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, selfcheck: selfCheckStatus(), h3: h3Status() };
+  return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, relay: relayStatus(), selfcheck: selfCheckStatus(), h3: h3Status() };
 }
 
 /**
