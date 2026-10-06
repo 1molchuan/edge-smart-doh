@@ -257,6 +257,42 @@ describe("hedged upstream", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("spreads a resolver over its paths within each path's budget, then moves on to the next entry", async () => {
+    const asked: string[] = [];
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      asked.push(String(input));
+      return Promise.resolve(ok());
+    }));
+    const cfg = config({
+      ecsUpstreams: ["https://budget-a.example/dns-query#qps=1|http://10.0.0.9:8053/dns-query#qps=1", "https://fallback.example/dns-query"],
+      ecsUpstreamHedgeMs: 0,
+    });
+    const labels: string[] = [];
+    for (let i = 0; i < 3; i += 1) labels.push((await queryUpstreams(new Uint8Array(12), cfg, { ecs: true })).label);
+    // The fragment never reaches the wire; the third query finds both paths spent.
+    expect(asked).toEqual(["https://budget-a.example/dns-query", "http://10.0.0.9:8053/dns-query", "https://fallback.example/dns-query"]);
+    expect(labels).toEqual(["budget-a.example", "budget-a.example via 10.0.0.9", "fallback.example"]);
+  });
+
+  it("cools a budgeted path down after repeated failures, and tries it again later", async () => {
+    const asked: string[] = [];
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      asked.push(String(input));
+      return Promise.resolve(String(input).includes("flaky") ? new Response("bad", { status: 503 }) : ok());
+    }));
+    const cfg = config({ ecsUpstreams: ["https://flaky.example/dns-query#qps=100", "https://steady.example/dns-query"], ecsUpstreamHedgeMs: 0 });
+    for (let i = 0; i < 5; i += 1) expect((await queryUpstreams(new Uint8Array(12), cfg, { ecs: true })).upstream).toContain("steady");
+    asked.length = 0;
+    await queryUpstreams(new Uint8Array(12), cfg, { ecs: true });
+    expect(asked).toEqual(["https://steady.example/dns-query"]);
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + 121_000);
+    asked.length = 0;
+    await queryUpstreams(new Uint8Array(12), cfg, { ecs: true });
+    expect(asked[0]).toBe("https://flaky.example/dns-query");
+    vi.restoreAllMocks();
+  });
+
   it("takes a late primary success if the hedged secondary fails first", async () => {
     let releasePrimary: (() => void) | undefined;
     const fetchMock = vi.fn((input: RequestInfo | URL) => {

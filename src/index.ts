@@ -326,7 +326,7 @@ async function resolveFresh(
   if (notes) {
     if (useCn) notes.push("domestic name: resolved through the direct CN upstreams (no ECS — the resolver sees the client's operator by source IP)");
     const answers = describeAnswers(originalResponse);
-    notes.push(`upstream ${new URL(result.upstream).hostname}${useEcs ? " (with ECS)" : ""}: rcode ${originalResponse.header.flags & 0x0f}, ${answers.length > 0 ? answers.join("; ") : "no answers"}`);
+    notes.push(`upstream ${result.label}${useEcs ? " (with ECS)" : ""}: rcode ${originalResponse.header.flags & 0x0f}, ${answers.length > 0 ? answers.join("; ") : "no answers"}`);
   }
   const ruled = applyResponseRules(rules, query, originalResponse);
   if (ruled !== originalResponse) notes?.push("response rules changed the answer");

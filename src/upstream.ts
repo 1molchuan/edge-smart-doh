@@ -1,10 +1,81 @@
 import { parseDnsPacket } from "./dns/packet";
 import { DnsType } from "./dns/types";
 import type { AppConfig } from "./config";
+import { parseUpstreamEntry, type UpstreamPath } from "./upstream-entry";
 
 export interface UpstreamResult {
   packet: Uint8Array;
+  /** The URL that answered (one path of the entry). */
   upstream: string;
+  /** For diagnostics: the resolver's host, and "via" the path's host when another path answered. */
+  label: string;
+}
+
+/**
+ * Budgeted paths (see upstream-entry.ts) also cool down after failures: a throttling resolver answers
+ * SERVFAIL or nothing, and every query sent to it meanwhile costs the hedge delay. BREAKER_FAILURES
+ * failures within BREAKER_WINDOW_MS take the path out for BREAKER_COOLDOWN_MS.
+ */
+const BREAKER_FAILURES = 5;
+const BREAKER_WINDOW_MS = 30_000;
+const BREAKER_COOLDOWN_MS = 120_000;
+
+interface PathState {
+  tokens: number;
+  refilledAt: number;
+  failures: number[];
+  openUntil: number;
+}
+
+const pathStates = new Map<string, PathState>();
+const parsedEntries = new Map<string, UpstreamPath[]>();
+
+function stateOf(path: UpstreamPath): PathState {
+  let state = pathStates.get(path.url);
+  if (!state) {
+    state = { tokens: path.qps ?? 0, refilledAt: Date.now(), failures: [], openUntil: 0 };
+    pathStates.set(path.url, state);
+  }
+  return state;
+}
+
+/** The first path of an entry within its budget and not cooling down, its token taken; or none. */
+function pickPath(entry: string): { path: UpstreamPath; paths: UpstreamPath[] } | undefined {
+  let paths = parsedEntries.get(entry);
+  if (!paths) {
+    // An entry readConfig would have dropped is tried as-is, so it fails like any other upstream.
+    paths = parseUpstreamEntry(entry) ?? [{ url: entry }];
+    parsedEntries.set(entry, paths);
+  }
+  const now = Date.now();
+  for (const path of paths) {
+    if (path.qps === undefined) return { path, paths };
+    const state = stateOf(path);
+    if (state.openUntil > now) continue;
+    state.tokens = Math.min(path.qps, state.tokens + ((now - state.refilledAt) / 1000) * path.qps);
+    state.refilledAt = now;
+    if (state.tokens < 1) continue;
+    state.tokens -= 1;
+    return { path, paths };
+  }
+  return undefined;
+}
+
+function recordOutcome(path: UpstreamPath, ok: boolean): void {
+  if (path.qps === undefined) return;
+  const state = stateOf(path);
+  const now = Date.now();
+  if (ok) {
+    state.failures = [];
+    return;
+  }
+  state.failures = state.failures.filter((at) => now - at < BREAKER_WINDOW_MS);
+  state.failures.push(now);
+  if (state.failures.length >= BREAKER_FAILURES) {
+    state.failures = [];
+    state.openUntil = now + BREAKER_COOLDOWN_MS;
+    console.warn(JSON.stringify({ event: "upstream_cooling_down", upstream: upstreamLabel(path.url), seconds: BREAKER_COOLDOWN_MS / 1000 }));
+  }
 }
 
 export interface UpstreamOptions {
@@ -84,9 +155,20 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
       else reject(new Error(`All upstreams failed (${errors.join("; ")})`));
     };
 
-    const launch = () => {
+    const launch = (): void => {
       if (settled || next >= upstreams.length) return;
-      const upstream = upstreams[next++]!;
+      const entry = upstreams[next++]!;
+      const picked = pickPath(entry);
+      if (!picked) {
+        // Every path over budget or cooling down: on to the next entry at once.
+        errors.push(`${upstreamLabel(entry.split("|", 1)[0]!.split("#", 1)[0]!)}: over budget or cooling down`);
+        if (next < upstreams.length) launch();
+        else if (pending === 0) finish();
+        return;
+      }
+      const { path, paths } = picked;
+      const upstream = path.url;
+      const label = path === paths[0] ? upstreamLabel(upstream) : `${upstreamLabel(paths[0]!.url)} via ${upstreamLabel(upstream)}`;
       const controller = new AbortController();
       controllers.push(controller);
       pending += 1;
@@ -96,17 +178,21 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
         timers.push(setTimeout(launch, hedgeMs));
       }
       queryOne(upstream, query, config, controller.signal)
-        .then((packet) => finish({ packet, upstream }))
+        .then((packet) => {
+          recordOutcome(path, true);
+          finish({ packet, upstream, label });
+        })
         .catch((error: unknown) => {
           clearTimeout(timeout);
           pending -= 1;
           if (settled) return;
+          recordOutcome(path, false);
           // The abort reason ("upstream timeout") is the useful diagnostic: a fetch rejected by an
           // abort only reports "This operation was aborted". Superseded attempts never reach here
           // (finish() sets settled before aborting), so every entry below is a real failure.
           const reason: unknown = controller.signal.reason;
           const detail = typeof reason === "string" && reason.length > 0 ? reason : error instanceof Error ? error.message : String(error);
-          errors.push(`${upstreamLabel(upstream)}: ${detail}`);
+          errors.push(`${label}: ${detail}`);
           if (next < upstreams.length) launch();
           else if (pending === 0) finish();
         });

@@ -1,6 +1,9 @@
+import { parseUpstreamEntry } from "./upstream-entry";
+
 export type EcsMode = "off" | "always" | "rules";
 
 export interface AppConfig {
+  /** Entries as upstream-entry.ts describes: a DoH URL, or paths to one resolver joined by "|". */
   upstreams: string[];
   /** Upstreams used for queries carrying ECS; only resolvers that forward ECS belong here. Falls back to `upstreams`. */
   ecsUpstreams: string[];
@@ -122,8 +125,9 @@ const CF_SERVICE_DOMAINS = [".argotunnel.com", ".cftunnel.com", ".cloudflareclie
 export function readConfig(env: Env): AppConfig {
   const rawMode: string = env.ECS_MODE;
   const mode = rawMode === "off" || rawMode === "always" ? rawMode : "rules";
-  const upstreams = list(env.UPSTREAMS).filter((item) => item.startsWith("https://"));
-  const ecsUpstreams = list(env.ECS_UPSTREAMS).filter((item) => item.startsWith("https://"));
+  const usable = (item: string) => parseUpstreamEntry(item) !== undefined;
+  const upstreams = list(env.UPSTREAMS).filter(usable);
+  const ecsUpstreams = list(env.ECS_UPSTREAMS).filter(usable);
   const upstreamHedgeMs = integer(env.UPSTREAM_HEDGE_MS, 100, 0, 5000);
   return {
     upstreams,
@@ -140,7 +144,7 @@ export function readConfig(env: Env): AppConfig {
     ecsDomains: list(env.ECS_DOMAINS).map((item) => item.toLowerCase()),
     ecsIpv4Prefix: integer(env.ECS_IPV4_PREFIX, 24, 0, 32),
     ecsIpv6Prefix: integer(env.ECS_IPV6_PREFIX, 48, 0, 128),
-    cnUpstreams: list(env.CN_UPSTREAMS).filter((item) => item.startsWith("https://")),
+    cnUpstreams: list(env.CN_UPSTREAMS).filter(usable),
     cnDomains: list(env.CN_DOMAINS).map((item) => item.toLowerCase()),
     // A "/24" suffix is accepted and ignored: the prefix comes from ECS_IPV4_PREFIX/ECS_IPV6_PREFIX.
     ecsFallbackSubnet: (env.ECS_FALLBACK_SUBNET ?? "").split("/", 1)[0] || undefined,

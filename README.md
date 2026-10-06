@@ -188,11 +188,11 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `UPSTREAMS` | Cloudflare、Google、AdGuard（不过滤版） | 上游 DoH，逗号分隔，只接受 https。Node 的 fetch 只发 HTTP/1.1，不支持 HTTP/1.1 的上游（如 Quad9，返回 505）用不了 |
+| `UPSTREAMS` | Cloudflare、Google、AdGuard（不过滤版） | 上游 DoH，逗号分隔，只接受 https。Node 的 fetch 只发 HTTP/1.1，不支持 HTTP/1.1 的上游（如 Quad9，返回 505）用不了。三组上游（还有 `ECS_UPSTREAMS`、`CN_UPSTREAMS`）的每一项都可以带限速：`https://1.12.12.12/dns-query#qps=6` 表示每秒最多发 6 个，超出的直接交给下一项；带限速的上游 30 秒内失败 5 次，会停用 2 分钟。公共解析器会对单个来源 IP 限流（实测 DNSPod 在每秒约 19 个查询时几分钟内就开始回 SERVFAIL）。一项还可以用 `\|` 连接同一个解析器的多条路径，例如 `https://1.12.12.12/dns-query#qps=6\|http://10.0.0.2:8053/dns-query#qps=6`，后者是经内网隧道、由另一台机器转发的同一个解析器，这样它看到的是两个来源 IP。每次查询取第一条还有额度、没在停用的路径。明文 http 只接受内网和本机地址 |
 | `ECS_UPSTREAMS` | 同 `UPSTREAMS` | 带 ECS 的查询用的上游，只放国内会转发 ECS 的解析器（如阿里 DNS、DNSPod）。Cloudflare 不转发 ECS；Google 虽然转发，同样的 ECS 查百度、华为、携程、去哪儿仍常拿到海外节点 |
 | `UPSTREAM_TIMEOUT_MS` | 2500 | 单次上游超时 |
 | `UPSTREAM_HEDGE_MS` | 100 | 多久没回就并发问下一个上游，0 表示不并发 |
-| `ECS_UPSTREAM_HEDGE_MS` | 同 `UPSTREAM_HEDGE_MS` | `ECS_UPSTREAMS` 这一组自己的并发间隔。建议设 0：只有前一个失败或超时才问下一个，第一个能答的都由它答；设成正数时，冷门网段上排第一的解析器递归慢，后面的就会抢答 |
+| `ECS_UPSTREAM_HEDGE_MS` | 同 `UPSTREAM_HEDGE_MS` | `ECS_UPSTREAMS` 这一组自己的并发间隔。组里有 Google 这类会给海外节点的解析器时，必须设 0：只有前一个失败或超时才问下一个，否则冷门网段上排第一的解析器递归慢，它就会抢答。组里全是国内解析器时，可以设 200 左右让它们竞速 |
 | `CACHE_MIN_TTL` / `CACHE_MAX_TTL` | 30 / 3600 | 缓存 TTL 的上下限（秒） |
 | `NEGATIVE_CACHE_MAX_TTL` | 300 | 否定应答最多缓存多久 |
 | `CACHE_STALE_TTL` | 86400 | 过期应答在上游全挂时还能用多久，0 关闭 |
