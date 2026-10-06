@@ -1,4 +1,5 @@
 import { canonicalName } from "./dns/name";
+import { storedEdns } from "./dns/edns";
 import { encodeDnsPacket, getResponseTtl, parseDnsPacket, patchTransactionId } from "./dns/packet";
 import { DnsType, type DnsPacket } from "./dns/types";
 import type { AppConfig } from "./config";
@@ -132,7 +133,14 @@ export async function writeCache(
   const parsed = parseDnsPacket(response);
   const ttl = getResponseTtl(parsed, config.cacheMinTtl, config.cacheMaxTtl, config.negativeCacheMaxTtl);
   if (ttl <= 0) return 0;
-  const normalized = patchTransactionId(response, 0);
+  let stored = response;
+  try {
+    const trimmed = storedEdns(parsed);
+    if (trimmed !== parsed) stored = encodeDnsPacket(trimmed);
+  } catch {
+    // A packet we cannot re-encode is stored as-is; its OPT is rebuilt when served anyway.
+  }
+  const normalized = patchTransactionId(stored, 0);
   await cache.put(
     identity.key,
     new Response(Uint8Array.from(normalized).buffer, {

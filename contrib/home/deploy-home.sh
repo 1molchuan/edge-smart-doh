@@ -206,7 +206,8 @@ elif [[ -n "$PROXY_ADDR" ]]; then
   # 答案缓存与 ECH/CF 判定用的派生缓存（实测时间线见 contrib/home/README.md）。
   # 国内域名不进这个池子：由 CN_UPSTREAMS 直连国内解析器分流（见下方「国内网站的国内节点」），
   # 两组上游各查各的域名，互不竞速。ECS 路径（CN 分流关闭时的回退）只留 dns.google：
-  # cloudflare 不转发 ECS，不能进 ECS 列表。
+  # cloudflare 不转发 ECS，不能进 ECS 列表；关分流就是不碰国内解析器，代价是百度、华为、
+  # 携程等站点常拿到海外节点（见 contrib/home/README.md）。
   UPSTREAMS_CFG="https://cloudflare-dns.com/dns-query,https://dns.google/dns-query"
   ECS_UPSTREAMS_CFG="https://dns.google/dns-query"
 else

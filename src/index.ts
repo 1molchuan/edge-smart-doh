@@ -1,7 +1,8 @@
 import { normalizedCacheIdentity, readCache, rotateAddressRecords, writeCache, type CacheHit, type CacheIdentity } from "./cache";
 import { inAnyCidr } from "./cidr";
 import { readConfig, type AppConfig } from "./config";
-import { addEcs, alignResponseEdns, clientEcsOption, clientEcsValue, ecsOptedOut, ecsSourceIp, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
+import { addEcs, clientEcsValue, ecsSourceIp, makeEcsValue, readClientEcs, removeEcs, shouldUseEcs } from "./dns/ecs";
+import { fitEdns } from "./dns/edns";
 import { encodeDnsPacket, makeBadvers, makeServfail, matchQuestionCase, parseDnsPacket, parseIpv4, patchTransactionId } from "./dns/packet";
 import { DnsType, type DnsPacket } from "./dns/types";
 import { chromiumEchVerdict, describeAnswers, dnsTypeName, selfCheckStatus, setSelfCheck } from "./explain";
@@ -96,9 +97,10 @@ function validateQuery(packet: DnsPacket): void {
   if (packet.questions.length !== 1) throw new Error("Exactly one DNS question is required");
 }
 
-function makeBlockedResponse(query: DnsPacket): Uint8Array {
+/** An answer-less response with `rcode`: 1 FORMERR, 3 NXDOMAIN. */
+function rcodeResponse(query: DnsPacket, rcode: number): Uint8Array {
   return encodeDnsPacket({
-    header: { ...query.header, flags: 0x8000 | (query.header.flags & 0x7910) | 0x0080 | 3 },
+    header: { ...query.header, flags: 0x8000 | (query.header.flags & 0x7910) | 0x0080 | rcode },
     questions: query.questions,
     answers: [],
     authorities: [],
@@ -194,9 +196,11 @@ function planQuery(query: DnsPacket, setup: DnsSetup): { upstreamQuery: DnsPacke
   const { config, options, rules, ecsIp } = setup;
   // A client that sent ECS with source prefix 0 asked that no subnet be passed on (RFC 7871 §7.1.2);
   // one that sent a subnet gets that subnet used; otherwise the server picks it from the client address.
-  const ecs = ecsOptedOut(query)
-    ? undefined
-    : clientEcsValue(clientEcsOption(query), config.ecsIpv4Prefix, config.ecsIpv6Prefix) ?? (ecsIp ? makeEcsValue(ecsIp, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined);
+  // (A malformed one never gets here: handleDns answers it FORMERR.)
+  const client = readClientEcs(query);
+  const ecs = client
+    ? clientEcsValue(client, config.ecsIpv4Prefix, config.ecsIpv6Prefix)
+    : ecsIp ? makeEcsValue(ecsIp, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined;
   // A domestic name goes to the direct CN resolvers when configured — no ECS: dialed from inside
   // China, they see the client's own operator by source IP, which is finer than any ECS /24.
   // Otherwise a rule decides first, and in rules mode the domestic lists add to ECS_DOMAINS.
@@ -240,31 +244,29 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   }
   const opt = query.additionals.find((record) => record.type === DnsType.OPT);
   if (opt && ((opt.ttl >>> 16) & 0xff) !== 0) return dnsResponse(makeBadvers(query), wire);
+  const client = readClientEcs(query);
+  // Every answer, cached or not, leaves with an OPT record made for this query (dns/edns.ts).
+  const reply = (packet: Uint8Array): Response => {
+    let body = packet;
+    try {
+      body = fitEdns(packet, query, client ?? undefined);
+    } catch {
+      // A packet we cannot re-encode is served as-is.
+    }
+    return dnsResponse(body, wire);
+  };
+  if (client === null) return reply(rcodeResponse(query, 1));
 
   const setup = await prepareDns(request, env, runtime);
   if (setup instanceof Response) return setup;
   const { config, options, cache, rules } = setup;
-  if (shouldBlock(rules, query)) return dnsResponse(makeBlockedResponse(query), wire);
+  if (shouldBlock(rules, query)) return reply(rcodeResponse(query, 3));
   // Blocked before the cache: every other answer is the same with or without ?safe=1, so they share it.
-  if (options.safe && safeBlocked(query.questions[0]!.name, config)) return dnsResponse(encodeDnsPacket(safeBlockedResponse(query)), wire);
+  if (options.safe && safeBlocked(query.questions[0]!.name, config)) return reply(encodeDnsPacket(safeBlockedResponse(query)));
 
   const { upstreamQuery, useEcs, useCn, identity } = planQuery(query, setup);
   const question = query.questions[0]!;
   const cached = await readCache(cache, identity, config);
-  // The subnet sent upstream is not echoed to a client that sent none; one that sent its own gets that
-  // back (RFC 7871 §7.2.2). Only answers that went out with ECS, or to a client with ECS, need the pass.
-  const clientEcs = clientEcsOption(query) !== undefined;
-  const reply = (packet: Uint8Array): Response => {
-    let body = packet;
-    if (useEcs || clientEcs) {
-      try {
-        body = alignResponseEdns(packet, query);
-      } catch {
-        // A packet we cannot re-encode is served as-is.
-      }
-    }
-    return dnsResponse(body, wire);
-  };
 
   const resolveAndStore = async (): Promise<{ wire: Uint8Array; upstream: string }> => {
     const resolved = await resolveFresh(query, upstreamQuery, useEcs, useCn, rules, options, config, cache);
@@ -297,7 +299,7 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
       return reply(cached.packet);
     }
     logQuery(config, query, "miss", undefined, Date.now() - started);
-    return dnsResponse(makeServfail(wire), wire);
+    return reply(makeServfail(wire));
   }
 }
 

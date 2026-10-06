@@ -1,9 +1,9 @@
 import { canonicalName } from "./name";
-import { encodeDnsPacket, parseDnsPacket, parseIpv4, parseIpv6 } from "./packet";
+import { parseIpv4, parseIpv6 } from "./packet";
 import { DnsType, type DnsPacket, type DnsRecord, type EdnsOption } from "./types";
 import type { AppConfig } from "../config";
 
-const ECS_OPTION_CODE = 8;
+export const ECS_OPTION_CODE = 8;
 
 function truncate(bytes: Uint8Array, prefix: number): Uint8Array {
   const length = Math.ceil(prefix / 8);
@@ -36,67 +36,61 @@ export function makeEcsValue(ip: string, ipv4Prefix: number, ipv6Prefix: number)
   }
 }
 
-/** The ECS option the client sent itself, if any. */
-export function clientEcsOption(packet: DnsPacket): EdnsOption | undefined {
-  for (const record of packet.additionals) {
-    if (record.rdata.kind !== "opt") continue;
-    const option = record.rdata.options.find((item) => item.code === ECS_OPTION_CODE);
-    if (option) return option;
-  }
-  return undefined;
-}
-
-/** The client sent ECS with a source prefix of 0: RFC 7871 §7.1.2 asks that no subnet be added for it. */
-export function ecsOptedOut(packet: DnsPacket): boolean {
-  const option = clientEcsOption(packet);
-  return option !== undefined && option.data.length >= 3 && option.data[2] === 0;
+/** The ECS option a client sent itself (RFC 7871 §6). */
+export interface ClientEcs {
+  family: 1 | 2;
+  source: number;
+  address: Uint8Array;
 }
 
 /**
- * The subnet the client asked for in its own ECS option, cut to the server's own prefix length (it
- * never sends more of an address than it would of the client's own). Undefined when there is none,
- * an opt-out (source prefix 0), or one that does not parse: the server then picks the subnet itself.
+ * The client's own ECS option: undefined when it sent none, null when the option is malformed, which
+ * RFC 7871 §6 answers with FORMERR: an unknown family, a source prefix longer than the address, an
+ * address that is not exactly ⌈source/8⌉ bytes, bits set past the prefix, or a non-zero scope in a
+ * query. A source prefix of 0 is valid: the client asks that no subnet be passed on (§7.1.2).
  */
-export function clientEcsValue(option: EdnsOption | undefined, ipv4Prefix: number, ipv6Prefix: number): EcsValue | undefined {
-  if (!option || option.data.length < 4) return undefined;
-  const family = (option.data[0]! << 8) | option.data[1]!;
-  const source = option.data[2]!;
-  const bytes = option.data.subarray(4);
-  const width = family === 1 ? 4 : family === 2 ? 16 : 0;
-  if (width === 0 || source === 0 || source > width * 8 || bytes.length !== Math.ceil(source / 8)) return undefined;
-  const full = new Uint8Array(width);
-  full.set(bytes);
-  const ip = family === 1
+export function readClientEcs(query: DnsPacket): ClientEcs | null | undefined {
+  const option = query.additionals.flatMap((record) => (record.rdata.kind === "opt" ? record.rdata.options : [])).find((item) => item.code === ECS_OPTION_CODE);
+  if (!option) return undefined;
+  const { data } = option;
+  if (data.length < 4) return null;
+  const family = (data[0]! << 8) | data[1]!;
+  const source = data[2]!;
+  const address = data.subarray(4);
+  if (family !== 1 && family !== 2) return null;
+  if (source > (family === 1 ? 32 : 128) || data[3] !== 0 || address.length !== Math.ceil(source / 8)) return null;
+  if (source % 8 !== 0 && (address[address.length - 1]! & (0xff >> source % 8)) !== 0) return null;
+  return { family, source, address: Uint8Array.from(address) };
+}
+
+/**
+ * The subnet sent upstream for a client's own ECS, cut to the server's own prefix length (it never
+ * passes on more of an address than it would of the client's own). Undefined for an opt-out.
+ */
+export function clientEcsValue(client: ClientEcs, ipv4Prefix: number, ipv6Prefix: number): EcsValue | undefined {
+  if (client.source === 0) return undefined;
+  const full = new Uint8Array(client.family === 1 ? 4 : 16);
+  full.set(client.address);
+  const ip = client.family === 1
     ? Array.from(full).join(".")
     : Array.from({ length: 8 }, (_, index) => ((full[index * 2]! << 8) | full[index * 2 + 1]!).toString(16)).join(":");
-  return makeEcsValue(ip, Math.min(source, ipv4Prefix), Math.min(source, ipv6Prefix));
+  return makeEcsValue(ip, Math.min(client.source, ipv4Prefix), Math.min(client.source, ipv6Prefix));
 }
 
-/**
- * The response's EDNS made to match the query (RFC 7871 §7.2.2, RFC 6891): the server's own ECS is
- * not shown to a client that sent none; a client that sent one gets its own option back, with the
- * scope upstream gave the answer (never wider than the client's source prefix); and a query without
- * OPT gets no OPT, even though one was added upstream to carry the subnet.
- */
-export function alignResponseEdns(wire: Uint8Array, query: DnsPacket): Uint8Array {
-  const parsed = parseDnsPacket(wire);
-  if (!parsed.additionals.some((record) => record.type === DnsType.OPT)) return wire;
-  if (!query.additionals.some((record) => record.type === DnsType.OPT)) {
-    return encodeDnsPacket({ ...parsed, additionals: parsed.additionals.filter((record) => record.type !== DnsType.OPT) });
-  }
-  const client = clientEcsOption(query);
-  const additionals = parsed.additionals.map((record) => {
-    if (record.rdata.kind !== "opt") return record;
-    const upstream = record.rdata.options.find((item) => item.code === ECS_OPTION_CODE);
-    const options = record.rdata.options.filter((item) => item.code !== ECS_OPTION_CODE);
-    if (client && client.data.length >= 4) {
-      const echo = Uint8Array.from(client.data);
-      echo[3] = Math.min(upstream && upstream.data.length >= 4 ? upstream.data[3]! : 0, echo[2]!);
-      options.push({ code: ECS_OPTION_CODE, data: echo });
-    }
-    return { ...record, rdata: { kind: "opt" as const, options } };
-  });
-  return encodeDnsPacket({ ...parsed, additionals });
+/** The client's ECS option as echoed in a response: its own family, prefix and address, with `scope`. */
+export function ecsEcho(client: ClientEcs, scope: number): EdnsOption {
+  const data = new Uint8Array(4 + client.address.length);
+  data[1] = client.family;
+  data[2] = client.source;
+  data[3] = Math.min(scope, client.source);
+  data.set(client.address, 4);
+  return { code: ECS_OPTION_CODE, data };
+}
+
+/** The scope prefix of the ECS option in a response's OPT record, or 0 when it carries none. */
+export function responseEcsScope(opt: DnsRecord | undefined): number {
+  const option = opt?.rdata.kind === "opt" ? opt.rdata.options.find((item) => item.code === ECS_OPTION_CODE) : undefined;
+  return option && option.data.length >= 4 ? option.data[3]! : 0;
 }
 
 function encodeEcs(value: EcsValue): Uint8Array {

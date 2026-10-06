@@ -60,9 +60,26 @@ function stubUpstream(seen: { ecs?: boolean; subnet?: string }[] = []) {
     return new Response(Uint8Array.from(packet).buffer, { headers: { "Content-Type": "application/dns-message" } });
   });
   vi.stubGlobal("fetch", fetchMock);
-  vi.stubGlobal("caches", { open: async () => new MemoryCache() });
+  const cache = new MemoryCache();
+  vi.stubGlobal("caches", { open: async () => cache });
   return fetchMock;
 }
+
+const opt = (options: { code: number; data: Uint8Array }[] = [], ttl = 0) => ({
+  additionals: [{ name: "", type: DnsType.OPT, class: 1232, ttl, rdata: { kind: "opt" as const, options } }],
+});
+const optOf = (packet: Uint8Array) => parseDnsPacket(packet).additionals.find((record) => record.type === DnsType.OPT);
+const optionCodes = (packet: Uint8Array) => {
+  const record = optOf(packet);
+  return record?.rdata.kind === "opt" ? record.rdata.options.map((option) => option.code) : undefined;
+};
+const PADDING = { code: 12, data: new Uint8Array(20) };
+const ecsIn = (packet: Uint8Array) => {
+  const record = optOf(packet);
+  const option = record?.rdata.kind === "opt" ? record.rdata.options.find((item) => item.code === 8) : undefined;
+  return option ? `${option.data[1] === 2 ? "v6 " : ""}${Array.from(option.data.subarray(4)).join(".")}/${option.data[2]} scope /${option.data[3]}` : undefined;
+};
+const withEcs = (subnet: number[], prefix: number, family = 1) => opt([{ code: 8, data: Uint8Array.from([0, family, prefix, 0, ...subnet]) }]);
 
 describe("protocol compliance", () => {
   it("answers BADVERS to an EDNS version above 0 without asking upstream", async () => {
@@ -93,15 +110,6 @@ describe("protocol compliance", () => {
     expect(seen.map((item) => item.ecs)).toEqual([true, false]);
   });
 
-  const ecsIn = (packet: Uint8Array) => {
-    const opt = parseDnsPacket(packet).additionals.find((record) => record.rdata.kind === "opt");
-    const option = opt?.rdata.kind === "opt" ? opt.rdata.options.find((item) => item.code === 8) : undefined;
-    return option ? `${Array.from(option.data.subarray(4)).join(".")}/${option.data[2]} scope /${option.data[3]}` : undefined;
-  };
-  const withEcs = (subnet: number[], prefix: number) => ({
-    additionals: [{ name: "", type: DnsType.OPT, class: 1232, ttl: 0, rdata: { kind: "opt" as const, options: [{ code: 8, data: Uint8Array.from([0, 1, prefix, 0, ...subnet]) }] } }],
-  });
-
   it("does not show the server's own subnet to a client that sent none (RFC 7871 §7.2.2)", async () => {
     const seen: { ecs?: boolean; subnet?: string }[] = [];
     stubUpstream(seen);
@@ -125,6 +133,79 @@ describe("protocol compliance", () => {
     const foreign = await ask(queryWire("www.example.org", withEcs([8, 8, 8], 24)), "58.247.1.1");
     expect(seen[1]).toEqual({ ecs: false });
     expect(ecsIn(foreign)).toBe("8.8.8/24 scope /0");
+  });
+
+  it("echoes a client's IPv6 ECS from the parsed fields", async () => {
+    const seen: { ecs?: boolean; subnet?: string }[] = [];
+    stubUpstream(seen);
+    const reply = await ask(queryWire("f.example.cn", withEcs([0x24, 0x08, 0x80, 0x00], 32, 2)), "58.247.1.1");
+    expect(seen[0]).toEqual({ ecs: true, subnet: "36.8.128.0/32" }); // 2408:8000::/32, under the /56 cut
+    expect(ecsIn(reply)).toBe("v6 36.8.128.0/32 scope /20");
+  });
+});
+
+// The cache is shared by every client of a name, so the OPT record of whichever query filled it must
+// not reach the next client: each answer gets one made for its own query.
+describe("EDNS does not depend on which query filled the cache", () => {
+  it("OPT first, then none: the second answer has no OPT (RFC 6891 §7)", async () => {
+    const fetchMock = stubUpstream();
+    expect(optOf(await ask(queryWire("a.example.org", opt())))).toBeDefined();
+    expect(optOf(await ask(queryWire("a.example.org")))).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("none first, then OPT or ECS: the second answer has OPT, and the client's ECS echoed (§6.1.1)", async () => {
+    const fetchMock = stubUpstream();
+    expect(optOf(await ask(queryWire("b.example.org")))).toBeUndefined();
+    expect(optOf(await ask(queryWire("b.example.org", opt())))).toBeDefined();
+    expect(ecsIn(await ask(queryWire("b.example.org", withEcs([8, 8, 8], 24))))).toBe("8.8.8/24 scope /0");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a padded query gets a padded answer, a plain one never does (RFC 8467)", async () => {
+    stubUpstream();
+    const plain = await ask(queryWire("c.example.org"));
+    const padded = await ask(queryWire("c.example.org", opt([PADDING])));
+    expect(padded.length % 468).toBe(0);
+    expect(optionCodes(padded)).toEqual([12]);
+    const unpadded = await ask(queryWire("c.example.org", opt()));
+    expect(optionCodes(unpadded)).toEqual([]);
+    expect(await ask(queryWire("c.example.org"))).toHaveLength(plain.length);
+    // Padded first: the cache does not keep the padding for the next client.
+    await ask(queryWire("d.example.org", opt([PADDING])));
+    expect(optOf(await ask(queryWire("d.example.org")))).toBeUndefined();
+    expect(optionCodes(await ask(queryWire("d.example.org", opt())))).toEqual([]);
+  });
+
+  it("the OPT carries the query's DO bit", async () => {
+    stubUpstream();
+    expect(optOf(await ask(queryWire("e.example.org", opt([], 0x8000))))!.ttl & 0x8000).toBe(0x8000);
+    expect(optOf(await ask(queryWire("e.example.org", opt())))!.ttl & 0x8000).toBe(0);
+  });
+
+  it("error answers carry OPT too when the query did", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 500 })));
+    vi.stubGlobal("caches", { open: async () => new MemoryCache() });
+    const reply = await ask(queryWire("f.example.org", opt()));
+    expect(parseDnsPacket(reply).header.flags & 0x0f).toBe(2);
+    expect(optOf(reply)).toBeDefined();
+  });
+});
+
+describe("a malformed client ECS option", () => {
+  it.each([
+    ["an IPv4 source prefix of 33", [0, 1, 33, 0, 8, 8, 8, 8, 0]],
+    ["more address bytes than the prefix covers", [0, 1, 24, 0, 8, 8, 8, 8]],
+    ["an unknown family", [0, 3, 24, 0, 8, 8, 8]],
+    ["bits set past the prefix", [0, 1, 20, 0, 8, 8, 8]],
+    ["a non-zero scope in the query", [0, 1, 24, 24, 8, 8, 8]],
+    ["a truncated option", [0, 1]],
+  ])("is answered FORMERR without asking upstream: %s", async (_label, data) => {
+    const fetchMock = stubUpstream();
+    const reply = await ask(queryWire("g.example.cn", opt([{ code: 8, data: Uint8Array.from(data) }])), "58.247.1.1");
+    expect(parseDnsPacket(reply).header.flags & 0x0f).toBe(1);
+    expect(optionCodes(reply)).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

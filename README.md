@@ -25,17 +25,17 @@
 2. **确定访问者**：Node 版本从 `X-Real-IP`（没有就用 TCP 对端地址）取得客户端 IP，Worker 版本用 `CF-Connecting-IP`。IP 只用来选池和决定 ECS，不写日志、不落盘。
 3. **选出这次用的优选池**（见[优选池分层](#优选池分层)）。
 4. **查缓存**（见[缓存](#缓存)）。命中就直接返回。
-5. **查上游**：同时准备多个上游 DoH（默认 Cloudflare、Google、AdGuard 不过滤版）。先问第一个，`UPSTREAM_HEDGE_MS` 毫秒内没回或者失败，就再问下一个，谁先给出合法应答用谁。“合法”指 HTTP 200 + `application/dns-message` + QR 位为响应，且 rcode 是 0（NOERROR）或 3（NXDOMAIN）、TC=0、OPT 记录的扩展 rcode 为 0；SERVFAIL/REFUSED/NOTIMP/截断一律算这次上游失败，交给下一个（否则它会赢下竞速并把并发的可信上游短路掉）。所有上游必须同样可信：竞速只比快慢，一个更快但被污染的上游会一直赢。命中 `ECS_DOMAINS` 的国内域名会带上客户端的 /24（IPv6 为 /48）子网信息（ECS），发给支持 ECS 的上游（`ECS_UPSTREAMS`），这样国内 CDN 能按你的位置返回节点。客户端自己带了 ECS 时用客户端给的子网（最长同样截到 /24、/48），带 `0/0` 表示不要 ECS；应答里不会出现服务端替你选的子网，只回显客户端自己发来的那份（RFC 7871）。
+5. **查上游**：同时准备多个上游 DoH（默认 Cloudflare、Google、AdGuard 不过滤版）。先问第一个，`UPSTREAM_HEDGE_MS` 毫秒内没回或者失败，就再问下一个，谁先给出合法应答用谁。“合法”指 HTTP 200 + `application/dns-message` + QR 位为响应，且 rcode 是 0（NOERROR）或 3（NXDOMAIN）、TC=0、OPT 记录的扩展 rcode 为 0；SERVFAIL/REFUSED/NOTIMP/截断一律算这次上游失败，交给下一个（否则它会赢下竞速并把并发的可信上游短路掉）。所有上游必须同样可信：竞速只比快慢，一个更快但被污染的上游会一直赢。命中 `ECS_DOMAINS` 的国内域名会带上客户端的 /24（IPv6 为 /48）子网信息（ECS），发给支持 ECS 的上游（`ECS_UPSTREAMS`），这样国内 CDN 能按你的位置返回节点。客户端自己带了 ECS 时用客户端给的子网（最长同样截到 /24、/48），带 `0/0` 表示不要 ECS；格式不合法的 ECS（未知地址族、前缀超长、地址长度不对、前缀外有非零位、查询里 SCOPE 不为 0）直接回 FORMERR。应答里不会出现服务端替你选的子网，只回显客户端自己发来的那份（RFC 7871）。
 6. **应用规则**：`RULES_JSON`、`RULES_URL` 或请求里的 `?rules=` 可以改写或屏蔽某些域名的应答。
 7. **判断是不是 Cloudflare**：应答里的地址落在 Cloudflare 公布的网段内（`https://www.cloudflare.com/ips-v4/` 等，每天刷新），就算 Cloudflare。X（Twitter）这类在多家 CDN 之间切换的域名，还会查 `<域名>.cdn.cloudflare.net` 是否存在，以判断 Cloudflare 是否也在服务它。
 8. **改写地址**：把应答里所有 Cloudflare 的 A/AAAA 记录换成整个优选池（每个地址族最多 6 个），HTTPS 记录的 `ipv4hint`/`ipv6hint` 同步改掉（Firefox 和 Safari 会直接用这些提示）。
 9. **注入 ECH**：HTTPS 类型的查询，如果是 Cloudflare 的网站，就把 `cloudflare-ech.com` 当前发布的 ECH 配置放进 HTTPS 记录（上游没有 HTTPS 记录就补一条）。同时决定 ALPN：只有探针实测"QUIC + ECH 能通"的站点才给 `h3`，否则只给 `h2`，避免浏览器先试一次必然失败的 QUIC。
 10. **展平 CNAME**：Chromium 只有在 A/AAAA 和 HTTPS 记录挂在同一个名字下时才会用 ECH，所以对这类站点把 CNAME 链展平到查询的域名上。`/explain` 里的 `chromium` 一项会直接告诉你 Chromium 能不能对这个域名用上 ECH。
-11. **返回并缓存**。每次返回前都会轮换 A/AAAA 的顺序，让总是只连第一个地址的客户端分散到整个池子上。
+11. **返回并缓存**。每次返回前都会轮换 A/AAAA 的顺序，让总是只连第一个地址的客户端分散到整个池子上。缓存里不保存 OPT 记录，每个应答的 OPT 都按这次的查询重建：查询没带 OPT 就不带；带了就照抄 DO 位，客户端带了 ECS 才回显；查询带了 padding，应答就补齐到 468 字节的整数倍（RFC 8467），免得应答长度暴露查的是哪个域名。
 
 ## 优选池分层
 
-每个请求按下面的顺序找池子，**越窄越优先**。IPv4 和 IPv6 分开处理：先取最窄一层的地址，不够 6 个再用下一层补足。
+每个请求按下面的顺序找池子，**越窄越优先**。IPv4 和 IPv6 分开处理：最窄的一层只要有 2 个以上地址就单独使用；只有 1 个时才用下一层补足（最多 6 个）。cfhub 只发布每条线路最快的一档，再拿别的线路测出来的地址补满，就把这一档又稀释了。
 
 | 顺序 | 池子 | 来源 | 谁会用到 |
 |---|---|---|---|
@@ -78,7 +78,7 @@ cfhub 是一个众包测速站：志愿者在自己的线路上运行探针 `cfp
 
 - **判断访问者的运营商**：DoH 从 `ISP_TABLE_URL` 拉取"网段 → 运营商"表（每行 `<运营商> <CIDR>`）。cfhub 每天根据 [china-operator-ip](https://github.com/gaoyifan/china-operator-ip) 和国内云厂商各自自治系统（ASN）宣告的网段（来自 RIPEstat）生成这张表。DoH 在内存里二分查找，同一个 IP 命中多个网段时取最精确的那个。
 - **推送什么**：cfhub 每 5 分钟把已发布的运营商池（`isp:chinanet`、`isp:unicom`、`isp:cmcc`、`isp:cernet`、`isp:cloud`）和全国池（`isp:national`）推给 DoH，每次有效期 30 分钟。
-- **全国池**：由已发布的各运营商池合并而成，每条线路算一票，被越多线路认可的 IP 越靠前；至少 2 条线路发布后才生成。它服务所有使用默认池的访问者，排在维护者自己的自学习池前面。
+- **全国池**：由已发布的各运营商池合并而成，每条线路算一票，只收至少 2 条线路都认可的 IP，被越多线路认可的越靠前；这样的 IP 不足 2 个时不发布。它服务识别不出运营商的访问者，也补某条线路缺的地址族，排在维护者自己的自学习池前面。
 - **cfhub 能做什么、不能做什么**：`HUB_TOKEN` **只能写运营商池**（`scope` 必须是 `isp:<名字>`），不能读取 DoH 的状态，也不能改自学习池、专属池、站点池。DoH 收到运营商池后会**再检查一遍**每个 IP 是否在 Cloudflare 公布的网段内，不在就整批拒绝。所以即使 cfhub 被人控制，也只能在 Cloudflare 自己的地址里挑，没法把用户引到别人的服务器上。
 - **cfhub 挂了会怎样**：运营商池和全国池 30 分钟后过期，用户退回维护者的自学习池和优选域名池，解析不中断。DoH 重启后，这些池子会在 cfhub 下一次推送时（最多 5 分钟）恢复；`deploy/restart-keep-state.sh` 可以在重启前保存、重启后立即写回。
 - **投票规则**（防投毒）写在 cfhub 仓库的 `cfhub/aggregate.go`：只收 Cloudflare 网段内的 IP；一个网段只算一票；一个人在一个池里最多算 5 台探针；进池的 IP 要超过半数探针认可、且至少来自 2 个不同的人；一条线路至少 2 个人参与才发布。
@@ -189,10 +189,10 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `UPSTREAMS` | Cloudflare、Google、AdGuard（不过滤版） | 上游 DoH，逗号分隔，只接受 https。Node 的 fetch 只发 HTTP/1.1，不支持 HTTP/1.1 的上游（如 Quad9，返回 505）用不了 |
-| `ECS_UPSTREAMS` | 同 `UPSTREAMS` | 带 ECS 的查询用的上游，应只放会转发 ECS 的解析器 |
+| `ECS_UPSTREAMS` | 同 `UPSTREAMS` | 带 ECS 的查询用的上游，只放国内会转发 ECS 的解析器（如阿里 DNS、DNSPod）。Cloudflare 不转发 ECS；Google 虽然转发，同样的 ECS 查百度、华为、携程、去哪儿仍常拿到海外节点 |
 | `UPSTREAM_TIMEOUT_MS` | 2500 | 单次上游超时 |
 | `UPSTREAM_HEDGE_MS` | 100 | 多久没回就并发问下一个上游，0 表示不并发 |
-| `ECS_UPSTREAM_HEDGE_MS` | 同 `UPSTREAM_HEDGE_MS` | `ECS_UPSTREAMS` 这一组自己的并发间隔。国内 CDN 对不同解析器转来的 ECS 认可程度不一样（实测 Google 带 ECS 查百度、华为大多仍给海外节点，阿里 DNS 给国内节点），可以把阿里 DNS 排第一、这里设 1000 左右，让它先答 |
+| `ECS_UPSTREAM_HEDGE_MS` | 同 `UPSTREAM_HEDGE_MS` | `ECS_UPSTREAMS` 这一组自己的并发间隔。建议设 0：只有前一个失败或超时才问下一个，第一个能答的都由它答；设成正数时，冷门网段上排第一的解析器递归慢，后面的就会抢答 |
 | `CACHE_MIN_TTL` / `CACHE_MAX_TTL` | 30 / 3600 | 缓存 TTL 的上下限（秒） |
 | `NEGATIVE_CACHE_MAX_TTL` | 300 | 否定应答最多缓存多久 |
 | `CACHE_STALE_TTL` | 86400 | 过期应答在上游全挂时还能用多久，0 关闭 |

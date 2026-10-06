@@ -122,12 +122,16 @@ describe("pool layering: client prefix → operator → nationwide", () => {
     expect(telecom.ipv4).toEqual(six);
   });
 
-  // 2026-09-26: a lapsed prober left a three-IP pool; a short narrow pool must not be served alone.
-  it("tops a short pool up to six from the wider layers, without duplicates", async () => {
+  // The hub publishes only a line's fast tier: topping it up with addresses measured on other lines
+  // would undo that, so two are enough. One is topped up, without duplicates.
+  it("serves a pool of two alone and tops up a single address from the wider layers", async () => {
     setLearnedPool(["1.0.1.1", "3.3.3.3", "1.0.2.1", "1.0.3.1", "1.0.4.1", "1.0.5.1"], [], 600, "aliyun");
     setLearnedPool(["3.3.3.3", "3.3.4.4"], [], 600, "hub", "isp:chinanet");
     const telecom = await preferredPool({}, [], true, config(), cache, undefined, "isp:chinanet");
-    expect(telecom.ipv4).toEqual(["3.3.3.3", "3.3.4.4", "1.0.1.1", "1.0.2.1", "1.0.3.1", "1.0.4.1"]);
+    expect(telecom.ipv4).toEqual(["3.3.3.3", "3.3.4.4"]);
+    setLearnedPool(["3.3.3.3"], [], 600, "hub", "isp:chinanet");
+    const thin = await preferredPool({}, [], true, config(), cache, undefined, "isp:chinanet");
+    expect(thin.ipv4).toEqual(["3.3.3.3", "1.0.1.1", "1.0.2.1", "1.0.3.1", "1.0.4.1", "1.0.5.1"]);
   });
 
   it("fills each address family on its own, so an IPv4-only operator pool keeps the nationwide IPv6", async () => {
