@@ -192,6 +192,17 @@ describe("EDNS does not depend on which query filled the cache", () => {
   });
 });
 
+describe("a query with more than one OPT record", () => {
+  it("is answered FORMERR without asking upstream (RFC 6891 §6.1.1)", async () => {
+    const fetchMock = stubUpstream();
+    const two = { additionals: [...opt().additionals, ...opt([], 1 << 16).additionals] };
+    const reply = await ask(queryWire("h.example.org", two));
+    expect(parseDnsPacket(reply).header.flags & 0x0f).toBe(1);
+    expect(parseDnsPacket(reply).additionals.filter((record) => record.type === DnsType.OPT)).toHaveLength(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("a malformed client ECS option", () => {
   it.each([
     ["an IPv4 source prefix of 33", [0, 1, 33, 0, 8, 8, 8, 8, 0]],

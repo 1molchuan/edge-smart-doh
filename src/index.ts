@@ -242,8 +242,9 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   } catch (error) {
     return new Response(error instanceof Error ? error.message : "Malformed DNS packet", { status: 400 });
   }
-  const opt = query.additionals.find((record) => record.type === DnsType.OPT);
-  if (opt && ((opt.ttl >>> 16) & 0xff) !== 0) return dnsResponse(makeBadvers(query), wire);
+  // RFC 6891 §6.1.1: more than one OPT record is FORMERR (below); one with a version above 0, BADVERS.
+  const opts = query.additionals.filter((record) => record.type === DnsType.OPT);
+  if (opts.length === 1 && ((opts[0]!.ttl >>> 16) & 0xff) !== 0) return dnsResponse(makeBadvers(query), wire);
   const client = readClientEcs(query);
   // Every answer, cached or not, leaves with an OPT record made for this query (dns/edns.ts).
   const reply = (packet: Uint8Array): Response => {
@@ -255,7 +256,7 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
     }
     return dnsResponse(body, wire);
   };
-  if (client === null) return reply(rcodeResponse(query, 1));
+  if (opts.length > 1 || client === null) return reply(rcodeResponse(query, 1));
 
   const setup = await prepareDns(request, env, runtime);
   if (setup instanceof Response) return setup;
