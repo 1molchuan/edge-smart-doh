@@ -531,60 +531,157 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Edge Smart DoH 控制台</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    --bg: #060a14;
+    --s1: #0c1326;          /* 磁贴面 */
+    --s2: #0e1730;          /* 磁贴面（亮一档/内嵌块） */
+    --s3: #0a1120;          /* 内嵌输入/表格底 */
+    --line: #1b2547;        /* 边框 */
+    --line-2: #141d38;      /* 表格分隔 */
+    --ink: #e7edf9;         /* 主文字 */
+    --ink-2: #97a2bf;       /* 次文字 */
+    --ink-3: #5d6a8c;       /* 弱文字/微标签 */
+    --blue: #4f8dff;
+    --ok: #34d399; --warn: #fbbf24; --bad: #f87171; --amber: #f59e0b;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #0a0f1e; color: #dbe2f0; font: 14px/1.5 system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
-  .wrap { max-width: 1120px; margin: 0 auto; padding: 28px 20px 48px; }
+  html { scrollbar-color: #223055 var(--bg); }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.55 system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background-image: radial-gradient(1100px 380px at 50% -140px, rgba(79,141,255,.075), transparent 70%);
+    background-repeat: no-repeat;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 20px 22px 48px; }
 
-  /* ---- 第一屏：健康判定 + 核心数字 ---- */
-  .hero { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; flex-wrap: wrap; }
-  .vdot { width: 14px; height: 14px; border-radius: 50%; background: #64748b; flex: none; }
-  .vdot.ok { background: #34d399; animation: pulse 2.4s ease-out infinite; }
-  .vdot.warn { background: #fbbf24; }
-  .vdot.bad { background: #f87171; animation: pulse 1.2s ease-out infinite; }
-  @keyframes pulse { 0% { box-shadow: 0 0 0 0 currentColor; opacity: 1; } 70% { box-shadow: 0 0 0 12px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
-  #v-text { font-size: 27px; font-weight: 700; letter-spacing: 1px; }
-  #v-text.ok { color: #34d399; } #v-text.warn { color: #fbbf24; } #v-text.bad { color: #f87171; }
-  #refresh-line { margin-left: auto; color: #5b6883; font-size: 12px; }
-  .vsub { color: #8792ad; font-size: 12.5px; margin-bottom: 4px; }
-  .vwhy { display: none; margin: 2px 0 0; padding: 7px 12px; border-radius: 8px; font-size: 13px; }
-  .vwhy.show { display: block; }
-  .vwhy.bad { background: #3a1420; border: 1px solid #7f1d1d; color: #fca5a5; }
-  .vwhy.warn { background: #33240e; border: 1px solid #78350f; color: #fcd34d; }
+  /* ===================== 命令栏 ===================== */
+  .bar {
+    position: sticky; top: 0; z-index: 30;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    margin: -20px -22px 18px; padding: 12px 22px;
+    background: rgba(6,10,20,.82); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: center; gap: 9px; }
+  .brand b { font-size: 14.5px; letter-spacing: .2px; }
+  .brandsub { color: var(--ink-3); font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 0 8px; line-height: 18px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px 3px 9px;
+    font-size: 12.5px; color: var(--ink-2); background: var(--s1);
+  }
+  .pill-dot { width: 9px; height: 9px; border-radius: 50%; background: #64748b; flex: none; }
+  .pill-dot.ok { background: var(--ok); box-shadow: 0 0 8px rgba(52,211,153,.7); }
+  .pill-dot.warn { background: var(--warn); box-shadow: 0 0 8px rgba(251,191,36,.55); }
+  .pill-dot.bad { background: var(--bad); animation: pulse 1.2s ease-out infinite; }
+  .bar-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  .clock { color: var(--ink-3); font-size: 12.5px; font-variant-numeric: tabular-nums; letter-spacing: .5px; }
 
-  .cards { display: grid; grid-template-columns: 1.2fr 1fr 1fr 1fr; gap: 12px; margin: 16px 0 12px; }
-  @media (max-width: 980px) { .cards { grid-template-columns: 1fr 1fr; } }
-  @media (max-width: 560px) { .cards { grid-template-columns: 1fr; } }
-  .card { background: #0f1630; border: 1px solid #1c2742; border-radius: 12px; padding: 14px 16px; min-width: 0; }
-  .card .k { color: #8792ad; font-size: 12px; margin-bottom: 6px; }
-  .card .v { font-size: 30px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
-  .card .v small { font-size: 14px; font-weight: 500; color: #8792ad; }
-  .card .s { color: #8792ad; font-size: 12px; margin-top: 5px; }
-  .path { display: flex; align-items: center; gap: 8px; padding: 4.5px 0; font-size: 13.5px; }
-  .path + .path { border-top: 1px solid #16203a; }
+  /* 会话徽标（命令栏内） */
+  #session-box { display: none; align-items: center; gap: 8px; color: var(--ink-2); font-size: 12px; }
+  #session-box.show { display: inline-flex; }
+  #session-box .slabel { border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; background: var(--s1); }
+  #session-box button { background: none; border: 1px solid var(--line); color: var(--ink-2); border-radius: 6px; padding: 2px 9px; font-size: 11.5px; cursor: pointer; }
+  #session-box button:hover { color: var(--ink); border-color: var(--blue); }
+
+  /* ===================== 分区标题 ===================== */
+  .sect { display: flex; align-items: baseline; gap: 8px; margin: 22px 2px 10px; }
+  .sect-tick { width: 4px; height: 13px; border-radius: 2px; background: var(--blue); align-self: center; }
+  .sect-tick.amber { background: var(--amber); }
+  .sect-t { font-size: 13px; font-weight: 700; letter-spacing: .12em; color: #c3cde6; }
+  .sect-s { color: var(--ink-3); font-size: 11px; letter-spacing: .14em; }
+
+  /* ===================== 磁贴 ===================== */
+  .tile {
+    background: linear-gradient(180deg, var(--s1), rgba(14,23,48,.6));
+    border: 1px solid var(--line); border-radius: 16px; padding: 16px 18px; min-width: 0;
+    transition: border-color .15s;
+  }
+  .tile:hover { border-color: #27345e; }
+
+  /* 第一屏 bento：状态大磁贴 + 三个 KPI + 链路磁贴 */
+  .bento { display: grid; grid-template-columns: 1.35fr 1fr 1fr 1fr; gap: 12px; }
+  .bento .status { grid-row: span 2; display: flex; flex-direction: column; }
+  @media (max-width: 980px) { .bento { grid-template-columns: 1fr 1fr; } .bento .status { grid-row: auto; grid-column: span 2; } .bento .linktile { grid-column: span 2; } }
+  @media (max-width: 560px) { .bento { grid-template-columns: 1fr; } .bento .status, .bento .linktile { grid-column: span 1; } }
+
+  .status { position: relative; overflow: hidden; }
+  .status::after { content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .5; transition: opacity .3s; }
+  .status.ok::after { background: radial-gradient(340px 160px at 12% 0%, rgba(52,211,153,.14), transparent 70%); }
+  .status.warn::after { background: radial-gradient(340px 160px at 12% 0%, rgba(251,191,36,.13), transparent 70%); opacity: .8; }
+  .status.bad::after { background: radial-gradient(340px 160px at 12% 0%, rgba(248,113,113,.16), transparent 70%); opacity: 1; }
+  .status-head { display: flex; align-items: center; gap: 12px; }
+  .vdot { width: 15px; height: 15px; border-radius: 50%; background: #64748b; flex: none; }
+  .vdot.ok { background: var(--ok); box-shadow: 0 0 14px rgba(52,211,153,.8); }
+  .vdot.warn { background: var(--warn); box-shadow: 0 0 14px rgba(251,191,36,.6); }
+  .vdot.bad { background: var(--bad); animation: pulse 1.2s ease-out infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 currentColor; } 70% { box-shadow: 0 0 0 11px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+  #v-text { font-size: 28px; font-weight: 800; letter-spacing: 1px; }
+  #v-text.ok { color: var(--ok); } #v-text.warn { color: var(--warn); } #v-text.bad { color: var(--bad); }
+  .vwhy { display: none; margin: 12px 0 0; padding: 9px 12px; border-radius: 10px; font-size: 13px; line-height: 1.6; }
+  .vwhy.bad { display: block; background: #2c1216; border: 1px solid #7f1d1d; color: #fca5a5; }
+  .vwhy.warn { display: block; background: #2a1c06; border: 1px solid #78350f; color: #fcd34d; }
+  .status .meta { margin-top: auto; padding-top: 14px; }
+  .vsub { color: var(--ink-2); font-size: 12.5px; }
+  #refresh-line { display: block; color: var(--ink-3); font-size: 12px; margin-top: 3px; min-height: 15px; }
+
+  .kk { color: var(--ink-3); font-size: 11px; font-weight: 600; letter-spacing: .1em; margin-bottom: 8px; }
+  .kk .h2s { letter-spacing: 0; text-transform: none; }
+  .kv { font-size: 29px; font-weight: 750; line-height: 1.15; font-variant-numeric: tabular-nums; }
+  .kv small { font-size: 14px; font-weight: 500; color: var(--ink-2); }
+  .ks { color: var(--ink-3); font-size: 12px; margin-top: 6px; }
+  .kv-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .donut {
+    --p: 0; flex: none; width: 46px; height: 46px; border-radius: 50%;
+    background: conic-gradient(var(--ok) calc(var(--p) * 1%), #182345 0);
+    display: grid; place-items: center;
+  }
+  .donut::before { content: ""; width: 33px; height: 33px; border-radius: 50%; background: var(--s2); }
+
+  /* 链路磁贴 */
+  .paths-list { display: flex; flex-direction: column; justify-content: space-evenly; min-height: 118px; }
+  .path { display: flex; align-items: center; gap: 9px; padding: 5px 0; font-size: 13.5px; }
+  .path + .path { border-top: 1px solid var(--line-2); }
   .pdot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; flex: none; }
-  .pdot.ok { background: #34d399; } .pdot.bad { background: #f87171; }
-  .pl { color: #c6cfe2; }
-  .pv { margin-left: auto; font-variant-numeric: tabular-nums; }
-  .pv.err { color: #fca5a5; }
+  .pdot.ok { background: var(--ok); } .pdot.bad { background: var(--bad); }
+  .pl { color: #ccd5ea; white-space: nowrap; }
+  .spark { margin-left: auto; flex: none; opacity: .95; }
+  .pv { flex: none; min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; font-size: 14.5px; font-weight: 650; white-space: nowrap; }
+  .pv.err { color: #fca5a5; font-size: 12px; font-weight: 400; }
 
-  /* ---- 面板 ---- */
-  .panel { background: #0f1630; border: 1px solid #1c2742; border-radius: 12px; padding: 14px 16px; min-width: 0; margin-bottom: 12px; }
-  .panel h2 { font-size: 13px; margin: 0 0 10px; color: #aab6d0; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .panel h2::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: #3b82f6; }
-  .panel h2 .h2s { color: #5b6883; font-weight: 400; font-size: 11.5px; }
-  .row { display: grid; grid-template-columns: 1fr 1.2fr 1.2fr; gap: 12px; margin-bottom: 12px; }
+  /* ===================== 面板 ===================== */
+  .panel-t { padding: 15px 18px 13px; margin-bottom: 12px; }
+  .panel-t h2 { font-size: 12px; margin: 0 0 10px; color: #b9c4de; font-weight: 700; letter-spacing: .08em; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .panel-t h2::before { content: ""; width: 3px; height: 11px; border-radius: 2px; background: var(--blue); align-self: center; }
+  .h2s { color: var(--ink-3); font-weight: 400; font-size: 11.5px; letter-spacing: 0; }
+  .row { display: grid; grid-template-columns: 1fr 1.15fr 1.15fr; gap: 12px; margin-bottom: 12px; }
   .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
   @media (max-width: 980px) { .row, .row2 { grid-template-columns: 1fr; } }
   .chart { width: 100%; }
 
+  /* 路径分布：分段占比条 + 图例 */
+  .segbar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: #182345; margin: 4px 0 12px; }
+  .segbar .seg-piece { display: block; height: 100%; min-width: 2px; }
+  .legend { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px 22px; }
+  @media (max-width: 980px) { .legend { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .legend { grid-template-columns: 1fr; } }
+  .lg { display: flex; align-items: center; gap: 7px; font-size: 12.5px; padding: 2.5px 0; white-space: nowrap; min-width: 0; }
+  .lgname { overflow: hidden; text-overflow: ellipsis; }
+  .lgdot { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+  .lgname { color: #ccd5ea; }
+  .lgn { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+  .lgp { font-variant-numeric: tabular-nums; color: var(--ink-3); width: 52px; text-align: right; }
+  .lga { font-variant-numeric: tabular-nums; color: var(--ink-3); width: 74px; text-align: right; }
+  .paths-note { font-size: 11.5px; margin-top: 10px; }
+
   table { width: 100%; border-collapse: collapse; font-size: 12.8px; }
-  th { text-align: left; color: #8792ad; font-weight: 500; padding: 3px 6px; border-bottom: 1px solid #1c2742; white-space: nowrap; }
-  td { padding: 4px 6px; border-bottom: 1px solid #141d38; font-variant-numeric: tabular-nums; vertical-align: top; }
+  th { text-align: left; color: var(--ink-3); font-weight: 500; padding: 3px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 4.5px 6px; border-bottom: 1px solid var(--line-2); font-variant-numeric: tabular-nums; vertical-align: top; }
   tr:last-child td { border-bottom: none; }
   td.n { text-align: right; white-space: nowrap; }
-  .muted { color: #8792ad; }
-  .warn2 { color: #fbbf24; }
+  .muted { color: var(--ink-2); }
+  .warn2 { color: var(--warn); }
   .err { color: #fca5a5; }
   .ok2 { color: #6ee7b7; }
   .badge { display: inline-block; padding: 0 7px; border-radius: 999px; font-size: 11px; border: 1px solid; line-height: 17px; white-space: nowrap; }
@@ -594,116 +691,121 @@ const PAGE = `<!doctype html>
   .b-miss { color: #93c5fd; border-color: #1e40af; background: #0d1834; }
   .b-blocked { color: #d8b4fe; border-color: #6b21a8; background: #20102e; }
   .b-error { color: #fca5a5; border-color: #7f1d1d; background: #2c1216; }
-  .b-path { border-color: #334155; background: #0d1834; }
-  .role { color: #8792ad; font-size: 11px; border: 1px solid #2a3550; border-radius: 4px; padding: 0 5px; margin-left: 6px; }
+  .b-path { border-color: #26335c; background: #0d1834; }
+  .role { color: var(--ink-2); font-size: 11px; border: 1px solid #26335c; border-radius: 4px; padding: 0 5px; margin-left: 6px; }
 
-  /* 延迟分布条 */
-  .lrow { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
-  .lk { width: 34px; color: #8792ad; font-size: 12px; }
-  .lbar { flex: 1; height: 8px; border-radius: 4px; background: #16203a; overflow: hidden; }
+  /* 回源延迟分位条 */
+  .lrow { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+  .lk { width: 34px; color: var(--ink-2); font-size: 12px; }
+  .lbar { flex: 1; height: 8px; border-radius: 4px; background: #182345; overflow: hidden; }
   .lbar i { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #38bdf8, #818cf8); }
   .lv { width: 74px; text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
 
-  /* 路径分布（面板④）：单条 = 名称+条+数字 */
-  .prow { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 13px; }
-  .prow .pk { width: 86px; color: #c6cfe2; flex: none; }
-  .prow .pbar { flex: 1; height: 10px; border-radius: 5px; background: #16203a; overflow: hidden; }
-  .prow .pbar i { display: block; height: 100%; border-radius: 5px; }
-  .prow .pn { width: 190px; text-align: right; font-variant-numeric: tabular-nums; color: #8792ad; font-size: 12px; flex: none; }
-
   /* 内联小条（高频域名） */
-  .tbar { height: 6px; border-radius: 3px; background: #16203a; overflow: hidden; min-width: 60px; }
-  .tbar i { display: block; height: 100%; background: #818cf8; opacity: .8; }
+  .tbar { height: 6px; border-radius: 3px; background: #182345; overflow: hidden; min-width: 60px; }
+  .tbar i { display: block; height: 100%; background: #818cf8; opacity: .85; }
 
   /* 折叠诊断区 */
-  details { background: #0f1630; border: 1px solid #1c2742; border-radius: 12px; margin-bottom: 10px; }
-  summary { cursor: pointer; padding: 11px 16px; color: #aab6d0; font-size: 13px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 8px; }
-  summary::before { content: "▸"; color: #5b6883; transition: transform .15s; }
+  details { background: var(--s1); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 10px; }
+  details:hover { border-color: #27345e; }
+  summary { cursor: pointer; padding: 12px 18px; color: #b9c4de; font-size: 13px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 8px; border-radius: 14px; }
+  summary::before { content: "▸"; color: var(--ink-3); transition: transform .15s; }
   details[open] summary::before { transform: rotate(90deg); }
-  summary .cnt { margin-left: auto; color: #5b6883; font-weight: 400; font-size: 11.5px; }
-  .dbody { padding: 2px 16px 12px; }
-  footer { margin-top: 16px; color: #5b6883; font-size: 12px; text-align: center; }
+  summary .cnt { margin-left: auto; color: var(--ink-3); font-weight: 400; font-size: 11.5px; }
+  .dbody { padding: 2px 18px 13px; }
+  footer { margin-top: 18px; color: var(--ink-3); font-size: 12px; text-align: center; }
 
-  /* ---- 登录卡 ---- */
-  #login-view { display: none; min-height: 100vh; align-items: center; justify-content: center; padding: 20px; }
-  #login-view.show { display: flex; }
-  .login-card { width: 380px; max-width: 100%; background: #0f1630; border: 1px solid #1c2742; border-radius: 14px; padding: 28px; }
-  .login-card h1 { font-size: 20px; margin: 0 0 4px; }
-  .login-card .sub { color: #8792ad; margin: 0 0 18px; font-size: 13px; }
-  .login-card input { width: 100%; margin-bottom: 10px; padding: 9px 12px; border-radius: 8px; border: 1px solid #2a3550; background: #0a0f1e; color: #dbe2f0; font-size: 14px; }
-  .login-card input:focus { outline: none; border-color: #3b82f6; }
-  .login-card button { width: 100%; padding: 10px; border-radius: 8px; border: none; background: #2563eb; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; }
-  .login-card button:disabled { opacity: .5; cursor: not-allowed; }
-  #login-error { color: #fca5a5; font-size: 13px; min-height: 18px; margin: 8px 0 4px; }
-  #login-hint { color: #5b6883; font-size: 11.5px; margin-top: 14px; line-height: 1.6; }
-  body.auth #main { display: none; }
-
-  /* ---- 会话徽标 ---- */
-  #session-box { display: none; align-items: center; gap: 8px; color: #8792ad; font-size: 12px; }
-  #session-box.show { display: inline-flex; }
-  #session-box .slabel { border: 1px solid #2a3550; border-radius: 999px; padding: 1px 9px; }
-  #session-box button { background: none; border: 1px solid #2a3550; color: #8792ad; border-radius: 6px; padding: 2px 9px; font-size: 11.5px; cursor: pointer; }
-  #session-box button:hover { color: #dbe2f0; border-color: #3b82f6; }
-
-  /* ---- 控制区（琥珀色边框，PRD §2.1）---- */
-  .control-panel { border-color: #78350f; }
-  .control-panel h2::before { background: #f59e0b; }
-  .cwarn { background: #33240e; border: 1px solid #78350f; color: #fcd34d; border-radius: 8px; padding: 8px 12px; font-size: 13px; margin: 8px 0; }
-  .cinfo { background: #04201e; border: 1px solid #115e59; color: #5eead4; border-radius: 8px; padding: 8px 12px; font-size: 13px; margin: 8px 0; }
-  .mode-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin: 10px 0; }
-  .mode-current { font-size: 15px; }
-  .mode-current b { font-size: 22px; margin-right: 6px; }
-  .seg { display: inline-flex; border: 1px solid #2a3550; border-radius: 10px; overflow: hidden; }
-  .seg button { background: none; border: none; color: #c6cfe2; padding: 8px 16px; font-size: 13px; cursor: pointer; border-right: 1px solid #2a3550; }
+  /* ===================== 控制甲板（琥珀语言） ===================== */
+  .deck { border-color: #6d3b0a; box-shadow: inset 0 1px 0 rgba(245,158,11,.12); padding: 0; overflow: hidden; }
+  .deck-head { display: grid; grid-template-columns: 1.1fr 1fr; gap: 0; }
+  @media (max-width: 980px) { .deck-head { grid-template-columns: 1fr; } }
+  .deck-mode { padding: 16px 18px; border-right: 1px dashed #54320d; }
+  @media (max-width: 980px) { .deck-mode { border-right: none; border-bottom: 1px dashed #54320d; } }
+  .deck-side { padding: 16px 18px; display: flex; flex-direction: column; justify-content: center; gap: 8px; }
+  .mode-now { display: flex; align-items: center; gap: 10px; margin: 2px 0 12px; }
+  .mode-now b { font-size: 23px; font-weight: 800; letter-spacing: .5px; }
+  .srcbadge { color: var(--amber); border: 1px solid #78350f; background: #2a1c06; font-size: 11px; border-radius: 999px; padding: 1px 9px; }
+  .srcbadge.env { color: var(--ink-2); border-color: var(--line); background: var(--s2); }
+  .seg { display: inline-flex; border: 1px solid #54320d; border-radius: 11px; overflow: hidden; background: rgba(245,158,11,.05); }
+  .seg button { background: none; border: none; color: #d7c9ae; padding: 9px 18px; font-size: 13px; cursor: pointer; border-right: 1px solid #54320d; transition: background .12s; }
   .seg button:last-child { border-right: none; }
-  .seg button.on { background: #1d4ed8; color: #fff; }
+  .seg button:hover:not(:disabled):not(.on) { background: rgba(245,158,11,.1); }
+  .seg button.on { background: rgba(245,158,11,.16); color: #fcd34d; font-weight: 700; box-shadow: inset 0 -2px 0 var(--amber); }
   .seg button:disabled { opacity: .35; cursor: not-allowed; }
-  .seg button.danger:not(.on) { color: #fbbf24; }
-  .cresult { border-radius: 8px; padding: 10px 12px; font-size: 13px; margin: 10px 0; line-height: 1.7; }
+  .seg button.danger:not(.on) { color: var(--warn); }
+  .cwarn { background: #2a1c06; border: 1px solid #78350f; color: #fcd34d; border-radius: 10px; padding: 9px 12px; font-size: 13px; }
+  .cinfo { background: #04201e; border: 1px solid #115e59; color: #5eead4; border-radius: 10px; padding: 9px 12px; font-size: 13px; }
+  .cresult { border-radius: 10px; padding: 10px 12px; font-size: 13px; line-height: 1.7; }
   .cresult.ok { background: #06281e; border: 1px solid #065f46; color: #6ee7b7; }
   .cresult.warn { background: #2a1c06; border: 1px solid #78350f; color: #fcd34d; }
   .cresult.err { background: #2c1216; border: 1px solid #7f1d1d; color: #fca5a5; }
-  .lists { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 12px; }
+  .deck-body { padding: 14px 18px 16px; border-top: 1px solid #54320d; }
+  .lists { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 980px) { .lists { grid-template-columns: 1fr; } }
-  .list-edit h3 { font-size: 12px; color: #aab6d0; margin: 0 0 8px; font-weight: 600; }
-  .list-edit h3 code { color: #5b6883; font-size: 11px; }
+  .list-edit h3 { font-size: 12px; color: #d7c9ae; margin: 0 0 8px; font-weight: 700; letter-spacing: .04em; }
+  .list-edit h3 code { color: var(--ink-3); font-size: 11px; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; min-height: 30px; }
   .chip { display: inline-flex; align-items: center; gap: 6px; background: #0d1834; border: 1px solid #1e3a8a; color: #93c5fd; border-radius: 999px; padding: 2px 6px 2px 10px; font-size: 12.5px; }
   .chip.ex { border-color: #7f1d1d; color: #fca5a5; background: #2c1216; }
   .chip button { background: none; border: none; color: inherit; cursor: pointer; font-size: 13px; padding: 0 4px; }
   .addrow { display: flex; gap: 6px; }
-  .addrow input { flex: 1; padding: 6px 10px; border-radius: 8px; border: 1px solid #2a3550; background: #0a0f1e; color: #dbe2f0; font-size: 13px; }
-  .addrow input:focus { outline: none; border-color: #3b82f6; }
-  .addrow button, .btn { background: #1d4ed8; border: none; color: #fff; border-radius: 8px; padding: 6px 14px; font-size: 13px; cursor: pointer; }
-  .btn.secondary { background: #334155; }
-  .btn:disabled { opacity: .4; cursor: not-allowed; }
-  .field-err { color: #fca5a5; font-size: 12px; min-height: 16px; margin-top: 4px; }
-  .diff-box { background: #0a0f1e; border: 1px solid #2a3550; border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 12.5px; }
+  .addrow input { flex: 1; padding: 7px 11px; border-radius: 9px; border: 1px solid #2a3550; background: var(--s3); color: var(--ink); font-size: 13px; }
+  .addrow input:focus { outline: none; border-color: var(--amber); }
+  .addrow button, .btn { background: #b45309; border: none; color: #fff; border-radius: 9px; padding: 7px 15px; font-size: 13px; cursor: pointer; font-weight: 600; }
+  .addrow button:hover, .btn:hover { filter: brightness(1.12); }
+  .btn.secondary { background: #26334f; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; filter: none; }
+  .field-err { color: #fca5a5; font-size: 12px; min-height: 17px; margin-top: 4px; }
+  .diff-box { background: var(--s3); border: 1px solid #54320d; border-radius: 10px; padding: 10px 12px; margin-top: 12px; font-size: 12.5px; line-height: 1.7; }
   .diff-box .add { color: #6ee7b7; } .diff-box .del { color: #fca5a5; }
-  .sync-line { color: #8792ad; font-size: 12.5px; margin-top: 12px; }
-  .ctl-actions { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+  .sync-line { color: var(--ink-2); font-size: 12.5px; }
+  .ctl-actions { display: flex; gap: 10px; margin-top: 13px; flex-wrap: wrap; }
 
-  /* ---- 确认弹层 ---- */
-  #modal { display: none; position: fixed; inset: 0; background: rgba(4,8,20,.72); z-index: 50; align-items: center; justify-content: center; padding: 20px; }
+  /* ===================== 确认弹层 ===================== */
+  #modal { display: none; position: fixed; inset: 0; background: rgba(3,6,14,.74); z-index: 50; align-items: center; justify-content: center; padding: 20px; }
   #modal.show { display: flex; }
-  .modal-card { width: 480px; max-width: 100%; max-height: 84vh; overflow: auto; background: #0f1630; border: 1px solid #2a3550; border-radius: 14px; padding: 22px; }
+  .modal-card { width: 500px; max-width: 100%; max-height: 84vh; overflow: auto; background: var(--s1); border: 1px solid #54320d; border-radius: 16px; padding: 22px; }
   .modal-card h3 { margin: 0 0 10px; font-size: 16px; }
-  .modal-card .mbody { color: #c6cfe2; font-size: 13.5px; line-height: 1.7; }
+  .modal-card .mbody { color: #ccd5ea; font-size: 13.5px; line-height: 1.7; }
   .modal-card .mbody ul { margin: 8px 0; padding-left: 20px; }
   .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
   .modal-actions .btn.go { background: #b45309; }
   .modal-actions .btn.go.red { background: #b91c1c; }
+
+  /* ===================== 登录卡 ===================== */
+  #login-view { display: none; min-height: 100vh; align-items: center; justify-content: center; padding: 20px; }
+  #login-view.show { display: flex; }
+  .login-card {
+    width: 400px; max-width: 100%; background: var(--s1); border: 1px solid var(--line);
+    border-top: 2px solid var(--blue); border-radius: 18px; padding: 30px 28px;
+    box-shadow: 0 24px 70px rgba(0,0,0,.5);
+  }
+  .login-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .login-brand b { font-size: 17px; }
+  .login-card h1 { font-size: 17px; margin: 0; font-weight: 700; }
+  .login-card .sub { color: var(--ink-2); margin: 6px 0 20px; font-size: 13px; }
+  .login-card input { width: 100%; margin-bottom: 10px; padding: 10px 13px; border-radius: 10px; border: 1px solid #2a3550; background: var(--s3); color: var(--ink); font-size: 14px; }
+  .login-card input:focus { outline: none; border-color: var(--blue); }
+  .login-card button { width: 100%; padding: 11px; border-radius: 10px; border: none; background: linear-gradient(135deg, #2563eb, #4f8dff); color: #fff; font-size: 14px; font-weight: 700; cursor: pointer; letter-spacing: .06em; }
+  .login-card button:hover { filter: brightness(1.1); }
+  .login-card button:disabled { opacity: .5; cursor: not-allowed; }
+  #login-error { color: #fca5a5; font-size: 13px; min-height: 18px; margin: 8px 0 4px; }
+  #login-hint { color: var(--ink-3); font-size: 11.5px; margin-top: 16px; line-height: 1.7; border-top: 1px solid var(--line-2); padding-top: 12px; }
+  body.auth #main { display: none; }
 </style>
 </head>
 <body>
 <div id="login-view">
   <div class="login-card">
-    <h1>Edge Smart DoH 控制台</h1>
+    <div class="login-brand">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M12 2l8.66 5v10L12 22l-8.66-5V7L12 2z" stroke="#4f8dff" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="#4f8dff"/></svg>
+      <h1>Edge Smart DoH 控制台</h1>
+    </div>
     <p class="sub" id="login-sub">请输入控制台密码</p>
     <form id="login-form">
       <input type="password" id="login-password" placeholder="密码" autocomplete="current-password" autofocus>
       <input type="text" id="login-label" placeholder="备注（可选，≤32 字符，便于审计）" maxlength="32">
-      <button type="submit" id="login-button">登录</button>
+      <button type="submit" id="login-button">登 录</button>
     </form>
     <div id="login-error"></div>
     <div id="login-hint">密码由安装脚本生成，可在服务器上查看：<br><code>sudo grep CONSOLE_PASSWORD /etc/edge-smart-doh/monitor.env</code></div>
@@ -711,86 +813,113 @@ const PAGE = `<!doctype html>
 </div>
 
 <div class="wrap" id="main">
-  <div class="hero">
-    <span class="vdot" id="v-dot"></span>
-    <span id="v-text">检测中…</span>
-    <span id="session-box"><span class="slabel" id="session-label"></span><button type="button" id="logout-button">退出</button></span>
-    <span id="refresh-line"></span>
-  </div>
-  <div class="vsub" id="v-sub">正在连接 8788 控制台服务…</div>
-  <div class="vwhy" id="v-why"></div>
+  <header class="bar">
+    <div class="brand">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none"><path d="M12 2l8.66 5v10L12 22l-8.66-5V7L12 2z" stroke="#4f8dff" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="#4f8dff"/></svg>
+      <b>edge-smart-doh</b><span class="brandsub">控制台</span>
+    </div>
+    <span class="pill"><span class="pill-dot" id="pill-dot"></span><span id="pill-text">检测中…</span></span>
+    <span class="bar-right">
+      <span id="session-box"><span class="slabel" id="session-label"></span><button type="button" id="logout-button">退出</button></span>
+      <span class="clock" id="clock"></span>
+    </span>
+  </header>
 
-  <div class="cards">
-    <div class="card"><div class="k">解析链路健康</div><div id="path-health" class="muted">等待首次探测…</div></div>
-    <div class="card"><div class="k">总查询</div><div class="v" id="stat-total">—</div><div class="s" id="stat-total-s">自上次重启</div></div>
-    <div class="card"><div class="k">缓存命中率</div><div class="v" id="stat-rate">—</div><div class="s" id="stat-rate-s"></div></div>
-    <div class="card"><div class="k">回源延迟 P50</div><div class="v" id="stat-p50">—</div><div class="s" id="stat-lat-s"></div></div>
+  <div class="bento">
+    <div class="tile status" id="status-tile">
+      <div class="status-head">
+        <span class="vdot" id="v-dot"></span>
+        <span id="v-text">检测中…</span>
+      </div>
+      <div class="vwhy" id="v-why"></div>
+      <div class="meta">
+        <div class="vsub" id="v-sub">正在连接 8788 控制台服务…</div>
+        <span id="refresh-line"></span>
+      </div>
+    </div>
+    <div class="tile"><div class="kk">总查询</div><div class="kv" id="stat-total">—</div><div class="ks" id="stat-total-s">自上次重启</div></div>
+    <div class="tile"><div class="kk">缓存命中率</div><div class="kv-row"><div class="kv" id="stat-rate">—</div><div class="donut" id="rate-donut"></div></div><div class="ks" id="stat-rate-s"></div></div>
+    <div class="tile"><div class="kk">回源延迟 P50</div><div class="kv" id="stat-p50">—</div><div class="ks" id="stat-lat-s"></div></div>
+    <div class="tile linktile"><div class="kk">解析链路 <span class="h2s">每 10 秒真实 DoH 探测</span></div><div id="path-health" class="paths-list muted">等待首次探测…</div></div>
   </div>
 
-  <div class="panel">
-    <h2>查询量 <span class="h2s">近 2 小时 · 每分钟 · 绿=缓存命中 蓝=回源 红=失败</span></h2>
-    <div id="minute-chart" class="chart" style="height:200px"></div>
-  </div>
+  <div class="sect"><span class="sect-tick"></span><span class="sect-t">监测</span><span class="sect-s">MONITOR</span></div>
 
-  <div class="panel">
-    <h2>解析路径分布 <span class="h2s">自服务启动以来 · 回源按路径归类，缓存应答单列 · 路径按回源时刻归类，已进入缓存的查询不再重新计类</span></h2>
+  <div class="tile panel-t">
+    <h2>解析路径分布 <span class="h2s">自启动累计 · 回源按路径归类，缓存应答单列</span></h2>
     <div id="paths-panel"></div>
   </div>
 
+  <div class="row2">
+    <div class="tile panel-t">
+      <h2>查询量 <span class="h2s">近 2 小时 · 每分钟 · 绿=缓存命中 蓝=回源 红=失败</span></h2>
+      <div id="minute-chart" class="chart" style="height:216px"></div>
+    </div>
+    <div class="tile panel-t">
+      <h2>链路延迟趋势 <span class="h2s">每 10 秒真实 DoH 查询 · 断点=该次失败</span></h2>
+      <div id="probe-chart" class="chart" style="height:216px"></div>
+    </div>
+  </div>
+
   <div class="row">
-    <div class="panel">
+    <div class="tile panel-t">
       <h2>回源延迟 <span class="h2s" id="lat-n"></span></h2>
       <div id="latency-bars"></div>
     </div>
-    <div class="panel">
+    <div class="tile panel-t">
       <h2>解析策略 <span class="h2s">回源时怎么解的（技术视图）</span></h2>
       <div id="strategy-chart" class="chart" style="height:190px"></div>
     </div>
-    <div class="panel">
+    <div class="tile panel-t">
       <h2>上游解析器</h2>
       <div id="upstreams"></div>
     </div>
   </div>
 
-  <div class="panel">
-    <h2>链路延迟趋势 <span class="h2s">每 10 秒真实 DoH 查询 · 断点=该次失败</span></h2>
-    <div id="probe-chart" class="chart" style="height:210px"></div>
+  <div class="sect"><span class="sect-tick amber"></span><span class="sect-t">控制</span><span class="sect-s">SNI RELAY</span></div>
+
+  <div class="tile deck" id="control-panel" hidden>
+    <div class="deck-head">
+      <div class="deck-mode">
+        <div class="kk">档位 <span class="h2s">变更即刻生效 · 持久化（重启保留）</span></div>
+        <div class="mode-now"><b id="relay-mode-text">—</b><span class="srcbadge" id="relay-mode-source"></span></div>
+        <div class="seg" id="mode-seg">
+          <button type="button" data-mode="off">off · 直连</button>
+          <button type="button" data-mode="auto">auto · 自动</button>
+          <button type="button" data-mode="always" class="danger">always · 常开</button>
+        </div>
+      </div>
+      <div class="deck-side">
+        <div id="relay-not-deployed" class="cwarn" hidden></div>
+        <div id="relay-no-report" class="cinfo" hidden></div>
+        <div id="relay-result" class="cresult" hidden></div>
+        <div class="sync-line" id="relay-sync">—</div>
+      </div>
+    </div>
+    <div class="deck-body">
+      <div class="lists">
+        <div class="list-edit">
+          <h3>中转名单 <code>RELAY_DOMAINS</code></h3>
+          <div class="chips" id="domains-chips"></div>
+          <div class="addrow"><input id="domain-input" placeholder="*.example.com（精确域名或 *.通配）"><button type="button" id="domain-add">添加</button></div>
+          <div class="field-err" id="domain-err"></div>
+        </div>
+        <div class="list-edit">
+          <h3>排除名单 <code>RELAY_EXCLUDE_DOMAINS</code> <span class="muted">排除优先于命中</span></h3>
+          <div class="chips" id="excludes-chips"></div>
+          <div class="addrow"><input id="exclude-input" placeholder="no-sni.example.com"><button type="button" id="exclude-add">添加</button></div>
+          <div class="field-err" id="exclude-err"></div>
+        </div>
+      </div>
+      <div id="domains-diff" class="diff-box" hidden></div>
+      <div class="ctl-actions">
+        <button type="button" class="btn" id="domains-save" disabled>保存名单</button>
+        <button type="button" class="btn secondary" id="relay-reset">恢复 env 默认配置</button>
+      </div>
+    </div>
   </div>
 
-  <div class="panel control-panel" id="control-panel" hidden>
-    <h2>SNI 中转控制 <span class="h2s">变更即刻生效并持久化（重启保留）· relay 进程 ≤30 秒同步新名单</span></h2>
-    <div id="relay-not-deployed" class="cwarn" hidden></div>
-    <div id="relay-no-report" class="cinfo" hidden></div>
-    <div class="mode-row">
-      <div class="mode-current">当前档位 <b id="relay-mode-text">—</b><span class="badge b-stale" id="relay-mode-source"></span></div>
-      <div class="seg" id="mode-seg">
-        <button type="button" data-mode="off">off · 直连</button>
-        <button type="button" data-mode="auto">auto · 自动</button>
-        <button type="button" data-mode="always" class="danger">always · 常开</button>
-      </div>
-    </div>
-    <div id="relay-result" class="cresult" hidden></div>
-    <div class="lists">
-      <div class="list-edit">
-        <h3>中转名单 <code>RELAY_DOMAINS</code></h3>
-        <div class="chips" id="domains-chips"></div>
-        <div class="addrow"><input id="domain-input" placeholder="*.example.com（精确域名或 *.通配）"><button type="button" id="domain-add">添加</button></div>
-        <div class="field-err" id="domain-err"></div>
-      </div>
-      <div class="list-edit">
-        <h3>排除名单 <code>RELAY_EXCLUDE_DOMAINS</code> <span class="muted">排除优先于命中</span></h3>
-        <div class="chips" id="excludes-chips"></div>
-        <div class="addrow"><input id="exclude-input" placeholder="no-sni.example.com"><button type="button" id="exclude-add">添加</button></div>
-        <div class="field-err" id="exclude-err"></div>
-      </div>
-    </div>
-    <div id="domains-diff" class="diff-box" hidden></div>
-    <div class="ctl-actions">
-      <button type="button" class="btn" id="domains-save" disabled>保存名单</button>
-      <button type="button" class="btn secondary" id="relay-reset">恢复 env 默认配置</button>
-    </div>
-    <div class="sync-line" id="relay-sync">—</div>
-  </div>
+  <div class="sect"><span class="sect-tick"></span><span class="sect-t">诊断</span><span class="sect-s">DETAILS</span></div>
 
   <details>
     <summary>高频域名 <span class="cnt" id="top-cnt"></span></summary>
@@ -798,7 +927,7 @@ const PAGE = `<!doctype html>
   </details>
   <details>
     <summary>最近查询 <span class="cnt" id="recent-cnt"></span></summary>
-    <div class="dbody"><table><tbody id="recent-body"></tbody></table></div>
+    <div class="dbody"><table><thead><tr><th>时间</th><th>域名</th><th>类型</th><th>结果</th><th class="n">延迟</th><th>上游</th></tr></thead><tbody id="recent-body"></tbody></table></div>
   </details>
   <details>
     <summary>优选池 / 规则状态 <span class="cnt" id="pools-cnt"></span></summary>
@@ -850,7 +979,12 @@ const MODE_TEXT = { off: "off · 直连", auto: "auto · 自动", always: "alway
 let CONSOLE_STATE = { authRequired: false, control: false, session: null };
 let RELAY = null;           // 最新一份 relay 状态（stats.pools.relay）
 let EDIT = null;            // 名单编辑草稿 { domains: [], excludes: [] }，null = 未编辑
-let OFF_WARN_SHOWN = false; // 切 off 后的持续警示（直到下一次档位变更）
+
+// 命令栏时钟
+const clockEl = document.getElementById("clock");
+function tickClock() { clockEl.textContent = hhmmss(Date.now()); }
+tickClock();
+setInterval(tickClock, 1000);
 
 // ===================== 登录 / 会话 =====================
 
@@ -870,7 +1004,7 @@ setInterval(function () {
   loginCooldownLeft -= 1;
   const button = document.getElementById("login-button");
   button.disabled = loginCooldownLeft > 0;
-  button.textContent = loginCooldownLeft > 0 ? "冷却 " + loginCooldownLeft + "s" : "登录";
+  button.textContent = loginCooldownLeft > 0 ? "冷却 " + loginCooldownLeft + "s" : "登 录";
   if (loginCooldownLeft === 0) document.getElementById("login-error").textContent = "";
 }, 1000);
 
@@ -950,7 +1084,7 @@ function verdictOf(d) {
 
 // ===================== ECharts =====================
 
-const PAL = { hit: "#34d399", miss: "#38bdf8", err: "#f87171", bar: "#818cf8", axis: "#8792ad", split: "#1a2440" };
+const PAL = { hit: "#34d399", miss: "#38bdf8", err: "#f87171", bar: "#818cf8", axis: "#6b7694", split: "#182345" };
 const LINE_COLORS = ["#38bdf8", "#a78bfa", "#34d399", "#fbbf24", "#f87171", "#22d3ee", "#fb923c", "#e879f9"];
 const charts = {};
 const axisLabel = { color: PAL.axis, fontSize: 10 };
@@ -978,6 +1112,12 @@ function setVerdict(d) {
   text.textContent = v.text;
   why.className = "vwhy " + (v.why ? v.cls : "");
   why.textContent = v.why || "";
+  // 命令栏胶囊同步
+  document.getElementById("pill-dot").className = "pill-dot " + v.cls;
+  document.getElementById("pill-text").textContent = v.text;
+  // 状态磁贴随状态着色（辉光）
+  const tile = document.getElementById("status-tile");
+  tile.className = "tile status" + (v.cls ? " " + v.cls : "");
   const s = d.stats;
   const bits = ["上游 " + d.monitor.dohUrl, "采样每 " + Math.round(d.monitor.intervalMs / 1000) + "s"];
   if (s) {
@@ -985,6 +1125,26 @@ function setVerdict(d) {
     if (s.memory) bits.push("内存 " + (s.memory.rssBytes / 1048576).toFixed(0) + " MB");
   }
   document.getElementById("v-sub").textContent = bits.join(" · ");
+}
+
+// 探测历史的迷你走势（纯 SVG，失败点断开）
+function sparkline(history, ok) {
+  const pts = (history || []).slice(-60);
+  const good = pts.filter((p) => p.ok);
+  if (good.length < 2) return "";
+  const w = 64, h = 20;
+  const max = Math.max(1, ...good.map((p) => p.ms));
+  let d = "", pen = false;
+  for (let i = 0; i < pts.length; i++) {
+    const x = (i / (pts.length - 1) * (w - 2) + 1).toFixed(1);
+    if (!pts[i].ok) { pen = false; continue; }
+    const y = (h - 2 - (pts[i].ms / max) * (h - 4)).toFixed(1);
+    d += (pen ? " L" : " M") + x + " " + y;
+    pen = true;
+  }
+  if (!d) return "";
+  const color = ok === false ? "#f87171" : "#2dd4bf";
+  return '<svg class="spark" width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + " " + h + '"><path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity=".9"/></svg>';
 }
 
 function pathHealth(probes, relay) {
@@ -996,12 +1156,14 @@ function pathHealth(probes, relay) {
     if (relay.mode === "always") return /github/.test(name);
     return (relay.hosts || []).some((h) => h.relayed && (name === h.host || name.endsWith("." + h.host)));
   };
+  el.classList.remove("muted");
   el.innerHTML = probes.map((p) => {
     const cls = p.ok === null ? "" : p.ok ? "ok" : "bad";
     const val = p.ok === null ? "—" : p.ok ? fmtMs(p.latencyMs) : (p.error || "失败").slice(0, 26);
     return '<div class="path"><span class="pdot ' + cls + '"></span><span class="pl">' + esc(p.label || p.name) +
       (viaRelay(p.name) ? ' <span class="warn2">中转</span>' : "") +
-      '</span><span class="pv' + (p.ok === false ? " err" : "") + '" title="' + esc(p.name + (p.error ? " · " + p.error : "")) + '">' + esc(val) + "</span></div>";
+      '</span>' + sparkline(p.history, p.ok) +
+      '<span class="pv' + (p.ok === false ? " err" : "") + '" title="' + esc(p.name + (p.error ? " · " + p.error : "")) + '">' + esc(val) + "</span></div>";
   }).join("");
 }
 
@@ -1010,6 +1172,7 @@ function heroCards(s) {
   document.getElementById("stat-total").textContent = fmt(s.queries.total);
   document.getElementById("stat-total-s").textContent = "近 1 分钟 " + fmt(lastMin ? lastMin.queries : 0) + " 次";
   document.getElementById("stat-rate").innerHTML = Math.round(s.hitRate * 100) + "<small>%</small>";
+  document.getElementById("rate-donut").style.setProperty("--p", String(Math.round(s.hitRate * 100)));
   document.getElementById("stat-rate-s").textContent = "失败 " + fmt(s.queries.error) + "（SERVFAIL " + fmt(s.queries.servfail) + "）";
   document.getElementById("stat-p50").textContent = fmtMs(s.freshLatency.p50Ms);
   document.getElementById("stat-lat-s").textContent = "P90 " + fmtMs(s.freshLatency.p90Ms) + " · 共 " + fmt(s.freshLatency.count) + " 次";
@@ -1025,32 +1188,31 @@ function minuteChart(minutes) {
     xAxis: { type: "category", data: minutes.map((b) => hhmm(b.t)), axisLabel: axisLabel, axisLine: { lineStyle: { color: PAL.split } } },
     yAxis: { type: "value", axisLabel: axisLabel, splitLine: splitLine },
     series: [
-      { name: "缓存命中", type: "bar", stack: "q", barMaxWidth: 10, itemStyle: { color: PAL.hit }, data: minutes.map((b) => b.hits) },
-      { name: "回源解析", type: "bar", stack: "q", barMaxWidth: 10, itemStyle: { color: PAL.miss }, data: minutes.map((b) => b.misses) },
-      { name: "解析失败", type: "bar", stack: "q", barMaxWidth: 10, itemStyle: { color: PAL.err }, data: minutes.map((b) => b.errors) },
+      { name: "缓存命中", type: "bar", stack: "q", barMaxWidth: 9, itemStyle: { color: PAL.hit, borderRadius: [2, 2, 0, 0] }, data: minutes.map((b) => b.hits) },
+      { name: "回源解析", type: "bar", stack: "q", barMaxWidth: 9, itemStyle: { color: PAL.miss }, data: minutes.map((b) => b.misses) },
+      { name: "解析失败", type: "bar", stack: "q", barMaxWidth: 9, itemStyle: { color: PAL.err, borderRadius: [2, 2, 0, 0] }, data: minutes.map((b) => b.errors) },
     ],
   }, { notMerge: true });
 }
 
 function pathsPanel(s) {
   const el = document.getElementById("paths-panel");
-  const rows = [];
   const freshTotal = (s.paths || []).reduce((sum, p) => sum + p.count, 0);
   const cached = (s.queries.hit || 0) + (s.queries.prefetch || 0) + (s.queries.stale || 0);
   const total = Math.max(1, s.queries.total || 0);
   const all = (s.paths || []).filter((p) => p.count > 0).map((p) => ({ key: p.path, count: p.count, avgMs: p.avgMs }));
   if (cached > 0) all.push({ key: "cache", count: cached, avgMs: null });
-  const max = Math.max(1, ...all.map((r) => r.count));
-  if (all.length === 0) { el.innerHTML = '<div class="muted" style="padding:12px 0">暂无回源记录</div>'; return; }
-  el.innerHTML = all.map(function (r) {
+  if (all.length === 0) { el.innerHTML = '<div class="muted" style="padding:10px 0 4px">暂无回源记录</div>'; return; }
+  const share = (r) => (r.count / total * 100);
+  el.innerHTML = '<div class="segbar">' + all.map((r) => {
     const meta = PATH_META[r.key] || [r.key, "#64748b"];
-    const share = (r.count / total * 100);
-    const note = r.avgMs == null ? "—" : "均 " + fmtMs(r.avgMs);
-    return '<div class="prow"><span class="pk">' + esc(meta[0]) + '</span>' +
-      '<span class="pbar"><i style="width:' + Math.max(1.5, Math.round(r.count / max * 100)) + "%;background:" + meta[1] + '"></i></span>' +
-      '<span class="pn">' + fmt(r.count) + " 次 · " + share.toFixed(1) + "% · " + note + "</span></div>";
-  }).join("") +
-  '<div class="muted" style="font-size:11.5px;margin-top:6px">回源 ' + fmt(freshTotal) + " 次 · 缓存应答 " + fmt(cached) + " 次 · 分母为总查询 " + fmt(s.queries.total || 0) + "</div>";
+    return '<span class="seg-piece" style="width:' + share(r).toFixed(2) + "%;background:" + meta[1] + '" title="' + esc(meta[0]) + " " + fmt(r.count) + ' 次"></span>';
+  }).join("") + '</div><div class="legend">' + all.map((r) => {
+    const meta = PATH_META[r.key] || [r.key, "#64748b"];
+    const avg = r.avgMs == null ? "—" : "均 " + fmtMs(r.avgMs);
+    return '<div class="lg"><span class="lgdot" style="background:' + meta[1] + '"></span><span class="lgname">' + esc(meta[0]) +
+      '</span><span class="lgn">' + fmt(r.count) + ' 次</span><span class="lgp">' + share(r).toFixed(1) + '%</span><span class="lga">' + avg + "</span></div>";
+  }).join("") + '</div><div class="paths-note muted">回源 ' + fmt(freshTotal) + " 次 · 缓存应答 " + fmt(cached) + " 次 · 分母为总查询 " + fmt(s.queries.total || 0) + " · 路径按回源时刻归类，已进缓存的查询不再重计</div>";
 }
 
 function latencyBars(f) {
@@ -1073,7 +1235,7 @@ function strategyChart(list) {
     tooltip: { trigger: "axis", textStyle: { fontSize: 11 } },
     xAxis: { type: "value", axisLabel: axisLabel, splitLine: splitLine },
     yAxis: { type: "category", data: rows.map((s) => s.name), axisLabel: Object.assign({}, axisLabel, { fontSize: 11 }), axisLine: { lineStyle: { color: PAL.split } } },
-    series: [{ type: "bar", barMaxWidth: 12, itemStyle: { color: PAL.bar },
+    series: [{ type: "bar", barMaxWidth: 12, itemStyle: { color: PAL.bar, borderRadius: [0, 3, 3, 0] },
       label: { show: true, position: "right", color: PAL.axis, fontSize: 10, formatter: (p) => p.value + " · 均 " + fmtMs(p.data.avgMs) },
       data: rows.map((s) => ({ value: s.count, avgMs: s.avgMs })) }],
   }, { notMerge: true });
@@ -1195,7 +1357,9 @@ function renderControl(relay) {
   RELAY = relay;
   if (!relay || !CONSOLE_STATE.control) return;
   document.getElementById("relay-mode-text").textContent = MODE_TEXT[relay.mode] || relay.mode;
-  document.getElementById("relay-mode-source").textContent = relay.modeSource === "override" ? "控制台覆盖" : "env 默认";
+  const sourceEl = document.getElementById("relay-mode-source");
+  sourceEl.textContent = relay.modeSource === "override" ? "控制台覆盖" : "env 默认";
+  sourceEl.className = "srcbadge" + (relay.modeSource === "override" ? "" : " env");
   const seg = document.getElementById("mode-seg");
   const deployed = Boolean(relay.ip);
   for (const button of seg.querySelectorAll("button")) {
@@ -1215,7 +1379,7 @@ function renderControl(relay) {
   if (noReports) {
     sync.innerHTML = "configVersion v" + v + " · <span class='warn2'>relay 未上报</span>";
   } else if ((relay.appliedConfigVersion || 0) >= v) {
-    sync.innerHTML = "configVersion v" + v + " · 中转已应用 v" + relay.appliedConfigVersion;
+    sync.innerHTML = "configVersion v" + v + " · <span class='ok2'>中转已应用 v" + relay.appliedConfigVersion + "</span>";
   } else {
     sync.innerHTML = "configVersion v" + v + " · <span class='warn2'>同步中（relay 回执 v" + (relay.appliedConfigVersion || 0) + "，≤30 秒）</span>——新增域名在'已同步'前可能被 relay 拒连，请稍候";
   }
@@ -1245,7 +1409,7 @@ function renderChips(id, list, isExclude) {
 }
 
 function validPattern(value) {
-  const clean = value.trim().toLowerCase().replace(/\.$/, "");
+  const clean = value.trim().toLowerCase().replace(/\\.$/, "");
   if (!clean || clean.length > 253) return null;
   const bare = clean.replace(/^\\*\\./, "").replace(/^\\./, "");
   if (!/^(?=.{1,253}$)(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\\.)*[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/.test(bare)) return null;
@@ -1319,7 +1483,6 @@ document.getElementById("domains-save").addEventListener("click", async function
 
 document.getElementById("relay-reset").addEventListener("click", async function () {
   if (!RELAY) return;
-  const envMode = MODE_TEXT.off;
   const go = await confirmDialog("恢复 env 默认配置",
     "<p>将清除控制台的运行时覆盖，回到 env 文件里的值：</p><ul><li>档位：<b>" + esc(MODE_TEXT.off) + "</b>（env RELAY_MODE）</li><li>中转名单：" + ((RELAY.envDomains || []).map(esc).join("、") || "（空）") + "</li><li>排除名单：" + ((RELAY.envExcludes || []).map(esc).join("、") || "（空）") + "</li></ul>",
     "恢复默认");
@@ -1367,10 +1530,8 @@ async function postRelayConfig(body, action) {
       "relay 进程 ≤30 秒收到新名单（下次健康上报）；新增域名请等'已同步'再使用"];
     if (after.mode === "off" && before && before.mode !== "off") {
       showResult("warn", lines[0] + "<br>" + lines.slice(1).join("<br>") + "<br>⚠ 名单域名回到直连路径，GitHub 族 SNI 抖动可能复发；relay 进程未停止（无害），彻底停用：systemctl disable --now edge-smart-doh-relay");
-      OFF_WARN_SHOWN = true;
     } else {
       showResult("ok", lines.join("<br>"));
-      OFF_WARN_SHOWN = false;
     }
     renderControl(after);
     return true;
@@ -1439,7 +1600,7 @@ async function refresh(force) {
       topTable(d.stats.top); recentTable(d.stats.recent); poolsTable(d.stats.pools);
     } else {
       ["stat-total", "stat-rate", "stat-p50"].forEach((id) => { document.getElementById(id).textContent = "—"; });
-      document.getElementById("paths-panel").innerHTML = '<div class="muted" style="padding:12px 0">统计不可用</div>';
+      document.getElementById("paths-panel").innerHTML = '<div class="muted" style="padding:10px 0 4px">统计不可用</div>';
     }
     pathHealth(d.probes || [], d.stats && d.stats.pools ? d.stats.pools.relay : null); probeChart(d.probes || []);
   } catch (e) {
@@ -1453,7 +1614,8 @@ window.addEventListener("resize", function () { Object.keys(charts).forEach((id)
 })();
 </script>
 </body>
-</html>`;
+</html>
+`;
 
 // ============================== HTTP 服务 ==============================
 
