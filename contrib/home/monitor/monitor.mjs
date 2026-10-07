@@ -17,7 +17,8 @@
  *   3. 凭据隔离：ADMIN_TOKEN 只存在本进程内存，页面只见会话 cookie，绝不回传。
  *   纵深防御：deploy-home.sh 的 nftables 规则（SETUP_FIREWALL=1）在网络层再限一次内网网段。
  *
- * 主题：明暗两套（CSS 变量切换），默认跟随系统偏好，手动切换存 localStorage。
+ * 主题：明暗两套（CSS 变量切换），默认"自动"档实时跟随系统 prefers-color-scheme（含运行中
+ *   切换），手动选择存 localStorage（自动 → 亮色 → 暗色 循环，选回自动即恢复跟随）。
  *
  * 其他配置（环境变量）：DOH_URL、ADMIN_TOKEN、CONSOLE_PASSWORD、MONITOR_HOST、MONITOR_PORT、
  *   MONITOR_INTERVAL_MS（采样间隔，≥5000）、MONITOR_PROBE_NAMES、MONITOR_PROBE_LABELS、
@@ -821,21 +822,31 @@ const CSS_COMMON = `
   body.auth #main { display: none; }
 `;
 
-// 主题引导：跟随系统偏好，手动选择存 localStorage（放 head 里避免闪色）
-const THEME_BOOT = `<script>document.documentElement.setAttribute("data-theme", localStorage.getItem("doh-console-theme") || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"));</script>`;
+// 主题：三态。无 localStorage 值 = 自动档，实时跟随系统 prefers-color-scheme（含页面开着时
+// 系统切换：mq change 监听）；手动选 light/dark 存 localStorage，选回"自动"即清除并恢复跟随。
+// BOOT 放 head 里避免闪色，SCRIPT 放页尾负责切换按钮与监听。
+const THEME_BOOT = `<script>(function(){var t=null;try{t=localStorage.getItem("doh-console-theme")}catch(e){}if(t!=="light"&&t!=="dark")t=null;document.documentElement.setAttribute("data-theme",t||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"));})();</script>`;
 const THEME_SCRIPT = `
 (function () {
   var root = document.documentElement;
-  function label() { return root.getAttribute("data-theme") === "light" ? "🌙 暗色" : "☀️ 亮色"; }
   var btn = document.getElementById("theme-toggle");
-  function sync() { if (btn) btn.textContent = label(); }
+  var mq = matchMedia("(prefers-color-scheme: light)");
+  function stored() { try { var v = localStorage.getItem("doh-console-theme"); return v === "light" || v === "dark" ? v : null; } catch (e) { return null; } }
+  function label(s) { return s === "light" ? "☀️ 亮色" : s === "dark" ? "🌙 暗色" : "🖥 自动"; }
+  function sync() { if (btn) btn.textContent = label(stored()); }
+  function apply() { root.setAttribute("data-theme", stored() || (mq.matches ? "light" : "dark")); }
   sync();
   if (btn) btn.addEventListener("click", function () {
-    var next = root.getAttribute("data-theme") === "light" ? "dark" : "light";
-    root.setAttribute("data-theme", next);
-    try { localStorage.setItem("doh-console-theme", next); } catch {}
+    var s = stored();
+    var next = s === "light" ? "dark" : s === "dark" ? null : "light"; // 自动 → 亮色 → 暗色 → 自动
+    try { if (next) localStorage.setItem("doh-console-theme", next); else localStorage.removeItem("doh-console-theme"); } catch (e) {}
+    apply();
     sync();
   });
+  // 系统主题变化时实时跟随；仅自动档（无手动选择）生效
+  function follow() { if (!stored()) { apply(); sync(); } }
+  if (mq.addEventListener) mq.addEventListener("change", follow);
+  else if (mq.addListener) mq.addListener(follow);
 })();`
 
 const BRAND_SVG = '<svg width="19" height="19" viewBox="0 0 24 24" fill="none"><path d="M12 2l8.66 5v10L12 22l-8.66-5V7L12 2z" stroke="#4f8dff" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="#4f8dff"/></svg>';
@@ -848,7 +859,7 @@ function commandBar(active, extraRight) {
     <span class="pill"><span class="pill-dot" id="pill-dot"></span><span id="pill-text">检测中…</span></span>
     <span class="bar-right">
       ${extraRight || ""}
-      <button type="button" class="tbtn" id="theme-toggle" title="切换明暗主题">☀️ 亮色</button>
+      <button type="button" class="tbtn" id="theme-toggle" title="主题：自动（跟随系统）→ 亮色 → 暗色 循环切换">🖥 自动</button>
       <span class="clock" id="clock"></span>
     </span>
   </header>`;

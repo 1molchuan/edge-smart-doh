@@ -49,19 +49,25 @@ try {
     const elements = new Map();
     const makeEl = (id) => ({
       id, textContent: "", innerHTML: "", value: "", hidden: false, disabled: false, open: false,
-      className: "", dataset: {},
+      className: "", dataset: {}, _h: {},
       style: { setProperty() {} },
       classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
-      addEventListener() {}, appendChild() {},
+      addEventListener(type, fn) { this._h[type] = fn; }, fire(type) { const f = this._h[type]; if (f) f({ preventDefault() {} }); },
+      appendChild() {},
       querySelectorAll() { return []; }, querySelector() { return null; },
       setAttribute() {}, getAttribute() { return null; },
     });
+    // 主题脚本要真跑：documentElement 存属性、storage 用 Map、matchMedia 可拨 matches 并派发 change
+    const rootAttrs = {};
+    const storage = new Map();
+    const mql = { matches: false, _fns: [], addEventListener(_t, fn) { this._fns.push(fn); }, removeEventListener() {}, addListener(fn) { this._fns.push(fn); }, removeListener() {} };
+    const fireScheme = () => mql._fns.forEach((f) => f());
     return {
-      elements,
+      elements, rootAttrs, storage, mql, fireScheme,
       document: {
         getElementById(id) { if (!elements.has(id)) elements.set(id, makeEl(id)); return elements.get(id); },
         addEventListener() {},
-        documentElement: { getAttribute: () => "dark", setAttribute() {} },
+        documentElement: { setAttribute(k, v) { rootAttrs[k] = v; }, getAttribute(k) { return k in rootAttrs ? rootAttrs[k] : null; } },
         body: { classList: { add() {}, remove() {} } },
       },
       window: { addEventListener() {} },
@@ -80,8 +86,8 @@ try {
     });
     new Function("document", "window", "fetch", "setInterval", "setTimeout", "localStorage", "matchMedia", js)(
       stub.document, stub.window, fetchStub, () => 0, () => 0,
-      { getItem: () => null, setItem() {} },
-      () => false,
+      { getItem: (k) => (stub.storage.has(k) ? stub.storage.get(k) : null), setItem: (k, v) => stub.storage.set(k, String(v)), removeItem: (k) => stub.storage.delete(k), clear: () => stub.storage.clear() },
+      () => stub.mql,
     );
     await new Promise((r) => setTimeout(r, 80));
     return stub;
@@ -136,6 +142,26 @@ try {
   check("监控页池状态含强制池", m.html("pools-body").includes("强制池"));
   check("监控页链路火花线", m.html("path-health").includes("svg"));
 
+  // ---- 主题三态：自动（跟随系统，含实时 change）→ 亮色 → 暗色 → 自动 ----
+  const theme = m.elements.get("theme-toggle");
+  const themeAttr = () => m.rootAttrs["data-theme"] ?? null;
+  check("主题默认自动档", theme.textContent.includes("自动"), theme.textContent);
+  m.fireScheme(); m.mql.matches = true; m.fireScheme();
+  check("自动档跟随系统亮色", themeAttr() === "light", themeAttr());
+  m.mql.matches = false; m.fireScheme();
+  check("自动档跟随系统暗色", themeAttr() === "dark", themeAttr());
+  theme.fire("click");
+  check("自动→亮色并持久化", theme.textContent.includes("亮色") && themeAttr() === "light" && m.storage.get("doh-console-theme") === "light",
+    theme.textContent + "/" + themeAttr() + "/" + m.storage.get("doh-console-theme"));
+  m.mql.matches = false; m.fireScheme();
+  check("手动亮色不被系统切换覆盖", themeAttr() === "light", themeAttr());
+  theme.fire("click");
+  check("亮色→暗色", theme.textContent.includes("暗色") && themeAttr() === "dark" && m.storage.get("doh-console-theme") === "dark",
+    theme.textContent + "/" + themeAttr());
+  theme.fire("click");
+  check("暗色→回到自动（清除存储恢复跟随）", theme.textContent.includes("自动") && m.storage.get("doh-console-theme") === undefined && themeAttr() === "dark",
+    theme.textContent + "/" + m.storage.get("doh-console-theme") + "/" + themeAttr());
+
   // ---- 控制页：已登录 ----
   const consoleHtml = await (await fetch(`${BASE}/console`)).text();
   check("控制页含双池卡", consoleHtml.includes('id="mode-seg"') && consoleHtml.includes('id="forced-mode-seg"') && consoleHtml.includes("强制池"));
@@ -149,6 +175,7 @@ try {
   check("控制页会话徽标", c.text("session-label").includes("ops-agent"));
   check("控制页审计渲染", c.html("audit-body").includes("主池档位") || c.html("audit-body").includes("暂无操作记录"));
   check("控制页页脚模式", c.text("foot-mode").includes("控制台模式"));
+  check("控制页主题按钮默认自动档", c.text("theme-toggle").includes("自动"), c.text("theme-toggle"));
 
   // ---- 校验/黏贴回归：渲染语义下的 validPattern 与 parsePatternInput（模板字面量转义陷阱曾让 *.gstatic.com 被拒） ----
   const renderedFn = (name) => {
