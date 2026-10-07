@@ -1431,6 +1431,7 @@ async function refresh(force) {
     sessionExpired = false;
     fetchFails = 0;
     if (line) line.textContent = "更新于 " + hhmmss(Date.now());
+    setVerdict(d);
     applyConsoleState(d);
     if (d.stats) {
       heroCards(d.stats); minuteChart(d.stats.minutes); latencyBars(d.stats.freshLatency);
