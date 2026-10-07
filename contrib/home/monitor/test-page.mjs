@@ -150,6 +150,27 @@ try {
   check("控制页审计渲染", c.html("audit-body").includes("主池档位") || c.html("audit-body").includes("暂无操作记录"));
   check("控制页页脚模式", c.text("foot-mode").includes("控制台模式"));
 
+  // ---- 校验/黏贴回归：渲染语义下的 validPattern 与 parsePatternInput（模板字面量转义陷阱曾让 *.gstatic.com 被拒） ----
+  const renderedFn = (name) => {
+    const m = consoleHtml.match(new RegExp("function " + name + "[\\s\\S]*?^}", "m"));
+    if (!m) return null;
+    return new Function(m[0] + ";\nreturn " + name + ";")(); // 已渲染页面即最终形态，不再过模板
+  };
+  const vp = renderedFn("validPattern");
+  const pp = renderedFn("parsePatternInput");
+  check("控制页校验函数存在", Boolean(vp) && Boolean(pp));
+  if (vp) {
+    check("validPattern 接受 *.gstatic.com", vp("*.gstatic.com") === "*.gstatic.com");
+    check("validPattern 接受精确域名", vp("example.com") === "example.com");
+    check("validPattern 拒绝 a..b", vp("a..b") === null);
+    check("validPattern 与服务端一致接受单标签", vp("*.x") === "*.x");
+  }
+  if (pp) {
+    check("parsePatternInput 逗号分隔", JSON.stringify(pp("*.a.com, *.b.com")) === JSON.stringify(["*.a.com", "*.b.com"]));
+    check("parsePatternInput 中文逗号/分号/换行/空格", pp("*.a.com，*.b.com；*.c.com\n*.d.com *.e.com").length === 5);
+    check("parsePatternInput 空输入", pp("   ").length === 0);
+  }
+
   // ---- 控制页：未登录（应显示登录卡，不渲染甲板数据） ----
   const cOut = await runPage(consoleHtml, summaryFetch({ authRequired: true, control: true, session: null }));
   check("控制页未登录显示登录卡", cOut.text("login-sub").includes("请输入控制台密码"));

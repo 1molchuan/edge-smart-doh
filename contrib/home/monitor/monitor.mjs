@@ -1054,7 +1054,7 @@ function pathHealth(probes, relay) {
   const el = document.getElementById("path-health");
   if (!probes.length) { el.innerHTML = "未配置探测"; return; }
   const patternHit = (name, patterns) => (patterns || []).some((p) => {
-    const bare = String(p).replace(/^\\\\*\\\\./, "");
+    const bare = String(p).replace(/^\\*\\./, "");
     return name === bare || name.endsWith("." + bare);
   });
   const excluded = (name) => patternHit(name, relay && relay.excludes);
@@ -1363,7 +1363,7 @@ ${THEME_BOOT}
         <div class="list-edit">
           <h3>中转名单 <code>RELAY_DOMAINS</code></h3>
           <div class="chips" id="domains-chips"></div>
-          <div class="addrow"><input id="domain-input" placeholder="*.example.com（精确域名或 *.通配）"><button type="button" id="domain-add">添加</button></div>
+          <div class="addrow"><input id="domain-input" placeholder="*.example.com；可黏贴多个（逗号/空格分隔）"><button type="button" id="domain-add">添加</button></div>
           <div class="field-err" id="domain-err"></div>
         </div>
       </div>
@@ -1381,7 +1381,7 @@ ${THEME_BOOT}
         <div class="list-edit">
           <h3>强制名单 <code>RELAY_FORCED_DOMAINS</code></h3>
           <div class="chips" id="forced-chips"></div>
-          <div class="addrow"><input id="forced-input" placeholder="*.google.com"><button type="button" id="forced-add">添加</button></div>
+          <div class="addrow"><input id="forced-input" placeholder="*.google.com；可黏贴多个"><button type="button" id="forced-add">添加</button></div>
           <div class="field-err" id="forced-err"></div>
         </div>
       </div>
@@ -1393,7 +1393,7 @@ ${THEME_BOOT}
         <div class="list-edit">
           <h3>排除名单 <code>RELAY_EXCLUDE_DOMAINS</code> <span class="muted">排除优先于命中</span></h3>
           <div class="chips" id="excludes-chips"></div>
-          <div class="addrow"><input id="exclude-input" placeholder="no-sni.example.com"><button type="button" id="exclude-add">添加</button></div>
+          <div class="addrow"><input id="exclude-input" placeholder="no-sni.example.com；可黏贴多个"><button type="button" id="exclude-add">添加</button></div>
           <div class="field-err" id="exclude-err"></div>
         </div>
         <div>
@@ -1678,11 +1678,16 @@ function renderChips(id, list, key) {
   }
 }
 
+/** 输入框支持一次黏贴多个：逗号（中英文皆可）、分号、空白、换行都是分隔符。 */
+function parsePatternInput(text) {
+  return String(text ?? "").split(/[,，;；\\s]+/).map((t) => t.trim()).filter(Boolean);
+}
+
 function validPattern(value) {
   const clean = value.trim().toLowerCase().replace(/\\.$/, "");
   if (!clean || clean.length > 253) return null;
-  const bare = clean.replace(/^\\\\*\\\\./, "").replace(/^\\\\./, "");
-  if (!/^(?=.{1,253}$)(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\\\\.)*[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/.test(bare)) return null;
+  const bare = clean.replace(/^\\*\\./, "").replace(/^\\./, "");
+  if (!/^(?=.{1,253}$)(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\\.)*[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/.test(bare)) return null;
   return clean;
 }
 
@@ -1731,15 +1736,26 @@ function wireAdd(inputId, errId, addId, key) {
   const err = document.getElementById(errId);
   const add = () => {
     err.textContent = "";
-    const pattern = validPattern(input.value);
-    if (!pattern) { err.textContent = "仅支持 精确域名 或 *.通配 两种写法"; return; }
+    const tokens = parsePatternInput(input.value);
+    if (tokens.length === 0) { err.textContent = "请输入域名（可一次黏贴多个，用逗号或空格分隔）"; return; }
     startEdit();
     const arr = EDIT[key];
-    if (arr.includes(pattern)) { err.textContent = "已在名单中"; return; }
-    if (arr.length >= 64) { err.textContent = "名单上限 64 条"; return; }
-    arr.push(pattern);
-    input.value = "";
-    refreshEdit();
+    const added = [], problems = [];
+    for (const token of tokens) {
+      const pattern = validPattern(token);
+      if (!pattern) { problems.push(token + "：仅支持 精确域名 或 *.通配"); continue; }
+      if (arr.includes(pattern)) { problems.push(pattern + "：已在名单中"); continue; }
+      if (arr.length >= 64) { problems.push(pattern + "：名单上限 64 条"); continue; }
+      arr.push(pattern);
+      added.push(pattern);
+    }
+    if (added.length > 0) {
+      input.value = "";
+      err.textContent = problems.length ? "已添加 " + added.length + " 条；" + problems.slice(0, 3).join("；") + (problems.length > 3 ? " 等" : "") : "";
+      refreshEdit();
+    } else {
+      err.textContent = problems.slice(0, 3).join("；") + (problems.length > 3 ? " 等" : "");
+    }
   };
   document.getElementById(addId).addEventListener("click", add);
   input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); add(); } });
