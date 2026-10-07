@@ -1,5 +1,5 @@
 [Unit]
-Description=Edge Smart DoH LAN Monitor (dashboard on :8788, private ranges only)
+Description=Edge Smart DoH LAN Console (monitor + control on :8788, private ranges only)
 After=network-online.target edge-smart-doh.service
 Wants=network-online.target
 

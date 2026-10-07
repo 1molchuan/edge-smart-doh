@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  edge-smart-doh 局域网监测站 安装/更新（不动主服务）
+#  edge-smart-doh 局域网控制台 安装/更新（不动主服务）
 #  位置：contrib/home/install-monitor.sh；安全模型见 contrib/home/monitor/monitor.mjs 头注释
 #  用法：sudo bash contrib/home/install-monitor.sh
 #
 #  做的事：
 #    1) contrib/home/monitor/monitor.mjs → /opt/edge-smart-doh/monitor.mjs
 #    2) /etc/edge-smart-doh/monitor.env（ADMIN_TOKEN 取自主 env；0600，pid1 以 root 读取）
+#       - 缺失时生成 CONSOLE_PASSWORD（openssl rand -hex 10）并只打印一次；已有值不覆盖
 #    3) deploy/edge-smart-doh-monitor.service → /etc/systemd/system/ 并 enable --now
-#    4) 8788 端口健康检查
+#    4) 8788 端口健康检查（healthz 报告 authRequired/control 能力）
 #
 #  前提：主服务已带 /admin/stats（重启过新版本 dist/node.mjs），否则页面仍可用但无查询统计。
-#  幂等：可反复执行；MONITOR_ALLOW 等自定义配置写在 monitor.env 里会被保留。
+#  幂等：可反复执行；MONITOR_ALLOW / CONSOLE_PASSWORD 等自定义配置写在 monitor.env 里会被保留。
 # ============================================================================
 set -euo pipefail
 
@@ -30,7 +31,7 @@ UNIT=/etc/systemd/system/edge-smart-doh-monitor.service
 ADMIN_TOKEN="$(sed -n 's/^ADMIN_TOKEN=//p' "$ENV_FILE" | head -1)"
 [[ -n "$ADMIN_TOKEN" ]] || die "$ENV_FILE 里没有 ADMIN_TOKEN"
 
-log "安装监测站文件"
+log "安装控制台文件"
 install -d -m 0755 /opt/edge-smart-doh
 install -m 0644 "$PROJECT_DIR/contrib/home/monitor/monitor.mjs" /opt/edge-smart-doh/monitor.mjs
 
@@ -57,6 +58,19 @@ else
   ok "沿用已有 $MON_ENV"
 fi
 
+# 控制台密码：设了密码看/控都要登录（三层防线见 monitor.mjs 头注释）；缺失时生成并只打印一次。
+# 轮换：sudo sed -i "s/^CONSOLE_PASSWORD=.*/CONSOLE_PASSWORD=$(openssl rand -hex 10)/" $MON_ENV && systemctl restart edge-smart-doh-monitor
+if ! grep -q '^CONSOLE_PASSWORD=.' "$MON_ENV"; then
+  CONSOLE_PASSWORD="$(openssl rand -hex 10)"
+  printf 'CONSOLE_PASSWORD=%s\n' "$CONSOLE_PASSWORD" >> "$MON_ENV"
+  chmod 600 "$MON_ENV"
+  ok "已生成控制台密码 CONSOLE_PASSWORD（仅本次打印，请保存）"
+  printf '\033[1;33m      %s\033[0m\n' "$CONSOLE_PASSWORD"
+  printf '  服务器上随时可查：sudo grep CONSOLE_PASSWORD %s\n' "$MON_ENV"
+else
+  ok "沿用已有 CONSOLE_PASSWORD"
+fi
+
 install -m 0644 "$PROJECT_DIR/deploy/edge-smart-doh-monitor.service" "$UNIT"
 systemctl daemon-reload
 systemctl enable --now edge-smart-doh-monitor >/dev/null 2>&1
@@ -67,10 +81,14 @@ for _ in $(seq 1 15); do
   sleep 1
 done
 curl --noproxy '*' -fsS http://127.0.0.1:8788/healthz >/dev/null \
-  || die "监测站 15 秒内未就绪：journalctl -u edge-smart-doh-monitor -n 30"
+  || die "控制台 15 秒内未就绪：journalctl -u edge-smart-doh-monitor -n 30"
 
 LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-ok "监测站运行中：http://${LAN_IP:-<内网IP>}:8788  （仅回环/私网来源可访问）"
+if curl --noproxy '*' -fsS http://127.0.0.1:8788/healthz 2>/dev/null | grep -q '"authRequired":true'; then
+  ok "控制台运行中：http://${LAN_IP:-<内网IP>}:8788  （密码登录；仅回环/私网来源可访问）"
+else
+  ok "控制台运行中：http://${LAN_IP:-<内网IP>}:8788  （未设密码=纯监测模式；控制功能需要 CONSOLE_PASSWORD）"
+fi
 
 # 防火墙提示：SETUP_FIREWALL=1 部署过的机器上 8787 是放行的，8788 也要补一条
 if nft list table inet home_firewall >/dev/null 2>&1 \

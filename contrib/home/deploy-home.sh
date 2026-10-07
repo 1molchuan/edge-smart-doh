@@ -536,6 +536,8 @@ EOF
     set_env_value RELAY_IP "$RELAY_IP_CFG"
     set_env_value RELAY_DOMAINS "$RELAY_DOMAINS_CFG"
     env_has_value RELAY_EXCLUDE_DOMAINS || set_env_value RELAY_EXCLUDE_DOMAINS "ssh.github.com"
+    # 控制台（8788）改档位/名单走 POST /admin/relay-config 的运行时覆盖；落在这里重启才不丢
+    env_has_value RELAY_CONFIG_PATH || set_env_value RELAY_CONFIG_PATH /var/lib/edge-smart-doh/relay-config.json
     ok "主服务 env：RELAY_MODE=$(sed -n 's/^RELAY_MODE=//p' "$ENV_FILE") RELAY_IP=$RELAY_IP_CFG"
 
     # --- 3c-3 relay 守护进程（独立最小 env，不读主 env 的解析配置）---
