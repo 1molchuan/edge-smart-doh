@@ -30,7 +30,7 @@ t=138   alidns 带着假 IP 先回来 → 赢了，另外两个被取消
 - **国内域名**（`ECS_DOMAIN_LIST_URLS` 名单 + `ECS_DOMAINS` + 你自加的 `CN_DOMAINS`）→ 直连 `https://dns.alidns.com/dns-query,https://doh.pub/dns-query`（阿里/腾讯 DoH，脚本自动把主机名加进服务的 `NO_PROXY`；改用自己的解析器设 `CN_UPSTREAMS_CFG`，设 `none` 关闭）；
 - **其余域名** → `UPSTREAMS` 信任清单，经代理出境，照旧竞速。
 
-两组上游各自组内竞速，互不见面，被污染域名永远不会碰到国内解析器。设 `CN_UPSTREAMS_CFG=none` 关闭分流时，国内域名退回 ECS 路径：`dns.google` 会转发 ECS，经代理查询照样按你的 /24 返回国内节点（作者实测 `www.taobao.com` 拿到的节点和直连阿里 DNS 相同）。所以脚本把 `ECS_UPSTREAMS` 也只设成 `dns.google`（Cloudflare 不转发 ECS，不能放进去）。代价：Google 按 ECS 选节点没有国内解析器细，且代理挂了时这些域名全部解析失败（缓存过期的记录还能临时顶一下）。
+两组上游各自组内竞速，互不见面，被污染域名永远不会碰到国内解析器。设 `CN_UPSTREAMS_CFG=none` 关闭分流时，国内域名退回 ECS 路径。关分流的目的就是一个国内解析器都不碰，所以脚本把 `ECS_UPSTREAMS` 设成经代理的 `dns.google`（Cloudflare 不转发 ECS，不能放进去）。这是有代价的取舍，**结果不如国内解析器**：Google 虽然转发 ECS，但不少国内 CDN 不认它转来的子网。实测同样带上海联通的 /24，12 个国内域名里有 4 个和阿里 DNS 不同，其中百度、华为、携程直接拿到了海外节点（`www.taobao.com` 这类倒是一样）。另外代理挂了时，这些域名会全部解析失败（缓存里过期的记录还能临时顶一下）。没有特别理由，就保持默认的分流。
 
 ECS 真正生效还差两个键，脚本会自动补齐（旧版 env 拷贝缺行、或留空时写入）：
 

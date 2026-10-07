@@ -25,17 +25,17 @@
 2. **确定访问者**：Node 版本从 `X-Real-IP`（没有就用 TCP 对端地址）取得客户端 IP，Worker 版本用 `CF-Connecting-IP`。IP 只用来选池和决定 ECS，不写日志、不落盘。
 3. **选出这次用的优选池**（见[优选池分层](#优选池分层)）。
 4. **查缓存**（见[缓存](#缓存)）。命中就直接返回。
-5. **查上游**：同时准备多个上游 DoH（默认 Cloudflare、Google、Quad9）。先问第一个，`UPSTREAM_HEDGE_MS` 毫秒内没回或者失败，就再问下一个，谁先给出合法应答用谁。“合法”指 HTTP 200 + `application/dns-message` + QR 位为响应，且 rcode 是 0（NOERROR）或 3（NXDOMAIN）、TC=0、OPT 记录的扩展 rcode 为 0；SERVFAIL/REFUSED/NOTIMP/截断一律算这次上游失败，交给下一个（否则它会赢下竞速并把并发的可信上游短路掉）。所有上游必须同样可信：竞速只比快慢，一个更快但被污染的上游会一直赢。命中 `ECS_DOMAINS` 的国内域名会带上客户端的 /24（IPv6 为 /48）子网信息（ECS），发给支持 ECS 的上游（`ECS_UPSTREAMS`），这样国内 CDN 能按你的位置返回节点。
+5. **查上游**：同时准备多个上游 DoH（默认 Cloudflare、Google、AdGuard 不过滤版）。先问第一个，`UPSTREAM_HEDGE_MS` 毫秒内没回或者失败，就再问下一个，谁先给出合法应答用谁。“合法”指 HTTP 200 + `application/dns-message` + QR 位为响应，且 rcode 是 0（NOERROR）或 3（NXDOMAIN）、TC=0、OPT 记录的扩展 rcode 为 0；SERVFAIL/REFUSED/NOTIMP/截断一律算这次上游失败，交给下一个（否则它会赢下竞速并把并发的可信上游短路掉）。所有上游必须同样可信：竞速只比快慢，一个更快但被污染的上游会一直赢。命中 `ECS_DOMAINS` 的国内域名会带上客户端的 /24（IPv6 为 /48）子网信息（ECS），发给支持 ECS 的上游（`ECS_UPSTREAMS`），这样国内 CDN 能按你的位置返回节点。客户端自己带了 ECS 时用客户端给的子网（最长同样截到 /24、/48），带 `0/0` 表示不要 ECS；格式不合法的 ECS（未知地址族、前缀超长、地址长度不对、前缀外有非零位、查询里 SCOPE 不为 0）直接回 FORMERR。应答里不会出现服务端替你选的子网，只回显客户端自己发来的那份（RFC 7871）。
 6. **应用规则**：`RULES_JSON`、`RULES_URL` 或请求里的 `?rules=` 可以改写或屏蔽某些域名的应答。
 7. **判断是不是 Cloudflare**：应答里的地址落在 Cloudflare 公布的网段内（`https://www.cloudflare.com/ips-v4/` 等，每天刷新），就算 Cloudflare。X（Twitter）这类在多家 CDN 之间切换的域名，还会查 `<域名>.cdn.cloudflare.net` 是否存在，以判断 Cloudflare 是否也在服务它。
 8. **改写地址**：把应答里所有 Cloudflare 的 A/AAAA 记录换成整个优选池（每个地址族最多 6 个），HTTPS 记录的 `ipv4hint`/`ipv6hint` 同步改掉（Firefox 和 Safari 会直接用这些提示）。
 9. **注入 ECH**：HTTPS 类型的查询，如果是 Cloudflare 的网站，就把 `cloudflare-ech.com` 当前发布的 ECH 配置放进 HTTPS 记录（上游没有 HTTPS 记录就补一条）。同时决定 ALPN：只有探针实测"QUIC + ECH 能通"的站点才给 `h3`，否则只给 `h2`，避免浏览器先试一次必然失败的 QUIC。
 10. **展平 CNAME**：Chromium 只有在 A/AAAA 和 HTTPS 记录挂在同一个名字下时才会用 ECH，所以对这类站点把 CNAME 链展平到查询的域名上。`/explain` 里的 `chromium` 一项会直接告诉你 Chromium 能不能对这个域名用上 ECH。
-11. **返回并缓存**。每次返回前都会轮换 A/AAAA 的顺序，让总是只连第一个地址的客户端分散到整个池子上。
+11. **返回并缓存**。每次返回前都会轮换 A/AAAA 的顺序，让总是只连第一个地址的客户端分散到整个池子上。缓存里不保存 OPT 记录，每个应答的 OPT 都按这次的查询重建：查询没带 OPT 就不带；带了就照抄 DO 位，客户端带了 ECS 才回显；查询带了 padding，应答就补齐到 468 字节的整数倍（RFC 8467），免得应答长度暴露查的是哪个域名。
 
 ## 优选池分层
 
-每个请求按下面的顺序找池子，**越窄越优先**。IPv4 和 IPv6 分开处理：先取最窄一层的地址，不够 6 个再用下一层补足。
+每个请求按下面的顺序找池子，**越窄越优先**。IPv4 和 IPv6 分开处理：最窄的一层只要有 2 个以上地址就单独使用；只有 1 个时才用下一层补足（最多 6 个）。cfhub 只发布每条线路最快的一档，再拿别的线路测出来的地址补满，就把这一档又稀释了。
 
 | 顺序 | 池子 | 来源 | 谁会用到 |
 |---|---|---|---|
@@ -78,7 +78,7 @@ cfhub 是一个众包测速站：志愿者在自己的线路上运行探针 `cfp
 
 - **判断访问者的运营商**：DoH 从 `ISP_TABLE_URL` 拉取"网段 → 运营商"表（每行 `<运营商> <CIDR>`）。cfhub 每天根据 [china-operator-ip](https://github.com/gaoyifan/china-operator-ip) 和国内云厂商各自自治系统（ASN）宣告的网段（来自 RIPEstat）生成这张表。DoH 在内存里二分查找，同一个 IP 命中多个网段时取最精确的那个。
 - **推送什么**：cfhub 每 5 分钟把已发布的运营商池（`isp:chinanet`、`isp:unicom`、`isp:cmcc`、`isp:cernet`、`isp:cloud`）和全国池（`isp:national`）推给 DoH，每次有效期 30 分钟。
-- **全国池**：由已发布的各运营商池合并而成，每条线路算一票，被越多线路认可的 IP 越靠前；至少 2 条线路发布后才生成。它服务所有使用默认池的访问者，排在维护者自己的自学习池前面。
+- **全国池**：由已发布的各运营商池合并而成，每条线路算一票，只收至少 2 条线路都认可的 IP，被越多线路认可的越靠前；这样的 IP 不足 2 个时不发布。它服务识别不出运营商的访问者，也补某条线路缺的地址族，排在维护者自己的自学习池前面。
 - **cfhub 能做什么、不能做什么**：`HUB_TOKEN` **只能写运营商池**（`scope` 必须是 `isp:<名字>`），不能读取 DoH 的状态，也不能改自学习池、专属池、站点池。DoH 收到运营商池后会**再检查一遍**每个 IP 是否在 Cloudflare 公布的网段内，不在就整批拒绝。所以即使 cfhub 被人控制，也只能在 Cloudflare 自己的地址里挑，没法把用户引到别人的服务器上。
 - **cfhub 挂了会怎样**：运营商池和全国池 30 分钟后过期，用户退回维护者的自学习池和优选域名池，解析不中断。DoH 重启后，这些池子会在 cfhub 下一次推送时（最多 5 分钟）恢复；`deploy/restart-keep-state.sh` 可以在重启前保存、重启后立即写回。
 - **投票规则**（防投毒）写在 cfhub 仓库的 `cfhub/aggregate.go`：只收 Cloudflare 网段内的 IP；一个网段只算一票；一个人在一个池里最多算 5 台探针；进池的 IP 要超过半数探针认可、且至少来自 2 个不同的人；一条线路至少 2 个人参与才发布。
@@ -102,7 +102,9 @@ cfhub 是一个众包测速站：志愿者在自己的线路上运行探针 `cfp
 ## 缓存
 
 - 缓存键是规范化后的查询（域名小写、去掉事务 ID）加上影响应答的因素：使用的池子、ECS 子网、请求参数、h3 结论和站点池的版本。
-- TTL 限制在 `CACHE_MIN_TTL`～`CACHE_MAX_TTL` 之间，否定应答最多 `NEGATIVE_CACHE_MAX_TTL`。
+- TTL 限制在 `CACHE_MIN_TTL`～`CACHE_MAX_TTL` 之间，否定应答最多 `NEGATIVE_CACHE_MAX_TTL`。命中缓存时返回的 TTL 会减去应答已经在缓存里待的秒数。
+- 问题部分按客户端发来的大小写原样返回（缓存不区分大小写，但用 0x20 大小写随机化的解析器会丢弃大小写不符的应答）。
+- **DNSSEC**：这个 DoH 不做验证。改写过的应答（换了地址、注入了 ECH 等）会去掉其中的 RRSIG 并清除 AD 位，因为原签名已经对不上；没改写的应答原样返回。需要自己做 DNSSEC 验证的系统不适合用它当系统 DNS。
 - **预取**：剩余 TTL 低于原 TTL 的 `CACHE_PREFETCH_PERCENT`% 时，先返回缓存，再在后台刷新。
 - **过期仍可用**（RFC 8767）：所有上游都失败时，`CACHE_STALE_TTL` 内的过期应答比 SERVFAIL 好。HTTPS 记录更进一步：只要有缓存就立即返回再后台刷新，因为 Chromium 在拿到 A/AAAA 后只等 HTTPS 记录约 50 毫秒，超时就不用 ECH 直接连了。
 - Node 版本的缓存在内存里（最多 `CACHE_MAX_ENTRIES` 条），设置 `CACHE_PERSIST_PATH` 后每 5 分钟和退出时写盘，启动时读回。
@@ -188,10 +190,11 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `UPSTREAMS` | Cloudflare、Google、Quad9 | 上游 DoH，逗号分隔，只接受 https |
-| `ECS_UPSTREAMS` | 同 `UPSTREAMS` | 带 ECS 的查询用的上游，应只放会转发 ECS 的解析器 |
+| `UPSTREAMS` | Cloudflare、Google、AdGuard（不过滤版） | 上游 DoH，逗号分隔，只接受 https。Node 的 fetch 只发 HTTP/1.1，不支持 HTTP/1.1 的上游（如 Quad9，返回 505）用不了。三组上游（还有 `ECS_UPSTREAMS`、`CN_UPSTREAMS`）的每一项都可以带限速：`https://1.12.12.12/dns-query#qps=6` 表示每秒最多发 6 个，超出的直接交给下一项；带限速的上游 30 秒内失败 5 次，会停用 2 分钟。公共解析器会对单个来源 IP 限流（实测 DNSPod 在每秒约 19 个查询时几分钟内就开始回 SERVFAIL）。一项还可以用 `\|` 连接同一个解析器的多条路径，例如 `https://1.12.12.12/dns-query#qps=6\|http://10.0.0.2:8053/dns-query#qps=6`，后者是经内网隧道、由另一台机器转发的同一个解析器，这样它看到的是两个来源 IP。每次查询取第一条还有额度、没在停用的路径。明文 http 只接受内网和本机地址 |
+| `ECS_UPSTREAMS` | 同 `UPSTREAMS` | 带 ECS 的查询用的上游，只放国内会转发 ECS 的解析器（如阿里 DNS、DNSPod）。Cloudflare 不转发 ECS；Google 虽然转发，同样的 ECS 查百度、华为、携程、去哪儿仍常拿到海外节点 |
 | `UPSTREAM_TIMEOUT_MS` | 2500 | 单次上游超时 |
 | `UPSTREAM_HEDGE_MS` | 100 | 多久没回就并发问下一个上游，0 表示不并发 |
+| `ECS_UPSTREAM_HEDGE_MS` | 同 `UPSTREAM_HEDGE_MS` | `ECS_UPSTREAMS` 这一组自己的并发间隔。组里有 Google 这类会给海外节点的解析器时，必须设 0：只有前一个失败或超时才问下一个，否则冷门网段上排第一的解析器递归慢，它就会抢答。组里全是国内解析器时，可以设 200 左右让它们竞速 |
 | `CACHE_MIN_TTL` / `CACHE_MAX_TTL` | 30 / 3600 | 缓存 TTL 的上下限（秒） |
 | `NEGATIVE_CACHE_MAX_TTL` | 300 | 否定应答最多缓存多久 |
 | `CACHE_STALE_TTL` | 86400 | 过期应答在上游全挂时还能用多久，0 关闭 |
@@ -203,10 +206,13 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 | `ECS_FALLBACK_SUBNET` | 空 | 访客 IP 不属于任何国内运营商时（通常是 DoH 查询走了境外代理，或客户端在私网/回环地址上——本机或局域网部署就是这样），ECS 改用这个国内子网，避免国内网站返回海外 CDN。非公网客户端直接适用；公网客户端需配置 `ISP_TABLE_URL` 才能判定。容忍 `1.2.3.4/24` 写法 |
 | `CN_UPSTREAMS` | 空 | 域名分流模块：国内域名（`ECS_DOMAINS` + `CN_DOMAINS` + 名单）改走这些**直连的国内解析器**（如 `https://dns.alidns.com/dns-query,https://doh.pub/dns-query`），不带 ECS——国内解析器看到的查询源 IP 就是客户端运营商，比 ECS 更准；其余域名照旧走 `UPSTREAMS`。空 = 关闭，国内域名走 ECS 路径。国内判定优先于 `ECS_MODE` 与 per-domain 的 ECS 规则；关闭只能清空 `CN_UPSTREAMS`。给服务配了出境代理时，这些解析器的主机名必须在 `NO_PROXY` 里（否则被代理接管，`server/node.ts` 会告警） |
 | `CN_DOMAINS` | 空 | 在 `ECS_DOMAINS` 和名单之外自加的国内域名后缀（带前导点才是后缀语义，如 `.mycompany.example`；不带点只匹配该域名本身） |
+| `RESOLVER_VIEW_DOMAINS` | 空 | 按"来问的解析器在哪"分配服务器、不看 ECS 的国内网站，如 `.cnki.net`：只采用 `ECS_UPSTREAMS` 第一项的应答，必要时超出它的限速。第一项必须是从境内发起递归的解析器：在香港实测，DNSPod 从境内出口查，阿里 DNS 从香港出口查，知网会把后者当成境外，给国际版（登录和国内版不通）。不在名单里的国内域名有一道通用检查：应答里的地址都不在国内运营商网段（需 `ISP_TABLE_URL`）时，先等其他 ECS 上游的应答，没有更好的再用它 |
+>>>>>>> origin/main
 | `CF_REWRITE_ENABLED` | false | 有池子时会自动开启，一般不用设 |
 | `CF_PREFERRED_DOMAIN` | 空 | 优选域名，解析出的地址合并为第 5 层池子 |
 | `CF_PREFERRED_IPV4` / `CF_PREFERRED_IPV6` | 空 | 静态优选地址 |
 | `CF_DROP_AAAA` | false | 改写后去掉 AAAA（给 IPv6 不通的网络） |
+| `CF_REWRITE_EXCLUDE` | 空 | 不做任何改写、原样返回上游应答的域名（含子域名）。Cloudflare 自己的非网页服务总是排除在外：`argotunnel.com`、`cftunnel.com`（cloudflared 隧道，7844 端口）和 `cloudflareclient.com`（WARP），因为优选 IP 只服务 HTTP/HTTPS |
 | `CF_IPV4_URL` / `CF_IPV6_URL` | Cloudflare 官方列表 | Cloudflare 网段来源 |
 | `ADMIN_TOKEN` | 空 | 管理接口令牌，空则关闭 `/admin/*` |
 | `HUB_TOKEN` | 空 | cfhub 的令牌，只能写运营商池 |

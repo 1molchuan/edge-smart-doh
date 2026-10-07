@@ -54,5 +54,28 @@ export function renderPlan(plan: RoutePlan, ctx: PlanContext, config: AppConfig,
       if (packet !== before) notes?.push(`CNAME chain flattened: every record now sits at ${question.name} (Chromium needs this to use ECH)`);
     }
   }
+  if (packet !== upstream) {
+    const before = packet;
+    packet = withoutDnssecClaims(packet);
+    if (packet !== before) notes?.push("answer changed: RRSIGs dropped and AD cleared (the signatures no longer cover it)");
+  }
   return packet;
+}
+
+const RRSIG = 46;
+const AD_FLAG = 0x0020;
+
+/**
+ * A changed answer no longer matches upstream's signatures: keeping the RRSIGs and the AD
+ * ("authenticated") bit would claim a validation that a validating stub then sees fail. The answer
+ * goes out unsigned and unauthenticated instead, like any answer from a non-validating resolver.
+ */
+export function withoutDnssecClaims(packet: DnsPacket): DnsPacket {
+  const signed = packet.answers.some((record) => record.type === RRSIG);
+  if (!signed && (packet.header.flags & AD_FLAG) === 0) return packet;
+  return {
+    ...packet,
+    header: { ...packet.header, flags: packet.header.flags & ~AD_FLAG },
+    answers: signed ? packet.answers.filter((record) => record.type !== RRSIG) : packet.answers,
+  };
 }

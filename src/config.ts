@@ -1,4 +1,5 @@
 import { parseIpv4 } from "./dns/packet";
+import { parseUpstreamEntry } from "./upstream-entry";
 
 export type EcsMode = "off" | "always" | "rules";
 export type RelayMode = "off" | "auto" | "always";
@@ -6,12 +7,19 @@ export type RelayMode = "off" | "auto" | "always";
 export type RelayForcedMode = "off" | "always";
 
 export interface AppConfig {
+  /** Entries as upstream-entry.ts describes: a DoH URL, or paths to one resolver joined by "|". */
   upstreams: string[];
   /** Upstreams used for queries carrying ECS; only resolvers that forward ECS belong here. Falls back to `upstreams`. */
   ecsUpstreams: string[];
   upstreamTimeoutMs: number;
   /** Delay before racing the next upstream while the previous one is still pending. 0 disables hedging. */
   upstreamHedgeMs: number;
+  /**
+   * The same delay for the ECS group. Resolvers differ in how well Chinese GSLBs honour ECS from them
+   * (Google often gets Baidu's and Huawei's overseas nodes, AliDNS the domestic ones), so the first
+   * ECS upstream should get time to answer before the next races it. Defaults to UPSTREAM_HEDGE_MS.
+   */
+  ecsUpstreamHedgeMs: number;
   cacheMinTtl: number;
   cacheMaxTtl: number;
   negativeCacheMaxTtl: number;
@@ -34,6 +42,12 @@ export interface AppConfig {
   /** Extra domestic domain suffixes on top of ECS_DOMAINS and the ECS_DOMAIN_LIST_URLS lists. */
   cnDomains: string[];
   /**
+   * Domains on the ECS path whose name servers answer by the asking resolver's location and ignore
+   * ECS: only the first ECS upstream's answer is taken, which must be a resolver that looks names up
+   * from the mainland (DNSPod does even when asked from Hong Kong; AliDNS does not).
+   */
+  resolverViewDomains: string[];
+  /**
    * ECS subnet for clients outside every mainland operator network (needs ISP_TABLE_URL). Their DoH
    * query arrived through a proxy, typically in Hong Kong; with their own address a Chinese site
    * answers with its overseas CDN, which the proxy's GeoIP rules then send abroad. Unset = their own.
@@ -49,6 +63,12 @@ export interface AppConfig {
   cfPreferredIpv6: string[];
   /** Strip AAAA from rewritten Cloudflare answers (for clients on broken IPv6 paths). */
   cfDropAaaa: boolean;
+  /**
+   * Names answered exactly as upstream gave them: Cloudflare's own non-web services (CF_SERVICE_DOMAINS)
+   * and CF_REWRITE_EXCLUDE. Preferred IPs only serve HTTP/HTTPS, so a tunnel or WARP endpoint
+   * rewritten to them stops working.
+   */
+  cfRewriteExclude: string[];
   /** Bearer token for POST /admin/preferred; empty disables the endpoint. */
   adminToken?: string;
   /**
@@ -148,16 +168,26 @@ function relayForcedModeOf(value: string | undefined): RelayForcedMode {
   return (value ?? "").toLowerCase() === "always" ? "always" : "off";
 }
 
+/**
+ * Cloudflare's own services that are not websites: cloudflared tunnels reach the edge on port 7844
+ * (argotunnel.com, cftunnel.com) and WARP on 2408 and MASQUE (cloudflareclient.com). Their addresses
+ * sit in Cloudflare's ranges, but the preferred IPs do not serve those ports.
+ */
+const CF_SERVICE_DOMAINS = [".argotunnel.com", ".cftunnel.com", ".cloudflareclient.com"];
+
 export function readConfig(env: Env): AppConfig {
   const rawMode: string = env.ECS_MODE;
   const mode = rawMode === "off" || rawMode === "always" ? rawMode : "rules";
-  const upstreams = list(env.UPSTREAMS).filter((item) => item.startsWith("https://"));
-  const ecsUpstreams = list(env.ECS_UPSTREAMS).filter((item) => item.startsWith("https://"));
+  const usable = (item: string) => parseUpstreamEntry(item) !== undefined;
+  const upstreams = list(env.UPSTREAMS).filter(usable);
+  const ecsUpstreams = list(env.ECS_UPSTREAMS).filter(usable);
+  const upstreamHedgeMs = integer(env.UPSTREAM_HEDGE_MS, 100, 0, 5000);
   return {
     upstreams,
     ecsUpstreams: ecsUpstreams.length > 0 ? ecsUpstreams : upstreams,
     upstreamTimeoutMs: integer(env.UPSTREAM_TIMEOUT_MS, 2500, 250, 15000),
-    upstreamHedgeMs: integer(env.UPSTREAM_HEDGE_MS, 100, 0, 5000),
+    upstreamHedgeMs,
+    ecsUpstreamHedgeMs: integer(env.ECS_UPSTREAM_HEDGE_MS, upstreamHedgeMs, 0, 5000),
     cacheMinTtl: integer(env.CACHE_MIN_TTL, 30, 0, 3600),
     cacheMaxTtl: integer(env.CACHE_MAX_TTL, 3600, 1, 86400),
     negativeCacheMaxTtl: integer(env.NEGATIVE_CACHE_MAX_TTL, 300, 0, 3600),
@@ -167,8 +197,9 @@ export function readConfig(env: Env): AppConfig {
     ecsDomains: list(env.ECS_DOMAINS).map((item) => item.toLowerCase()),
     ecsIpv4Prefix: integer(env.ECS_IPV4_PREFIX, 24, 0, 32),
     ecsIpv6Prefix: integer(env.ECS_IPV6_PREFIX, 48, 0, 128),
-    cnUpstreams: list(env.CN_UPSTREAMS).filter((item) => item.startsWith("https://")),
+    cnUpstreams: list(env.CN_UPSTREAMS).filter(usable),
     cnDomains: list(env.CN_DOMAINS).map((item) => item.toLowerCase()),
+    resolverViewDomains: list(env.RESOLVER_VIEW_DOMAINS).map((item) => item.toLowerCase()),
     // A "/24" suffix is accepted and ignored: the prefix comes from ECS_IPV4_PREFIX/ECS_IPV6_PREFIX.
     ecsFallbackSubnet: (env.ECS_FALLBACK_SUBNET ?? "").split("/", 1)[0] || undefined,
     ecsDomainListUrls: list(env.ECS_DOMAIN_LIST_URLS).filter((item) => item.startsWith("https://") || item.startsWith("http://127.0.0.1")),
@@ -178,6 +209,7 @@ export function readConfig(env: Env): AppConfig {
     cfPreferredIpv4: list(env.CF_PREFERRED_IPV4),
     cfPreferredIpv6: list(env.CF_PREFERRED_IPV6),
     cfDropAaaa: enabled(env.CF_DROP_AAAA),
+    cfRewriteExclude: [...CF_SERVICE_DOMAINS, ...list(env.CF_REWRITE_EXCLUDE).map((item) => item.toLowerCase())],
     adminToken: optionalSecret(env, "ADMIN_TOKEN"),
     hubToken: optionalSecret(env, "HUB_TOKEN"),
     ispTableUrl: env.ISP_TABLE_URL || undefined,

@@ -180,4 +180,16 @@ describe("readConfig CN vars", () => {
     expect(parsed.cnUpstreams).toEqual(["https://dns.alidns.com/dns-query"]);
     expect(parsed.cnDomains).toEqual([".huawei.com"]);
   });
+
+  it("accepts paths joined by | with budgets, and plain http only to a private address", () => {
+    const parsed = readConfig({
+      ECS_UPSTREAMS: [
+        "https://1.12.12.12/dns-query#qps=6|http://10.0.0.2:8053/dns-query#qps=6",
+        "https://a.example/dns-query|http://public.example/dns-query",
+        "https://b.example/dns-query#qps=0",
+        "https://dns.alidns.com/dns-query",
+      ].join(","),
+    } as unknown as Env);
+    expect(parsed.ecsUpstreams).toEqual(["https://1.12.12.12/dns-query#qps=6|http://10.0.0.2:8053/dns-query#qps=6", "https://dns.alidns.com/dns-query"]);
+  });
 });

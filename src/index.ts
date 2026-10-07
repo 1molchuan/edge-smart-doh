@@ -1,12 +1,13 @@
 import { normalizedCacheIdentity, readCache, rotateAddressRecords, writeCache, type CacheHit, type CacheIdentity } from "./cache";
 import { inAnyCidr } from "./cidr";
 import { readConfig, type AppConfig } from "./config";
-import { addEcs, domainMatches, ecsSourceIp, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
-import { encodeDnsPacket, makeServfail, parseDnsPacket, parseIpv4, patchTransactionId } from "./dns/packet";
+import { addEcs, clientEcsValue, domainMatches, ecsSourceIp, makeEcsValue, readClientEcs, removeEcs, shouldUseEcs } from "./dns/ecs";
+import { fitEdns } from "./dns/edns";
+import { encodeDnsPacket, makeBadvers, makeServfail, matchQuestionCase, parseDnsPacket, parseIpv4, patchTransactionId } from "./dns/packet";
 import { DnsType, type DnsPacket } from "./dns/types";
 import { chromiumEchVerdict, describeAnswers, dnsTypeName, selfCheckStatus, setSelfCheck } from "./explain";
 import { h3Status, setH3Verdicts } from "./h3";
-import { isIspName, ispScopeOf, ispTableReady } from "./isp";
+import { isIspName, ispScopeOf, ispTableReady, loadIspTable, onOperatorNetwork } from "./isp";
 import { recordQuery, statsSnapshot } from "./metrics";
 import { applyResponseRules, ecsOverride, loadRules, shouldBlock, type RuleSet } from "./rules";
 import { parseRequestOptions, type RequestOptions } from "./request-options";
@@ -23,13 +24,15 @@ import { chineseSiteStatus, isDomesticSite } from "./cn-domains";
 const DNS_CONTENT_TYPE = "application/dns-message";
 const STRATEGIES = sortStrategies(PUBLIC_STRATEGIES);
 
-function dnsResponse(packet: Uint8Array, status = 200): Response {
+/** `query`, when given, is the client's wire query: its question spelling is restored in the answer. */
+function dnsResponse(packet: Uint8Array, query?: Uint8Array, status = 200): Response {
   let body = packet;
   try {
     body = rotateAddressRecords(packet);
   } catch {
     // A packet we cannot re-encode (unknown RDATA with compression) is served as-is.
   }
+  if (query) body = matchQuestionCase(body, query);
   return new Response(Uint8Array.from(body).buffer, {
     status,
     headers: {
@@ -96,9 +99,10 @@ function validateQuery(packet: DnsPacket): void {
   if (packet.questions.length !== 1) throw new Error("Exactly one DNS question is required");
 }
 
-function makeBlockedResponse(query: DnsPacket): Uint8Array {
+/** An answer-less response with `rcode`: 1 FORMERR, 3 NXDOMAIN. */
+function rcodeResponse(query: DnsPacket, rcode: number): Uint8Array {
   return encodeDnsPacket({
-    header: { ...query.header, flags: 0x8000 | (query.header.flags & 0x7910) | 0x0080 | 3 },
+    header: { ...query.header, flags: 0x8000 | (query.header.flags & 0x7910) | 0x0080 | rcode },
     questions: query.questions,
     answers: [],
     authorities: [],
@@ -192,7 +196,13 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
 /** ECS decision and cache key for one query. */
 function planQuery(query: DnsPacket, setup: DnsSetup): { upstreamQuery: DnsPacket; useEcs: boolean; useCn: boolean; ecsIdentity?: string; identity: CacheIdentity } {
   const { config, options, rules, ecsIp } = setup;
-  const ecs = ecsIp ? makeEcsValue(ecsIp, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined;
+  // A client that sent ECS with source prefix 0 asked that no subnet be passed on (RFC 7871 §7.1.2);
+  // one that sent a subnet gets that subnet used; otherwise the server picks it from the client address.
+  // (A malformed one never gets here: handleDns answers it FORMERR.)
+  const client = readClientEcs(query);
+  const ecs = client
+    ? clientEcsValue(client, config.ecsIpv4Prefix, config.ecsIpv6Prefix)
+    : ecsIp ? makeEcsValue(ecsIp, config.ecsIpv4Prefix, config.ecsIpv6Prefix) : undefined;
   // A domestic name goes to the direct CN resolvers when configured — no ECS: dialed from inside
   // China, they see the client's own operator by source IP, which is finer than any ECS /24.
   // Otherwise a rule decides first, and in rules mode the domestic lists add to ECS_DOMAINS.
@@ -234,6 +244,21 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   } catch (error) {
     return new Response(error instanceof Error ? error.message : "Malformed DNS packet", { status: 400 });
   }
+  // RFC 6891 §6.1.1: more than one OPT record is FORMERR (below); one with a version above 0, BADVERS.
+  const opts = query.additionals.filter((record) => record.type === DnsType.OPT);
+  if (opts.length === 1 && ((opts[0]!.ttl >>> 16) & 0xff) !== 0) return dnsResponse(makeBadvers(query), wire);
+  const client = readClientEcs(query);
+  // Every answer, cached or not, leaves with an OPT record made for this query (dns/edns.ts).
+  const reply = (packet: Uint8Array): Response => {
+    let body = packet;
+    try {
+      body = fitEdns(packet, query, client ?? undefined);
+    } catch {
+      // A packet we cannot re-encode is served as-is.
+    }
+    return dnsResponse(body, wire);
+  };
+  if (opts.length > 1 || client === null) return reply(rcodeResponse(query, 1));
 
   const setup = await prepareDns(request, env, runtime);
   if (setup instanceof Response) return setup;
@@ -242,12 +267,12 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   const sample = () => ({ name: question.name, type: dnsTypeName(question.type), latencyMs: Date.now() - started });
   if (shouldBlock(rules, query)) {
     recordQuery({ ...sample(), outcome: "blocked" });
-    return dnsResponse(makeBlockedResponse(query));
+    return reply(rcodeResponse(query, 3));
   }
   // Blocked before the cache: every other answer is the same with or without ?safe=1, so they share it.
   if (options.safe && safeBlocked(question.name, config)) {
     recordQuery({ ...sample(), outcome: "blocked" });
-    return dnsResponse(encodeDnsPacket(safeBlockedResponse(query)));
+    return reply(encodeDnsPacket(safeBlockedResponse(query)));
   }
 
   const { upstreamQuery, useEcs, useCn, identity } = planQuery(query, setup);
@@ -271,25 +296,25 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
     const outcome = cached.state === "fresh" ? "hit" : cached.state === "refresh" ? "prefetch" : "stale";
     recordQuery({ ...sample(), outcome });
     logQuery(config, query, outcome, undefined, Date.now() - started);
-    return dnsResponse(cached.packet);
+    return reply(cached.packet);
   }
 
   try {
     const resolved = await resolveAndStore();
     recordQuery({ ...sample(), outcome: "miss", upstream: upstreamLabel(resolved.upstream), strategy: resolved.plan.strategy, path: pathCategory(resolved.plan, useCn) });
     logQuery(config, query, "miss", resolved.upstream, Date.now() - started);
-    return dnsResponse(resolved.wire);
+    return reply(resolved.wire);
   } catch (error) {
     console.error(JSON.stringify({ event: "upstream_failure", message: errorMessage(error) }));
     if (cached) {
       // RFC 8767: an expired answer beats SERVFAIL when every upstream is unreachable.
       recordQuery({ ...sample(), outcome: "stale", error: errorMessage(error) });
       logQuery(config, query, "stale", undefined, Date.now() - started);
-      return dnsResponse(cached.packet);
+      return reply(cached.packet);
     }
     recordQuery({ ...sample(), outcome: "error", error: errorMessage(error), servfail: true });
     logQuery(config, query, "miss", undefined, Date.now() - started);
-    return dnsResponse(makeServfail(wire));
+    return reply(makeServfail(wire));
   }
 }
 
@@ -307,6 +332,24 @@ function pathCategory(plan: RoutePlan, useCn: boolean): "relay" | "ech" | "pool"
 }
 
 /**
+ * Whether an answer for a domestic name looks like the mainland view: it has no addresses, or at least
+ * one is on a mainland operator's network (or no operator table is loaded to tell). Some sites' name
+ * servers answer by the asking resolver's location and ignore ECS, and a public resolver queried from
+ * Hong Kong may look names up from there: CNKI then sends kns.cnki.net to oversea.cnki.net, its
+ * international site, whose logins are not the domestic site's (2026-10-07). AliDNS looks names up
+ * from Hong Kong, DNSPod from the mainland, so such an answer waits for another ECS upstream.
+ */
+function domesticView(answer: DnsPacket): boolean {
+  let addresses = 0;
+  for (const record of answer.answers) {
+    if (record.rdata.kind !== "a" && record.rdata.kind !== "aaaa") continue;
+    addresses += 1;
+    if (onOperatorNetwork(record.rdata.address) !== false) return true;
+  }
+  return addresses === 0;
+}
+
+/**
  * Asks upstream, then lets the strategies decide how the name is reached (plan.ts) and applies that
  * plan to the answer (render.ts). `notes`, when given, collects one line per decision for /explain.
  */async function resolveFresh(
@@ -321,13 +364,21 @@ function pathCategory(plan: RoutePlan, useCn: boolean): "relay" | "ech" | "pool"
   notes?: string[],
 ): Promise<{ wire: Uint8Array; upstream: string; plan: RoutePlan }> {
   const upstreamWire = encodeDnsPacket(upstreamQuery);
-  const result = await queryUpstreams(upstreamWire, config, { ecs: useEcs, cn: useCn });
+  if (useEcs) await loadIspTable(config, cache); // domesticView needs it
+  // A name whose servers answer by the resolver's location only takes the first ECS upstream's answer
+  // (configured to be one that looks names up from the mainland): its overseas view need not have
+  // an overseas address (CNKI's www goes through EdgeOne's mainland nodes, cnki.net to a Beijing server).
+  const resolverView = useEcs && domainMatches(query.questions[0]!.name, config.resolverViewDomains);
+  const acceptable = resolverView ? (_answer: DnsPacket, entry: number) => entry === 0 : domesticView;
+  const result = await queryUpstreams(upstreamWire, config, { ecs: useEcs, cn: useCn, ...(useEcs ? { acceptable } : {}) });
   const originalResponse = parseDnsPacket(result.packet);
   if (originalResponse.header.id !== upstreamQuery.header.id) throw new Error("Upstream transaction ID mismatch");
   if (notes) {
     if (useCn) notes.push("domestic name: resolved through the direct CN upstreams (no ECS — the resolver sees the client's operator by source IP)");
+    if (resolverView) notes.push("RESOLVER_VIEW_DOMAINS: only the first ECS upstream's answer is taken, over its budget if need be");
+    else if (useEcs && !domesticView(originalResponse)) notes.push("no address in the answer is on a mainland network, from any ECS upstream that answered (the overseas view, or a site hosted abroad)");
     const answers = describeAnswers(originalResponse);
-    notes.push(`upstream ${new URL(result.upstream).hostname}${useEcs ? " (with ECS)" : ""}: rcode ${originalResponse.header.flags & 0x0f}, ${answers.length > 0 ? answers.join("; ") : "no answers"}`);
+    notes.push(`upstream ${result.label}${useEcs ? " (with ECS)" : ""}: rcode ${originalResponse.header.flags & 0x0f}, ${answers.length > 0 ? answers.join("; ") : "no answers"}`);
   }
   const ruled = applyResponseRules(rules, query, originalResponse);
   if (ruled !== originalResponse) notes?.push("response rules changed the answer");

@@ -28,6 +28,8 @@ const MAX_ISP_POOLS = 16;
 export const HUB_NATIONAL_SCOPE = "isp:national";
 /** Addresses served from a learned pool; probers may report more candidates than this. */
 export const LEARNED_POOL_SIZE = 6;
+/** Fewest addresses of a family a pool layer is served with on its own; a thinner layer is topped up. */
+const MIN_SERVED_POOL = 2;
 /**
  * Below this many IPs a majority of probers vouch for, fall back to interleaving the probers' lists.
  * Kept low: two IPs most lines vouch for beat six that mix in IPs only one line tolerates.
@@ -401,9 +403,10 @@ async function mergedDomainPool(domains: string[], config: AppConfig, cache: Cac
  * prefix pool → its operator's pool (`ispScope`, from the probe hub) → the hub's nationwide pool →
  * the nationwide learned pool of the maintainer's probers (all four only when the request relies on
  * the server default) → ?cf= / default domains. Each
- * address family is filled on its own, narrowest pool first and topped up from the wider ones to
- * LEARNED_POOL_SIZE, so a narrower pool with only IPv4 does not hide the wider pool's IPv6 and a
- * short narrow pool is not served alone. `scope` names the narrower pools that contributed, so
+ * address family is filled on its own from the narrowest pool that has at least MIN_SERVED_POOL
+ * addresses of it (a thinner one is topped up from the wider ones, to at most LEARNED_POOL_SIZE), so
+ * a narrower pool with only IPv4 does not hide the wider pool's IPv6 and a single address is never
+ * served alone. `scope` names the narrower pools that contributed, so
  * callers can keep their answers out of the shared cache entry.
  * Answer ordering is rotated at serve time (see rotateAddressRecords), not here, so cached
  * responses spread clients across the pool too.
@@ -433,9 +436,10 @@ export async function preferredPool(
   }
   const used = new Set<string>();
   if (layers.length > 0) {
-    // Narrowest layer first, topped up from the wider ones: a two-IP operator pool must not replace a
-    // six-IP nationwide pool outright (2026-09-26: a lapsed prober left the nationwide pool with three
-    // IPs, one of them slow, and every client got that thin list).
+    // Narrowest layer first, served alone once it has MIN_SERVED_POOL addresses; a thinner one is
+    // topped up from the wider ones. The hub publishes only each line's fast tier, so filling a short
+    // operator pool up to six with nationwide addresses measured on other lines undid that cut
+    // (2026-10-06: mobile's three fast IPs came with three that only telecom and cloud had measured).
     const fill = (family: "ipv4" | "ipv6"): string[] | undefined => {
       const out: string[] = [];
       for (const layer of layers) {
@@ -443,7 +447,7 @@ export async function preferredPool(
         if (fresh.length === 0) continue;
         out.push(...fresh);
         if (layer.scope) used.add(layer.scope);
-        if (out.length >= LEARNED_POOL_SIZE) break;
+        if (out.length >= MIN_SERVED_POOL) break;
       }
       return out.length > 0 ? out : undefined;
     };

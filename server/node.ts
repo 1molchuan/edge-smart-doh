@@ -7,10 +7,11 @@ import { readConfig } from "../src/config";
 import { sanitizeRelayOverride, setRelayOverride, setRelayPersistence } from "../src/relay";
 
 const DEFAULTS = {
-  UPSTREAMS: "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query",
+  UPSTREAMS: "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://unfiltered.adguard-dns.com/dns-query",
   ECS_UPSTREAMS: "",
   UPSTREAM_TIMEOUT_MS: "2500",
   UPSTREAM_HEDGE_MS: "100",
+  ECS_UPSTREAM_HEDGE_MS: "",
   CACHE_MIN_TTL: "30",
   CACHE_MAX_TTL: "3600",
   NEGATIVE_CACHE_MAX_TTL: "300",
@@ -24,12 +25,14 @@ const DEFAULTS = {
   ECS_DOMAIN_LIST_URLS: "",
   CN_UPSTREAMS: "",
   CN_DOMAINS: "",
+  RESOLVER_VIEW_DOMAINS: "",
   EDGEONE_CLIENT_IP_HEADER: "X-EdgeOne-Client-IP-Configure-Me",
   CF_REWRITE_ENABLED: "false",
   CF_PREFERRED_DOMAIN: "",
   CF_PREFERRED_IPV4: "",
   CF_PREFERRED_IPV6: "",
   CF_DROP_AAAA: "false",
+  CF_REWRITE_EXCLUDE: "",
   ADMIN_TOKEN: "",
   HUB_TOKEN: "",
   ISP_TABLE_URL: "",
