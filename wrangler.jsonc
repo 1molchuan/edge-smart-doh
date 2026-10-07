@@ -29,6 +29,7 @@
     "ECS_DOMAIN_LIST_URLS": "",
     "CN_UPSTREAMS": "",
     "CN_DOMAINS": "",
+    "RESOLVER_VIEW_DOMAINS": "",
     "EDGEONE_CLIENT_IP_HEADER": "X-EdgeOne-Client-IP-Configure-Me",
     "CF_REWRITE_ENABLED": "false",
     "CF_PREFERRED_DOMAIN": "",

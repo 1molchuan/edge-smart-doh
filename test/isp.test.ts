@@ -322,3 +322,71 @@ describe("ECS for clients outside every operator (ECS_FALLBACK_SUBNET)", () => {
     expect(await ecsSent("47.243.223.74", undefined)).toBe("47.243.223");
   });
 });
+
+// 2026-10-07: CNKI's name servers answer by the asking resolver's location and ignore ECS. AliDNS looks
+// names up from Hong Kong and got kns.cnki.net -> oversea.cnki.net, the international site, whose
+// logins are not the domestic site's; DNSPod looks up from the mainland and gets the real one.
+describe("a domestic name answered with no mainland address", () => {
+  async function served(byUpstream: Record<string, string>, ecsUpstreams: string, extra: Record<string, string> = {}): Promise<{ address: string; asked: string[] }> {
+    const asked: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("isp-table")) return new Response(TABLE);
+      const host = new URL(String(input)).hostname;
+      asked.push(host);
+      const query = parseDnsPacket(new Uint8Array(init!.body as ArrayBuffer));
+      const reply = encodeDnsPacket({
+        header: { id: query.header.id, flags: 0x8180, qdcount: 1, ancount: 1, nscount: 0, arcount: 0 },
+        questions: query.questions,
+        answers: [{ name: query.questions[0]!.name, type: DnsType.A, class: 1, ttl: 300, rdata: { kind: "a", address: byUpstream[host]! } }],
+        authorities: [], additionals: [],
+      });
+      return new Response(Uint8Array.from(reply).buffer, { headers: { "Content-Type": "application/dns-message" } });
+    }));
+    const cache = new MemoryCache();
+    vi.stubGlobal("caches", { open: async () => cache });
+    const env = {
+      UPSTREAMS: "https://up.example/dns-query",
+      ECS_UPSTREAMS: ecsUpstreams,
+      ECS_UPSTREAM_HEDGE_MS: "0",
+      ECS_DOMAINS: ".cnki.net",
+      ISP_TABLE_URL: "http://127.0.0.1:8790/internal/isp-table",
+      ...extra,
+    } as unknown as Env;
+    const body = encodeDnsPacket({ header: { id: 1, flags: 0x0100, qdcount: 1, ancount: 0, nscount: 0, arcount: 0 }, questions: [{ name: "kns.cnki.net", type: DnsType.A, class: 1 }], answers: [], authorities: [], additionals: [] });
+    const res = await handleRequest(new Request("https://doh.example/dns-query", {
+      method: "POST", headers: { Accept: "application/dns-message", "Content-Type": "application/dns-message" }, body: Uint8Array.from(body).buffer,
+    }), env, { waitUntil: () => undefined }, { clientIp: () => "58.247.1.1", probe: () => ({}) });
+    const answer = parseDnsPacket(new Uint8Array(await res.arrayBuffer())).answers[0]!;
+    return { address: answer.rdata.kind === "a" ? answer.rdata.address : "", asked };
+  }
+
+  it("waits for an ECS upstream that gives the mainland view", async () => {
+    const { address, asked } = await served({ "hk.example": "203.0.113.126", "cn.example": "58.247.9.9" }, "https://hk.example/dns-query,https://cn.example/dns-query");
+    expect(address).toBe("58.247.9.9");
+    expect(asked).toEqual(["hk.example", "cn.example"]);
+  });
+
+  it("stops at the first answer with a mainland address", async () => {
+    const { address, asked } = await served({ "cn.example": "58.247.9.9", "hk.example": "203.0.113.126" }, "https://cn.example/dns-query,https://hk.example/dns-query");
+    expect(address).toBe("58.247.9.9");
+    expect(asked).toEqual(["cn.example"]);
+  });
+
+  // CNKI's overseas view of cnki.net is a Beijing server: no address check can tell it apart.
+  it("takes only the first upstream's answer for RESOLVER_VIEW_DOMAINS, over its budget if need be", async () => {
+    const upstreams = "https://cn-view.example/dns-query#qps=1,https://hk-view.example/dns-query";
+    const answers = { "cn-view.example": "58.247.9.9", "hk-view.example": "58.247.9.33" };
+    const view = { RESOLVER_VIEW_DOMAINS: ".cnki.net" };
+    expect((await served(answers, upstreams, view)).address).toBe("58.247.9.9"); // spends the budget
+    const { address, asked } = await served(answers, upstreams, view);
+    expect(asked).toEqual(["hk-view.example", "cn-view.example"]);
+    expect(address).toBe("58.247.9.9");
+    // Without the setting, the second upstream's answer, with a mainland address, is taken.
+    expect((await served(answers, upstreams)).address).toBe("58.247.9.33");
+  });
+
+  it("serves a site that really is abroad, as the first upstream gave it", async () => {
+    const { address } = await served({ "cn.example": "203.0.113.7", "hk.example": "203.0.113.8" }, "https://cn.example/dns-query,https://hk.example/dns-query");
+    expect(address).toBe("203.0.113.7");
+  });
+});

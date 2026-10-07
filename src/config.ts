@@ -38,6 +38,12 @@ export interface AppConfig {
   /** Extra domestic domain suffixes on top of ECS_DOMAINS and the ECS_DOMAIN_LIST_URLS lists. */
   cnDomains: string[];
   /**
+   * Domains on the ECS path whose name servers answer by the asking resolver's location and ignore
+   * ECS: only the first ECS upstream's answer is taken, which must be a resolver that looks names up
+   * from the mainland (DNSPod does even when asked from Hong Kong; AliDNS does not).
+   */
+  resolverViewDomains: string[];
+  /**
    * ECS subnet for clients outside every mainland operator network (needs ISP_TABLE_URL). Their DoH
    * query arrived through a proxy, typically in Hong Kong; with their own address a Chinese site
    * answers with its overseas CDN, which the proxy's GeoIP rules then send abroad. Unset = their own.
@@ -146,6 +152,7 @@ export function readConfig(env: Env): AppConfig {
     ecsIpv6Prefix: integer(env.ECS_IPV6_PREFIX, 48, 0, 128),
     cnUpstreams: list(env.CN_UPSTREAMS).filter(usable),
     cnDomains: list(env.CN_DOMAINS).map((item) => item.toLowerCase()),
+    resolverViewDomains: list(env.RESOLVER_VIEW_DOMAINS).map((item) => item.toLowerCase()),
     // A "/24" suffix is accepted and ignored: the prefix comes from ECS_IPV4_PREFIX/ECS_IPV6_PREFIX.
     ecsFallbackSubnet: (env.ECS_FALLBACK_SUBNET ?? "").split("/", 1)[0] || undefined,
     ecsDomainListUrls: list(env.ECS_DOMAIN_LIST_URLS).filter((item) => item.startsWith("https://") || item.startsWith("http://127.0.0.1")),

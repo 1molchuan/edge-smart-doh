@@ -1,5 +1,5 @@
 import { parseDnsPacket } from "./dns/packet";
-import { DnsType } from "./dns/types";
+import { DnsType, type DnsPacket } from "./dns/types";
 import type { AppConfig } from "./config";
 import { parseUpstreamEntry, type UpstreamPath } from "./upstream-entry";
 
@@ -39,8 +39,12 @@ function stateOf(path: UpstreamPath): PathState {
   return state;
 }
 
-/** The first path of an entry within its budget and not cooling down, its token taken; or none. */
-function pickPath(entry: string): { path: UpstreamPath; paths: UpstreamPath[] } | undefined {
+/**
+ * The first path of an entry within its budget and not cooling down, its token taken; or none.
+ * `overBudget` also takes a path whose budget is spent (never one cooling down): the query is then
+ * charged ahead, at most one second's worth, so the budget still holds on average.
+ */
+function pickPath(entry: string, overBudget = false): { path: UpstreamPath; paths: UpstreamPath[] } | undefined {
   let paths = parsedEntries.get(entry);
   if (!paths) {
     // An entry readConfig would have dropped is tried as-is, so it fails like any other upstream.
@@ -54,7 +58,7 @@ function pickPath(entry: string): { path: UpstreamPath; paths: UpstreamPath[] } 
     if (state.openUntil > now) continue;
     state.tokens = Math.min(path.qps, state.tokens + ((now - state.refilledAt) / 1000) * path.qps);
     state.refilledAt = now;
-    if (state.tokens < 1) continue;
+    if (state.tokens < (overBudget ? 1 - path.qps : 1)) continue;
     state.tokens -= 1;
     return { path, paths };
   }
@@ -83,6 +87,11 @@ export interface UpstreamOptions {
   ecs?: boolean;
   /** Use the domestic-resolver list (CN_UPSTREAMS) instead of the default one. */
   cn?: boolean;
+  /**
+   * Whether an answer is good enough to stop at. One that is not is kept while the remaining entries
+   * are asked, then those skipped over their budget (see pickPath); it is served if none does better.
+   */
+  acceptable?: (answer: DnsPacket, entry: number) => boolean;
 }
 
 /** Hostname for diagnostics; a malformed URL must not turn a failure path into a throw. */
@@ -94,7 +103,7 @@ function upstreamLabel(upstream: string): string {
   }
 }
 
-async function queryOne(upstream: string, query: Uint8Array, config: AppConfig, signal: AbortSignal): Promise<Uint8Array> {
+async function queryOne(upstream: string, query: Uint8Array, config: AppConfig, signal: AbortSignal): Promise<{ packet: Uint8Array; parsed: DnsPacket }> {
   const response = await fetch(upstream, {
     method: "POST",
     headers: { Accept: "application/dns-message", "Content-Type": "application/dns-message" },
@@ -123,14 +132,15 @@ async function queryOne(upstream: string, query: Uint8Array, config: AppConfig, 
   // Truncated replies are deliberately failures: the next upstream usually answers in full, and half
   // an A/AAAA set must never reach the address-derived caches in rewrite.ts.
   if ((flags & 0x0200) !== 0) throw new Error("truncated response");
-  return packet;
+  return { packet, parsed };
 }
 
 /**
  * Hedged upstream query: the next upstream is started either when the previous one fails
  * or after `upstreamHedgeMs` (`ecsUpstreamHedgeMs` for the ECS group) without an answer,
  * whichever comes first. The first valid response wins and every other in-flight attempt is
- * aborted. With hedging disabled this degrades to plain sequential fallback.
+ * aborted. With hedging disabled this degrades to plain sequential fallback. A response that
+ * `options.acceptable` rejects does not win: see UpstreamOptions.
  */
 export function queryUpstreams(query: Uint8Array, config: AppConfig, options: UpstreamOptions = {}): Promise<UpstreamResult> {
   const cn = options.cn === true && config.cnUpstreams.length > 0;
@@ -145,25 +155,48 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
     let next = 0;
     let pending = 0;
     let settled = false;
+    // Entries skipped over budget or cooling down, and the earliest entry's unacceptable answer.
+    const skipped: number[] = [];
+    let kept: { result: UpstreamResult; index: number } | undefined;
+    let retried = false;
 
     const finish = (result?: UpstreamResult) => {
       if (settled) return;
       settled = true;
       for (const timer of timers) clearTimeout(timer);
       for (const controller of controllers) controller.abort("superseded");
+      result ??= kept?.result;
       if (result) resolve(result);
       else reject(new Error(`All upstreams failed (${errors.join("; ")})`));
     };
 
+    // Nothing in flight and no entry left: with only an unacceptable answer, give the entries skipped
+    // over their budget one more try before serving it.
+    const exhausted = () => {
+      if (kept && !retried && skipped.length > 0) {
+        retried = true;
+        for (const index of skipped) attempt(index, true);
+        if (pending > 0) return;
+      }
+      finish();
+    };
+
     const launch = (): void => {
       if (settled || next >= upstreams.length) return;
-      const entry = upstreams[next++]!;
-      const picked = pickPath(entry);
+      attempt(next++, false);
+    };
+
+    const attempt = (index: number, overBudget: boolean): void => {
+      const entry = upstreams[index]!;
+      const picked = pickPath(entry, overBudget);
       if (!picked) {
         // Every path over budget or cooling down: on to the next entry at once.
-        errors.push(`${upstreamLabel(entry.split("|", 1)[0]!.split("#", 1)[0]!)}: over budget or cooling down`);
-        if (next < upstreams.length) launch();
-        else if (pending === 0) finish();
+        if (!overBudget) {
+          skipped.push(index);
+          errors.push(`${upstreamLabel(entry.split("|", 1)[0]!.split("#", 1)[0]!)}: over budget or cooling down`);
+          if (next < upstreams.length) launch();
+          else if (pending === 0) exhausted();
+        }
         return;
       }
       const { path, paths } = picked;
@@ -174,17 +207,26 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
       pending += 1;
       const timeout = setTimeout(() => controller.abort("upstream timeout"), config.upstreamTimeoutMs);
       timers.push(timeout);
-      if (hedgeMs > 0 && next < upstreams.length) {
+      if (hedgeMs > 0 && next < upstreams.length && !overBudget) {
         timers.push(setTimeout(launch, hedgeMs));
       }
+      const settle = () => {
+        clearTimeout(timeout);
+        pending -= 1;
+        if (next < upstreams.length) launch();
+        else if (pending === 0) exhausted();
+      };
       queryOne(upstream, query, config, controller.signal)
-        .then((packet) => {
+        .then(({ packet, parsed }) => {
+          if (settled) return;
           recordOutcome(path, true);
-          finish({ packet, upstream, label });
+          const result = { packet, upstream, label };
+          if (!options.acceptable || options.acceptable(parsed, index)) return finish(result);
+          errors.push(`${label}: answer not acceptable`);
+          if (!kept || index < kept.index) kept = { result, index };
+          settle();
         })
         .catch((error: unknown) => {
-          clearTimeout(timeout);
-          pending -= 1;
           if (settled) return;
           recordOutcome(path, false);
           // The abort reason ("upstream timeout") is the useful diagnostic: a fetch rejected by an
@@ -193,8 +235,7 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
           const reason: unknown = controller.signal.reason;
           const detail = typeof reason === "string" && reason.length > 0 ? reason : error instanceof Error ? error.message : String(error);
           errors.push(`${label}: ${detail}`);
-          if (next < upstreams.length) launch();
-          else if (pending === 0) finish();
+          settle();
         });
     };
 

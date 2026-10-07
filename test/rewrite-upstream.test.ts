@@ -293,6 +293,43 @@ describe("hedged upstream", () => {
     vi.restoreAllMocks();
   });
 
+  describe("an unacceptable answer", () => {
+    const answering = (byHost: Record<string, string>, asked: string[] = []) => vi.fn((input: RequestInfo | URL) => {
+      asked.push(new URL(String(input)).hostname);
+      const address = byHost[new URL(String(input)).hostname]!;
+      return Promise.resolve(new Response(Uint8Array.from(encodeDnsPacket(response(address))).buffer, { headers: { "Content-Type": "application/dns-message" } }));
+    });
+    const mainland = (answer: DnsPacket) => answer.answers.some((record) => record.rdata.kind === "a" && record.rdata.address.startsWith("10."));
+    const address = (result: { packet: Uint8Array }) => (parseDnsPacket(result.packet).answers[0]!.rdata as { address: string }).address;
+
+    it("waits for the next upstream's answer", async () => {
+      vi.stubGlobal("fetch", answering({ "primary.example": "192.0.2.1", "secondary.example": "10.0.0.1" }));
+      const result = await queryUpstreams(new Uint8Array(12), config({ ecsUpstreamHedgeMs: 0 }), { ecs: true, acceptable: mainland });
+      expect(address(result)).toBe("10.0.0.1");
+    });
+
+    it("is served when no upstream does better, the earliest entry's first", async () => {
+      vi.stubGlobal("fetch", answering({ "primary.example": "192.0.2.1", "secondary.example": "192.0.2.2" }));
+      const result = await queryUpstreams(new Uint8Array(12), config({ ecsUpstreamHedgeMs: 0 }), { ecs: true, acceptable: mainland });
+      expect(address(result)).toBe("192.0.2.1");
+    });
+
+    it("gets an upstream skipped over its budget asked anyway", async () => {
+      const asked: string[] = [];
+      vi.stubGlobal("fetch", answering({ "spent.example": "10.0.0.7", "secondary.example": "192.0.2.2" }, asked));
+      const cfg = config({ ecsUpstreams: ["https://spent.example/dns-query#qps=1", "https://secondary.example/dns-query"], ecsUpstreamHedgeMs: 0 });
+      await queryUpstreams(new Uint8Array(12), cfg, { ecs: true }); // spends the budget
+      asked.length = 0;
+      const result = await queryUpstreams(new Uint8Array(12), cfg, { ecs: true, acceptable: mainland });
+      expect(asked).toEqual(["secondary.example", "spent.example"]);
+      expect(address(result)).toBe("10.0.0.7");
+      // Charged ahead by at most a second's worth: a third query in the same second is not sent.
+      asked.length = 0;
+      expect(address(await queryUpstreams(new Uint8Array(12), cfg, { ecs: true, acceptable: mainland }))).toBe("192.0.2.2");
+      expect(asked).toEqual(["secondary.example"]);
+    });
+  });
+
   it("takes a late primary success if the hedged secondary fails first", async () => {
     let releasePrimary: (() => void) | undefined;
     const fetchMock = vi.fn((input: RequestInfo | URL) => {

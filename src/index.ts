@@ -1,13 +1,13 @@
 import { normalizedCacheIdentity, readCache, rotateAddressRecords, writeCache, type CacheHit, type CacheIdentity } from "./cache";
 import { inAnyCidr } from "./cidr";
 import { readConfig, type AppConfig } from "./config";
-import { addEcs, clientEcsValue, ecsSourceIp, makeEcsValue, readClientEcs, removeEcs, shouldUseEcs } from "./dns/ecs";
+import { addEcs, clientEcsValue, domainMatches, ecsSourceIp, makeEcsValue, readClientEcs, removeEcs, shouldUseEcs } from "./dns/ecs";
 import { fitEdns } from "./dns/edns";
 import { encodeDnsPacket, makeBadvers, makeServfail, matchQuestionCase, parseDnsPacket, parseIpv4, patchTransactionId } from "./dns/packet";
 import { DnsType, type DnsPacket } from "./dns/types";
 import { chromiumEchVerdict, describeAnswers, dnsTypeName, selfCheckStatus, setSelfCheck } from "./explain";
 import { h3Status, setH3Verdicts } from "./h3";
-import { isIspName, ispScopeOf, ispTableReady } from "./isp";
+import { isIspName, ispScopeOf, ispTableReady, loadIspTable, onOperatorNetwork } from "./isp";
 import { applyResponseRules, ecsOverride, loadRules, shouldBlock, type RuleSet } from "./rules";
 import { parseRequestOptions, type RequestOptions } from "./request-options";
 import { clearMetaEch, githubPoolStatus, githubReports, ispPoolStatus, learnedPoolStatus, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolStatus, siteReports } from "./preferred";
@@ -305,6 +305,24 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
 }
 
 /**
+ * Whether an answer for a domestic name looks like the mainland view: it has no addresses, or at least
+ * one is on a mainland operator's network (or no operator table is loaded to tell). Some sites' name
+ * servers answer by the asking resolver's location and ignore ECS, and a public resolver queried from
+ * Hong Kong may look names up from there: CNKI then sends kns.cnki.net to oversea.cnki.net, its
+ * international site, whose logins are not the domestic site's (2026-10-07). AliDNS looks names up
+ * from Hong Kong, DNSPod from the mainland, so such an answer waits for another ECS upstream.
+ */
+function domesticView(answer: DnsPacket): boolean {
+  let addresses = 0;
+  for (const record of answer.answers) {
+    if (record.rdata.kind !== "a" && record.rdata.kind !== "aaaa") continue;
+    addresses += 1;
+    if (onOperatorNetwork(record.rdata.address) !== false) return true;
+  }
+  return addresses === 0;
+}
+
+/**
  * Asks upstream, then lets the strategies decide how the name is reached (plan.ts) and applies that
  * plan to the answer (render.ts). `notes`, when given, collects one line per decision for /explain.
  */
@@ -320,11 +338,19 @@ async function resolveFresh(
   notes?: string[],
 ): Promise<{ wire: Uint8Array; upstream: string; plan: RoutePlan }> {
   const upstreamWire = encodeDnsPacket(upstreamQuery);
-  const result = await queryUpstreams(upstreamWire, config, { ecs: useEcs, cn: useCn });
+  if (useEcs) await loadIspTable(config, cache); // domesticView needs it
+  // A name whose servers answer by the resolver's location only takes the first ECS upstream's answer
+  // (configured to be one that looks names up from the mainland): its overseas view need not have
+  // an overseas address (CNKI's www goes through EdgeOne's mainland nodes, cnki.net to a Beijing server).
+  const resolverView = useEcs && domainMatches(query.questions[0]!.name, config.resolverViewDomains);
+  const acceptable = resolverView ? (_answer: DnsPacket, entry: number) => entry === 0 : domesticView;
+  const result = await queryUpstreams(upstreamWire, config, { ecs: useEcs, cn: useCn, ...(useEcs ? { acceptable } : {}) });
   const originalResponse = parseDnsPacket(result.packet);
   if (originalResponse.header.id !== upstreamQuery.header.id) throw new Error("Upstream transaction ID mismatch");
   if (notes) {
     if (useCn) notes.push("domestic name: resolved through the direct CN upstreams (no ECS — the resolver sees the client's operator by source IP)");
+    if (resolverView) notes.push("RESOLVER_VIEW_DOMAINS: only the first ECS upstream's answer is taken, over its budget if need be");
+    else if (useEcs && !domesticView(originalResponse)) notes.push("no address in the answer is on a mainland network, from any ECS upstream that answered (the overseas view, or a site hosted abroad)");
     const answers = describeAnswers(originalResponse);
     notes.push(`upstream ${result.label}${useEcs ? " (with ECS)" : ""}: rcode ${originalResponse.header.flags & 0x0f}, ${answers.length > 0 ? answers.join("; ") : "no answers"}`);
   }

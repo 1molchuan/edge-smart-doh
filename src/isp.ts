@@ -157,9 +157,17 @@ async function refresh(url: string, cache: Cache): Promise<void> {
  */
 export async function ispScopeOf(ip: string | undefined, config: AppConfig, cache: Cache): Promise<string | undefined> {
   if (!ip || !config.ispTableUrl) return undefined;
+  await loadIspTable(config, cache);
+  const name = current ? lookupIsp(current, ip) : undefined;
+  return name ? `isp:${name}` : undefined;
+}
+
+/** Loads the table when it is due; waits only for the first load (a stale table refreshes in the background). */
+export async function loadIspTable(config: AppConfig, cache: Cache): Promise<void> {
+  if (!config.ispTableUrl) return;
   const now = Date.now();
   if (!current || now - loadedAt >= REFRESH_MS) {
-    if (!current && now - failedAt < RETRY_MS) return undefined;
+    if (!current && now - failedAt < RETRY_MS) return;
     inflight ??= refresh(config.ispTableUrl, cache)
       .catch((error: unknown) => {
         failedAt = Date.now();
@@ -170,13 +178,16 @@ export async function ispScopeOf(ip: string | undefined, config: AppConfig, cach
       });
     if (!current) await inflight;
   }
-  const name = current ? lookupIsp(current, ip) : undefined;
-  return name ? `isp:${name}` : undefined;
 }
 
 /** Whether a table is loaded: an address missing from it is then known to be outside every operator. */
 export function ispTableReady(): boolean {
   return current !== undefined;
+}
+
+/** Whether an address is on a mainland operator's network; undefined while no table is loaded. */
+export function onOperatorNetwork(ip: string): boolean | undefined {
+  return current ? lookupIsp(current, ip) !== undefined : undefined;
 }
 
 /** Test hook: forget the loaded table. */
