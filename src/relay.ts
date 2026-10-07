@@ -56,6 +56,8 @@ export interface RelayOverride {
 
 let override: RelayOverride | null = null;
 let persistOverride: ((value: RelayOverride | null) => void) | undefined;
+/** One loud warning per process: an override applied with no persistence configured is lost on restart. */
+let warnedVolatileOverride = false;
 
 export interface EffectiveRelayConfig {
   mode: RelayMode;
@@ -104,7 +106,13 @@ export function setRelayOverride(patch: RelayOverride | null, config: AppConfig)
   if (changed) {
     state.version += 1;
     state.configVersion += 1;
-    persistOverride?.(override);
+    if (persistOverride) persistOverride(override);
+    else if (!warnedVolatileOverride) {
+      // A restart silently forgets everything the console changed — exactly how a whole pool's
+      // configuration "disappeared" after a redeploy on 2026-10-07. Say it when it happens, not after.
+      warnedVolatileOverride = true;
+      console.warn(JSON.stringify({ event: "relay_override_volatile", message: "relay override applied but RELAY_CONFIG_PATH is unset: it lives in memory only and the next restart forgets it" }));
+    }
   }
   return changed;
 }

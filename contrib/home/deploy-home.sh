@@ -289,6 +289,11 @@ getent passwd edge-smart-doh >/dev/null 2>&1 || useradd --system --no-create-hom
 install -D -m 0644 "$PROJECT_DIR/dist/node.mjs" /opt/edge-smart-doh/node.mjs
 
 [[ -f "$ENV_FILE" ]] || install -D -m 0600 "$PROJECT_DIR/deploy/edge-smart-doh.env.example" "$ENV_FILE"
+# 控制台运行时覆盖（档位/名单）的持久化文件，重启才不丢。无条件补齐、不依赖 relay 是否
+# 安装：这行曾藏在 3c 里，relay 未启用时 3c 整体跳过 → env 缺键 → 控制台改动全部沦为
+# 内存态，一次重启即丢（2026-10-07 实录：deploy 后"配置全没了"）。目录由单元的
+# StateDirectory=edge-smart-doh 负责创建和属主，这里只补 env 键。
+env_has_value RELAY_CONFIG_PATH || set_env_value RELAY_CONFIG_PATH /var/lib/edge-smart-doh/relay-config.json
 # 下面会改 env，先备份。备份落在仓库外的 $BACKUP_DIR（0700）——env 副本含 ADMIN_TOKEN，
 # 绝不能写进本仓库（仓库挂着 origin/fork 两个 GitHub remote）
 ENV_BAK="$(backup_file "$ENV_FILE")" || die "备份 $ENV_FILE 失败"
@@ -562,8 +567,6 @@ EOF
     # 留空绝不覆盖——用户可能已在 env 或控制台配好 Google 族名单，重跑部署不该清掉
     env_has_value RELAY_FORCED_MODE || set_env_value RELAY_FORCED_MODE off
     [[ -n "$RELAY_FORCED_DOMAINS_CFG" ]] && set_env_value RELAY_FORCED_DOMAINS "$RELAY_FORCED_DOMAINS_CFG"
-    # 控制台（8788）改档位/名单走 POST /admin/relay-config 的运行时覆盖；落在这里重启才不丢
-    env_has_value RELAY_CONFIG_PATH || set_env_value RELAY_CONFIG_PATH /var/lib/edge-smart-doh/relay-config.json
     ok "主服务 env：RELAY_MODE=$(sed -n 's/^RELAY_MODE=//p' "$ENV_FILE") RELAY_FORCED_MODE=$(sed -n 's/^RELAY_FORCED_MODE=//p' "$ENV_FILE") RELAY_IP=$RELAY_IP_CFG"
 
     # --- 3c-3 relay 守护进程（独立最小 env，不读主 env 的解析配置）---
