@@ -45,7 +45,9 @@ SETUP_FIREWALL=0                     # 1 = 用 nftables 整体替换 /etc/nftabl
                                      #     SSH/mosh/DoH。NAS 或跑着其他服务的机器上会挡掉它们，确认后再开
 RELAY_ENABLED=0                      # 1 = 安装 SNI 中转（contrib/home/relay/DESIGN.md）：名单域名的 DNS
                                      #     答案指向第二内网 IP，本机按 SNI 经代理转发 TCP（TLS 端到端），
-                                     #     auto 档在直连质量差时自动接管；0 = 完全不装
+                                     #     auto 档在直连质量差时自动接管；0 = 新机器不主动安装。
+                                     #     注意：只要机器上已装了 relay 守护，0 也会被自动检测并按 1 维护
+                                     #     （更新 relay.mjs/relay.env 并重启守护），杜绝主服务与守护新旧错位
 RELAY_IP_CFG=""                      # 中转监听的第二内网 IP（如 192.168.1.250）；留空=首跑询问并持久化
 RELAY_DOMAINS_CFG=""                 # 走中转的域名（支持 *. 通配）；留空=GitHub 族默认四条通配
 RELAY_FORCED_DOMAINS_CFG=""          # 强制池域名（只有 off/always 两档、无 auto——这些域名没有实测池
@@ -462,8 +464,22 @@ fi
 # ---- 3c：SNI 中转（可选，RELAY_ENABLED=1；见 contrib/home/relay/DESIGN.md）----
 # 给网卡加第二个内网 IP，DNS 把名单域名答成它，relay 进程按 SNI 把 TCP 经代理转出去。
 # 必须放在服务 restart 之前：RELAY_* env 要随这次重启一起生效。
+# 已部署的守护无条件纳入维护：RELAY_ENABLED=0 只表示"新机器不主动安装"，绝不表示
+# "已装的东西从此不再更新"——主服务与守护新旧错位时，DNS 把域名答成中转 IP 而旧守护拒连，
+# 表现为该池域名全断（2026-10-07 实录：google 打不开、GitHub 无恙）。检测到单元即视为 1。
+if [[ "$RELAY_ENABLED" != "1" && -f /etc/systemd/system/edge-smart-doh-relay.service ]]; then
+  RELAY_ENABLED=1
+  if [[ -z "${RELAY_IP_CFG:-}" ]]; then
+    DETECTED_IP="$(sed -n 's/^RELAY_LISTEN_IP=//p' /etc/edge-smart-doh/relay.env 2>/dev/null | head -1)"
+    if [[ -n "$DETECTED_IP" ]]; then
+      RELAY_IP_CFG="$DETECTED_IP"
+      save_conf RELAY_IP_CFG "$RELAY_IP_CFG"
+    fi
+  fi
+  log "步骤 3c：检测到已安装的 edge-smart-doh-relay，按 RELAY_ENABLED=1 维护（更新 relay.mjs/relay.env 并重启守护）"
+fi
 if [[ "$RELAY_ENABLED" != "1" ]]; then
-  log "步骤 3c：SNI 中转（跳过：RELAY_ENABLED=0）"
+  log "步骤 3c：SNI 中转（跳过：RELAY_ENABLED=0 且未检测到已安装的守护）"
 elif [[ -z "$PROXY_ADDR" ]]; then
   warn "中转需要出境代理（PROXY_ADDR），本次跳过"
 else
