@@ -3,7 +3,7 @@ import { DnsType } from "./dns/types";
 import { alpnFor, h3CacheTag } from "./h3";
 import type { PlanContext, RequestContext, Strategy } from "./plan";
 import { githubPoolFor, metaEchCacheTag, metaEchOverride, sitePoolCacheTag, sitePoolFor } from "./preferred";
-import { RELAY_PIN_TTL, relayCacheTag, relayServes } from "./relay";
+import { effectiveRelayConfig, RELAY_PIN_TTL, relayCacheTag, relayServes } from "./relay";
 import type { RequestOptions } from "./request-options";
 import { relayHttpsCleanup, resolveEchConfig, validatedEchConfig } from "./rewrite";
 
@@ -111,17 +111,17 @@ export const relay: Strategy = {
   cacheTag: (ctx: RequestContext) => (relayServes(ctx.name, ctx.config) ? relayCacheTag() : undefined),
   async apply(ctx: PlanContext, plan) {
     if (!relayServes(ctx.name, ctx.config)) return;
-    const ip = ctx.config.relayIp!;
+    const { ip, mode } = effectiveRelayConfig(ctx.config);
     if (ctx.type === DnsType.A || ctx.type === DnsType.AAAA) {
-      plan.pin = [ip];
+      plan.pin = [ip!];
       plan.pinTtl = RELAY_PIN_TTL;
       plan.locked.addresses = true;
       plan.strategy = "relay";
-      ctx.notes?.push(`relay: answer pinned to ${ip}, IPv6 dropped (mode ${ctx.config.relayMode})`);
+      ctx.notes?.push(`relay: answer pinned to ${ip}, IPv6 dropped (mode ${mode})`);
     } else if (ctx.type === DnsType.HTTPS) {
       plan.locked.ech = true;
       plan.strategy = "relay";
-      plan.post.push({ apply: (packet) => relayHttpsCleanup(packet, [ip]), note: `relay: HTTPS hints → ${ip}, ECH removed, ALPN → h2` });
+      plan.post.push({ apply: (packet) => relayHttpsCleanup(packet, [ip!]), note: `relay: HTTPS hints → ${ip}, ECH removed, ALPN → h2` });
     }
   },
 };

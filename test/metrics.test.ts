@@ -50,6 +50,22 @@ describe("metrics", () => {
     expect(github).toEqual({ name: "github-pool", count: 2, avgMs: 40 });
   });
 
+  it("rolls fresh resolutions up into path categories (relay/ech/pool/cn/direct)", () => {
+    resetMetrics();
+    recordQuery(query({ latencyMs: 30, strategy: "direct", path: "direct" }));
+    recordQuery(query({ latencyMs: 36, strategy: "direct", path: "direct" }));
+    recordQuery(query({ latencyMs: 10, strategy: "native-ech", path: "ech" }));
+    recordQuery(query({ latencyMs: 12, strategy: "relay", path: "relay" }));
+    recordQuery(query({ latencyMs: 5, strategy: "direct", path: "cn" }));
+    recordQuery(query({ outcome: "hit", latencyMs: 1 })); // cache hits carry no routing decision
+    const paths = Object.fromEntries(statsSnapshot().paths.map((entry) => [entry.path, entry]));
+    expect(paths.direct).toEqual({ path: "direct", count: 2, avgMs: 33 });
+    expect(paths.ech).toEqual({ path: "ech", count: 1, avgMs: 10 });
+    expect(paths.relay).toEqual({ path: "relay", count: 1, avgMs: 12 });
+    expect(paths.cn).toEqual({ path: "cn", count: 1, avgMs: 5 });
+    expect(paths.pool).toEqual({ path: "pool", count: 0, avgMs: 0 });
+  });
+
   it("keeps fresh-resolution latency percentiles", () => {
     resetMetrics();
     for (let index = 1; index <= 100; index += 1) recordQuery(query({ latencyMs: index }));

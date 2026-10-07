@@ -1,7 +1,7 @@
 import { normalizedCacheIdentity, readCache, rotateAddressRecords, writeCache, type CacheHit, type CacheIdentity } from "./cache";
 import { inAnyCidr } from "./cidr";
 import { readConfig, type AppConfig } from "./config";
-import { addEcs, ecsSourceIp, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
+import { addEcs, domainMatches, ecsSourceIp, makeEcsValue, removeEcs, shouldUseEcs } from "./dns/ecs";
 import { encodeDnsPacket, makeServfail, parseDnsPacket, parseIpv4, patchTransactionId } from "./dns/packet";
 import { DnsType, type DnsPacket } from "./dns/types";
 import { chromiumEchVerdict, describeAnswers, dnsTypeName, selfCheckStatus, setSelfCheck } from "./explain";
@@ -13,7 +13,7 @@ import { parseRequestOptions, type RequestOptions } from "./request-options";
 import { clearMetaEch, githubPoolFor, githubPoolStatus, githubReports, ispPoolStatus, learnedPoolStatus, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolFor, sitePoolStatus, siteReports } from "./preferred";
 import { loadCloudflareRanges, validatedEchConfig } from "./rewrite";
 import { describePlan, makePlan, sortStrategies, strategyCacheTags, type RoutePlan } from "./plan";
-import { relayStatus, setRelayHealth } from "./relay";
+import { parseRelayDomainPattern, relayOverrideSnapshot, relayStatus, setRelayHealth, setRelayOverride } from "./relay";
 import { renderPlan } from "./render";
 import { PUBLIC_STRATEGIES } from "./strategies";
 import { queryUpstreams, upstreamLabel } from "./upstream";
@@ -276,7 +276,7 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
 
   try {
     const resolved = await resolveAndStore();
-    recordQuery({ ...sample(), outcome: "miss", upstream: upstreamLabel(resolved.upstream), strategy: resolved.plan.strategy });
+    recordQuery({ ...sample(), outcome: "miss", upstream: upstreamLabel(resolved.upstream), strategy: resolved.plan.strategy, path: pathCategory(resolved.plan, useCn) });
     logQuery(config, query, "miss", resolved.upstream, Date.now() - started);
     return dnsResponse(resolved.wire);
   } catch (error) {
@@ -294,10 +294,22 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
 }
 
 /**
+ * The path rollup for /admin/stats (see metrics.ts QueryPath). Judged on the rendered plan, so
+ * "preferred-ip" only counts when the rewrite actually changed the answer (render.ts renames the
+ * strategy then) and ECH counts even when a pool strategy had claimed the label first.
+ */
+function pathCategory(plan: RoutePlan, useCn: boolean): "relay" | "ech" | "pool" | "cn" | "direct" {
+  if (plan.strategy === "relay") return "relay";
+  if (plan.ech) return "ech";
+  if (useCn) return "cn";
+  if (plan.pin || plan.xPool || plan.strategy === "preferred-ip") return "pool";
+  return "direct";
+}
+
+/**
  * Asks upstream, then lets the strategies decide how the name is reached (plan.ts) and applies that
  * plan to the answer (render.ts). `notes`, when given, collects one line per decision for /explain.
- */
-async function resolveFresh(
+ */async function resolveFresh(
   query: DnsPacket,
   upstreamQuery: DnsPacket,
   useEcs: boolean,
@@ -430,6 +442,7 @@ export async function handleRequest(request: Request, env: Env, ctx: WaitUntilCo
   if (url.pathname === "/admin/github") return handleAdminGithub(request, env);
   if (url.pathname === "/admin/site") return handleAdminSite(request, env);
   if (url.pathname === "/admin/relay") return handleAdminRelay(request, env);
+  if (url.pathname === "/admin/relay-config") return handleAdminRelayConfig(request, env);
   if (url.pathname === "/admin/relay-health") return handleAdminRelayHealth(request, env);
   if (url.pathname === "/admin/pool") return handleAdminPool(request, env);
   if (url.pathname === "/admin/health") return handleAdminHealth(request, env);
@@ -468,8 +481,8 @@ async function preferredAuth(request: Request, env: Env): Promise<"admin" | "hub
   return new Response("Unauthorized", { status: 401 });
 }
 
-function adminState(): Record<string, unknown> {
-  return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, relay: relayStatus(), selfcheck: selfCheckStatus(), h3: h3Status() };
+function adminState(config: AppConfig): Record<string, unknown> {
+  return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, relay: relayStatus(config), selfcheck: selfCheckStatus(), h3: h3Status() };
 }
 
 /**
@@ -481,14 +494,10 @@ async function handleAdminStats(request: Request, env: Env): Promise<Response> {
   const denied = await adminAuth(request, env);
   if (denied) return denied;
   if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET" } });
-  const pools = adminState();
-  // The relay card distinguishes "not deployed" (mode off) from "deployed but not reporting".
-  const relayConfig = readConfig(env);
-  if (pools.relay && typeof pools.relay === "object") Object.assign(pools.relay as object, { mode: relayConfig.relayMode, ip: relayConfig.relayIp ?? null });
   return json({
     ok: true,
     ...statsSnapshot(),
-    pools,
+    pools: adminState(readConfig(env)),
     ...(typeof process !== "undefined" && typeof process.memoryUsage === "function" ? { memory: { rssBytes: process.memoryUsage().rss } } : {}),
   });
 }
@@ -565,21 +574,99 @@ async function readHostReport(request: Request): Promise<{ source: string; ttl: 
 /**
  * SNI relay state (contrib/home/relay): GET reports liveness and the per-host decisions; the relay
  * daemon POSTs its self-check verdict {source, ttl, healthy[, direct]} so the server can withdraw
- * the override the moment the relay or the egress proxy dies. State is in relay.ts.
+ * the override the moment the relay or the egress proxy dies. The health response carries the
+ * effective domain lists so the daemon can pick console edits without a restart. State is in relay.ts.
  */
 async function handleAdminRelay(request: Request, env: Env): Promise<Response> {
   const denied = await adminAuth(request, env);
   if (denied) return denied;
   if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET" } });
+  return json({ ok: true, relay: relayStatus(readConfig(env)) });
+}
+
+/**
+ * The console's control plane: overrides RELAY_MODE / RELAY_DOMAINS / RELAY_EXCLUDE_DOMAINS at
+ * runtime. A change takes effect on the next resolution (the relay cache tag re-keys answers), is
+ * persisted by the Node server across restarts, and is pushed to the relay daemon through the
+ * health-report response. `reset: true` clears the override, returning to the env values.
+ * `expectedVersion` is the configVersion the caller last saw: a mismatch means someone else changed
+ * the config in between and yields 409 rather than a silent last-write-wins.
+ */
+async function handleAdminRelayConfig(request: Request, env: Env): Promise<Response> {
+  const denied = await adminAuth(request, env);
+  if (denied) return denied;
+  if (request.method !== "GET" && request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
   const config = readConfig(env);
-  return json({ ok: true, relay: { mode: config.relayMode, ip: config.relayIp ?? null, domains: config.relayDomains.length, excludes: config.relayExcludeDomains.length, ...relayStatus() } });
+  if (request.method === "GET") return json({ ok: true, relay: relayStatus(config) });
+  let body: { mode?: unknown; domains?: unknown; excludeDomains?: unknown; reset?: unknown; expectedVersion?: unknown };
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+  const current = relayStatus(config);
+  if (typeof body.expectedVersion === "number" && Number.isFinite(body.expectedVersion) && body.expectedVersion !== current.configVersion) {
+    return json({ ok: false, error: `config version mismatch: expected ${body.expectedVersion}, current ${current.configVersion}; refresh and retry`, configVersion: current.configVersion }, 409);
+  }
+  if (body.reset === true) {
+    setRelayOverride(null, config);
+    return json({ ok: true, changed: true, relay: relayStatus(config) });
+  }
+  const patch: { mode?: typeof config.relayMode; domains?: string[]; excludeDomains?: string[] } = {};
+  if (body.mode !== undefined) {
+    if (body.mode !== "off" && body.mode !== "auto" && body.mode !== "always") {
+      return new Response("mode must be \"off\", \"auto\" or \"always\"", { status: 400 });
+    }
+    patch.mode = body.mode;
+  }
+  // ECH names cannot go through the relay: the relay steers by reading SNI, and an ECH name's outer
+  // SNI no longer points at the real target (the HTTPS cleanup would strip the ECH key anyway —
+  // the entry is rejected so the operator notices before clients lose ECH, DESIGN.md §10).
+  const echPatterns = [...(config.echEnabled ? config.echDomains : []), ...config.metaDomains, ...config.xDomains];
+  const echConflicts = (patterns: string[]): string[] =>
+    patterns.filter((entry) => echPatterns.some((ech) => domainMatches(entry.replace(/^\*\./, ""), [ech])));
+  const readPatterns = (value: unknown, field: string): string[] | Response => {
+    if (!Array.isArray(value)) return new Response(`${field} must be an array of domain patterns`, { status: 400 });
+    if (value.length > 64) return new Response(`${field} is limited to 64 patterns`, { status: 400 });
+    if (value.some((entry) => typeof entry !== "string")) return new Response(`${field} must contain only strings`, { status: 400 });
+    const invalid = (value as string[]).filter((entry) => parseRelayDomainPattern(entry) === null);
+    if (invalid.length > 0) {
+      return new Response(`${field} has invalid entries (hostnames, optionally *.prefixed): ${invalid.slice(0, 3).join(", ")}`, { status: 400 });
+    }
+    const conflicts = echConflicts(value as string[]);
+    if (conflicts.length > 0) {
+      return new Response(`${field} entries conflict with ECH domains (the relay reads SNI, ECH encrypts it): ${conflicts.slice(0, 5).join(", ")}`, { status: 400 });
+    }
+    return [...new Set((value as string[]).map((entry) => parseRelayDomainPattern(entry)!))];
+  };
+  if (body.domains !== undefined) {
+    const domains = readPatterns(body.domains, "domains");
+    if (domains instanceof Response) return domains;
+    patch.domains = domains;
+  }
+  if (body.excludeDomains !== undefined) {
+    const excludes = readPatterns(body.excludeDomains, "excludeDomains");
+    if (excludes instanceof Response) return excludes;
+    patch.excludeDomains = excludes;
+  }
+  if (Object.keys(patch).length === 0) return new Response("nothing to change: mode, domains, excludeDomains or reset required", { status: 400 });
+  // Turning the relay up needs a usable address; env typos must surface here rather than degrade silently.
+  const nextMode = patch.mode ?? current.mode;
+  if (nextMode !== "off" && !config.relayIp) {
+    return new Response("relay not deployed: RELAY_IP is missing or not a private address (mode stays as-is)", { status: 400 });
+  }
+  // Fields left out of the request keep their current override values (absent = env), like a PATCH.
+  const merged = { ...(relayOverrideSnapshot() ?? {}), ...patch } as typeof patch;
+  const changed = setRelayOverride(merged, config);
+  if (changed) console.log(JSON.stringify({ event: "relay_config_updated", fields: Object.keys(patch), configVersion: relayStatus(config).configVersion }));
+  return json({ ok: true, changed, relay: relayStatus(config) });
 }
 
 async function handleAdminRelayHealth(request: Request, env: Env): Promise<Response> {
   const denied = await adminAuth(request, env);
   if (denied) return denied;
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "POST" } });
-  let body: { source?: unknown; ttl?: unknown; healthy?: unknown; direct?: unknown };
+  let body: { source?: unknown; ttl?: unknown; healthy?: unknown; direct?: unknown; appliedConfigVersion?: unknown };
   try {
     body = await request.json();
   } catch {
@@ -587,8 +674,11 @@ async function handleAdminRelayHealth(request: Request, env: Env): Promise<Respo
   }
   const source = typeof body.source === "string" ? body.source.slice(0, 64) : "unknown";
   const ttl = typeof body.ttl === "number" && Number.isFinite(body.ttl) ? Math.max(30, Math.min(3600, body.ttl)) : 120;
-  setRelayHealth({ source, ttlSeconds: ttl, healthy: body.healthy === true, direct: readRelayDirectSamples(body.direct) });
-  return json({ ok: true, relay: relayStatus() });
+  const appliedConfigVersion = typeof body.appliedConfigVersion === "number" && Number.isFinite(body.appliedConfigVersion) && body.appliedConfigVersion >= 0
+    ? Math.min(Math.floor(body.appliedConfigVersion), 2 ** 31)
+    : undefined;
+  setRelayHealth({ source, ttlSeconds: ttl, healthy: body.healthy === true, direct: readRelayDirectSamples(body.direct), ...(appliedConfigVersion !== undefined ? { appliedConfigVersion } : {}) });
+  return json({ ok: true, relay: relayStatus(readConfig(env)) });
 }
 
 /** direct: {"github.com": {ok: true, rttMs: 120}} — per-host handshake samples from the relay's prober. */
@@ -680,7 +770,7 @@ async function handleAdminSelfCheck(request: Request, env: Env): Promise<Respons
 async function handleAdminHealth(request: Request, env: Env): Promise<Response> {
   const denied = await adminAuth(request, env);
   if (denied) return denied;
-  if (request.method === "GET") return json({ ok: true, ...adminState() });
+  if (request.method === "GET") return json({ ok: true, ...adminState(readConfig(env)) });
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
   let body: { metaEch?: unknown; echConfig?: unknown; verified?: unknown; ttl?: unknown; source?: unknown; reason?: unknown };
   try {
@@ -720,7 +810,7 @@ async function handleAdminHealth(request: Request, env: Env): Promise<Response> 
     default:
       return new Response("metaEch must be \"ok\", \"rotated\" or \"broken\"", { status: 400 });
   }
-  return json({ ok: true, ...adminState() });
+  return json({ ok: true, ...adminState(readConfig(env)) });
 }
 
 const MAX_REPORTED_IPS = 64;
@@ -729,7 +819,7 @@ async function handleAdminPreferred(request: Request, env: Env, runtime: Request
   const role = await preferredAuth(request, env);
   if (role instanceof Response) return role;
   const hubOnly = "The hub token may only write operator pools (POST with scope \"isp:<name>\")";
-  if (request.method === "GET") return role === "admin" ? json({ ok: true, ...adminState() }) : new Response(hubOnly, { status: 403 });
+  if (request.method === "GET") return role === "admin" ? json({ ok: true, ...adminState(readConfig(env)) }) : new Response(hubOnly, { status: 403 });
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
   let body: { ipv4?: unknown; ipv6?: unknown; ttl?: unknown; source?: unknown; scope?: unknown };
   try {
@@ -777,7 +867,7 @@ async function handleAdminPreferred(request: Request, env: Env, runtime: Request
     const pool = setLearnedPool(ipv4, ipv6, ttl, source, scope);
     console.log(JSON.stringify({ event: "preferred_pool_updated", source, scope: scope ?? "default", ipv4: pool.ipv4.length, ipv6: pool.ipv6.length, ttl }));
     if (role === "hub") return json({ ok: true, scope, ipv4: pool.ipv4.length, ipv6: pool.ipv6.length, expiresAt: pool.expiresAt });
-    return json({ ok: true, scope: scope ?? "default", ...adminState() });
+    return json({ ok: true, scope: scope ?? "default", ...adminState(readConfig(env)) });
   } catch (error) {
     return new Response(`Invalid address: ${errorMessage(error)}`, { status: 400 });
   }

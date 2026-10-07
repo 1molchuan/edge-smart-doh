@@ -14,6 +14,14 @@
 export type QueryOutcome = "hit" | "prefetch" | "stale" | "miss" | "blocked" | "error";
 export type UpstreamRole = "default" | "ecs" | "cn";
 
+/**
+ * How a fresh resolution reached the name, rolled up for the console's path panel: "relay" the
+ * answer was pinned to the SNI relay, "ech" the HTTPS record carried an injected ECH key, "cn" the
+ * domestic split (CN upstreams), "pool" a measured/preferred pool pin or rewrite, "direct" the
+ * upstream answer untouched. Cache hits carry no routing info, so paths describe fresh resolutions.
+ */
+export type QueryPath = "relay" | "ech" | "pool" | "cn" | "direct";
+
 export interface QuerySample {
   name: string;
   /** DNS type as shown to clients ("A", "AAAA", ...). */
@@ -24,6 +32,8 @@ export interface QuerySample {
   upstream?: string;
   /** Route-plan label ("direct", "preferred-ip", "github-pool", ...) — fresh resolutions only. */
   strategy?: string;
+  /** Path rollup of `strategy` (see QueryPath) — fresh resolutions only. */
+  path?: QueryPath;
   /** Why a fresh resolution failed (outcome "error", or "stale" served over the failure). */
   error?: string;
   /** The query failed with SERVFAIL: no cached answer to fall back to. */
@@ -64,6 +74,11 @@ interface StrategyStat {
   totalMs: number;
 }
 
+interface PathStat {
+  count: number;
+  totalMs: number;
+}
+
 const MINUTE_MS = 60_000;
 const MINUTE_BUCKETS = 120;
 const RECENT_MAX = 100;
@@ -71,6 +86,7 @@ const FRESH_LATENCY_SAMPLES = 2000;
 const TOP_TRACKED = 1024;
 const TOP_REPORTED = 20;
 const STRATEGIES_MAX = 64;
+const PATHS: QueryPath[] = ["relay", "ech", "pool", "cn", "direct"];
 
 const startedAt = Date.now();
 const outcomes: Record<QueryOutcome, number> = { hit: 0, prefetch: 0, stale: 0, miss: 0, blocked: 0, error: 0 };
@@ -81,6 +97,7 @@ const top = new Map<string, number>();
 const recent: (QuerySample & { t: number })[] = [];
 const upstreams = new Map<string, UpstreamStat>();
 const strategies = new Map<string, StrategyStat>();
+const paths = new Map<QueryPath, PathStat>(PATHS.map((path) => [path, { count: 0, totalMs: 0 }]));
 
 export function recordQuery(sample: QuerySample, now = Date.now()): void {
   outcomes[sample.outcome] += 1;
@@ -108,6 +125,12 @@ export function recordQuery(sample: QuerySample, now = Date.now()): void {
       const oldest = strategies.keys().next().value;
       if (oldest !== undefined && oldest !== sample.strategy) strategies.delete(oldest);
     }
+  }
+  if (sample.path) {
+    const stat = paths.get(sample.path) ?? { count: 0, totalMs: 0 };
+    stat.count += 1;
+    stat.totalMs += sample.latencyMs;
+    paths.set(sample.path, stat);
   }
 }
 
@@ -138,6 +161,8 @@ export function resetMetrics(): void {
   recent.length = 0;
   upstreams.clear();
   strategies.clear();
+  paths.clear();
+  for (const path of PATHS) paths.set(path, { count: 0, totalMs: 0 });
 }
 
 function currentMinute(now: number): MinuteBucket {
@@ -166,6 +191,7 @@ export interface StatsSnapshot {
   minutes: MinuteBucket[];
   upstreams: { role: UpstreamRole; name: string; ok: number; fail: number; avgMs: number; maxMs: number; lastMs: number; lastError?: string; lastUsedAgoSec: number }[];
   strategies: { name: string; count: number; avgMs: number }[];
+  paths: { path: QueryPath; count: number; avgMs: number }[];
   top: { name: string; count: number }[];
   recent: (QuerySample & { t: number })[];
 }
@@ -209,6 +235,10 @@ export function statsSnapshot(now = Date.now()): StatsSnapshot {
     })).sort((a, b) => b.ok + b.fail - (a.ok + a.fail)),
     strategies: [...strategies.entries()].map(([name, stat]) => ({ name, count: stat.count, avgMs: Math.round(stat.totalMs / stat.count) }))
       .sort((a, b) => b.count - a.count),
+    paths: PATHS.map((path) => {
+      const stat = paths.get(path)!;
+      return { path, count: stat.count, avgMs: stat.count > 0 ? Math.round(stat.totalMs / stat.count) : 0 };
+    }).sort((a, b) => b.count - a.count),
     top: [...top.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count).slice(0, TOP_REPORTED),
     recent: recent.slice(-RECENT_MAX).reverse(),
   };

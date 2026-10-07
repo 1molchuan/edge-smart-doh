@@ -4,7 +4,7 @@ import { DnsType, type DnsPacket } from "../src/dns/types";
 import { describeHttpsParams } from "../src/dns/https-rr";
 import { readConfig } from "../src/config";
 import { handleRequest } from "../src/index";
-import { relayCacheTag, relayServes, relayStatus, resetRelayState, setRelayHealth } from "../src/relay";
+import { relayCacheTag, relayServes, relayStatus, resetRelayState, setRelayHealth, setRelayOverride } from "../src/relay";
 import { clearGithubPools, setGithubPools } from "../src/preferred";
 import { strategyCacheTags } from "../src/plan";
 import { PUBLIC_STRATEGIES } from "../src/strategies";
@@ -233,7 +233,7 @@ describe("auto-mode hysteresis", () => {
     expect(relayServes("github.com", autoCfg)).toBe(true);
     reportAt(1, {}, false);
     expect(relayServes("github.com", autoCfg)).toBe(false);
-    expect(relayStatus().hosts.every((host) => !host.relayed)).toBe(true);
+    expect(relayStatus(autoCfg).hosts.every((host) => !host.relayed)).toBe(true);
   });
 
   it("reports per-host rates for the monitor", () => {
@@ -242,9 +242,40 @@ describe("auto-mode hysteresis", () => {
     reportAt(0, {});
     reportAt(1, { "github.com": { ok: true, rttMs: 100 } });
     reportAt(2, { "github.com": { ok: false } });
-    const host = relayStatus().hosts.find((entry) => entry.host === "github.com");
+    const host = relayStatus(autoCfg).hosts.find((entry) => entry.host === "github.com");
     expect(host).toMatchObject({ relayed: false, samples: 2 });
     expect(host!.enterRate).toBeCloseTo(0.5);
+  });
+});
+
+describe("runtime relay override (console control plane)", () => {
+  const envOff = config({ relayMode: "off", relayIp: RELAY_IP, relayDomains: ["*.github.com"] });
+
+  it("turns the relay on over an env value of off, and reset returns to the env", () => {
+    healthyRelay();
+    expect(relayServes("github.com", envOff)).toBe(false);
+    const before = relayCacheTag();
+    expect(setRelayOverride({ mode: "always" }, envOff)).toBe(true);
+    expect(relayCacheTag()).not.toBe(before);
+    expect(relayServes("github.com", envOff)).toBe(true);
+    const status = relayStatus(envOff);
+    expect(status).toMatchObject({ mode: "always", modeSource: "override", overridden: ["mode"], domains: ["*.github.com"] });
+    expect(setRelayOverride({ mode: "always" }, envOff)).toBe(false); // same value: no bump
+    expect(setRelayOverride(null, envOff)).toBe(true);
+    expect(relayServes("github.com", envOff)).toBe(false);
+    expect(relayStatus(envOff)).toMatchObject({ mode: "off", modeSource: "env", overridden: [] });
+  });
+
+  it("a domains override re-scopes which names are served", () => {
+    const base = config({ relayMode: "always", relayIp: RELAY_IP, relayDomains: ["*.github.com"] });
+    healthyRelay();
+    setRelayOverride({ domains: ["*.example.com"], excludeDomains: ["bad.example.com"] }, base);
+    expect(relayServes("www.example.com", base)).toBe(true);
+    expect(relayServes("bad.example.com", base)).toBe(false);
+    expect(relayServes("github.com", base)).toBe(false);
+    setRelayOverride(null, base);
+    expect(relayServes("www.example.com", base)).toBe(false);
+    expect(relayServes("github.com", base)).toBe(true);
   });
 });
 
@@ -274,5 +305,69 @@ describe("relay admin endpoints", () => {
     expect(body.source).toBe("github-pool");
     const none = await call("/admin/pool?name=unknown.example", { headers: { Authorization: "Bearer t" } });
     expect(((await none.json()) as { pool: string[] }).pool).toEqual([]);
+  });
+
+  it("POST /admin/relay-config overrides mode and domains at runtime; reset returns to the env", async () => {
+    expect((await call("/admin/relay-config", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status).toBe(401);
+    const post = (payload: unknown): Promise<Response> =>
+      call("/admin/relay-config", { method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    expect((await post({ mode: "sometimes" })).status).toBe(400);
+    expect((await post({ domains: ["not a domain!"] })).status).toBe(400);
+    expect((await post({})).status).toBe(400);
+
+    healthyRelay();
+    const cfg = () => readConfig(env);
+    expect(relayServes("github.com", cfg())).toBe(true); // env: always + *.github.com
+    const applied = await post({ mode: "off", domains: ["*.example.com"] });
+    expect(applied.status).toBe(200);
+    expect(((await applied.json()) as { relay: { mode: string; domains: string[]; modeSource: string } }).relay)
+      .toMatchObject({ mode: "off", domains: ["*.example.com"], modeSource: "override" });
+    expect(relayServes("github.com", cfg())).toBe(false); // override mode off wins over env always
+    expect(relayServes("www.example.com", cfg())).toBe(false);
+
+    await post({ mode: "always" });
+    expect(relayServes("www.example.com", cfg())).toBe(true);
+    expect(relayServes("github.com", cfg())).toBe(false);
+
+    const reset = await post({ reset: true });
+    expect(((await reset.json()) as { relay: { mode: string; modeSource: string; domains: string[] } }).relay)
+      .toMatchObject({ mode: "always", modeSource: "env", domains: ["*.github.com"] });
+    expect(relayServes("github.com", cfg())).toBe(true);
+  });
+
+  it("POST /admin/relay-health answers with the effective domain lists for the daemon to sync", async () => {
+    const post = (payload: unknown): Promise<Response> =>
+      call("/admin/relay-health", { method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const reported = (await (await post({ source: "relay@192.168.31.250", ttl: 120, healthy: true })).json()) as { relay: { domains: string[]; excludes: string[] } };
+    expect(reported.relay).toMatchObject({ domains: ["*.github.com"], excludes: [] });
+    await call("/admin/relay-config", { method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify({ domains: ["a.example", "*.b.example"], excludeDomains: ["x.a.example"] }) });
+    const after = (await (await post({ source: "relay@192.168.31.250", ttl: 120, healthy: true })).json()) as { relay: { domains: string[]; excludes: string[] } };
+    expect(after.relay.domains).toEqual(["a.example", "*.b.example"]);
+    expect(after.relay.excludes).toEqual(["x.a.example"]);
+  });
+
+  it("guards the control plane: version conflicts, ECH-domain conflicts, missing RELAY_IP", async () => {
+    const post = (payload: unknown): Promise<Response> =>
+      call("/admin/relay-config", { method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const version = (): Promise<number> => call("/admin/relay", { headers: { Authorization: "Bearer t" } }).then((res) => res.json().then((body: unknown) => (body as { relay: { configVersion: number } }).relay.configVersion));
+    const stale = await version();
+    await post({ mode: "auto" });
+    const conflict = await post({ mode: "off", expectedVersion: stale });
+    expect(conflict.status).toBe(409);
+    const echEnv = { UPSTREAMS: "https://up.example/dns-query", ADMIN_TOKEN: "t", X_DOMAINS: "x.com,.x.com,twimg.com", RELAY_MODE: "always", RELAY_IP: RELAY_IP, RELAY_DOMAINS: "*.github.com" } as unknown as Env;
+    const ech = await handleRequest(new Request("https://doh.example/admin/relay-config", {
+      method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify({ domains: ["*.x.com"] }),
+    }), echEnv, { waitUntil: () => undefined }, { clientIp: () => undefined, probe: () => ({}) });
+    expect(ech.status).toBe(400);
+    expect(await ech.text()).toContain("ECH");
+    const noIp = await handleRequest(new Request("https://doh.example/admin/relay-config", {
+      method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify({ mode: "always" }),
+    }), { UPSTREAMS: "https://up.example/dns-query", ADMIN_TOKEN: "t", RELAY_MODE: "off", RELAY_DOMAINS: "*.github.com" } as unknown as Env, { waitUntil: () => undefined }, { clientIp: () => undefined, probe: () => ({}) });
+    expect(noIp.status).toBe(400);
+    expect(await noIp.text()).toContain("RELAY_IP");
+    // The daemon's applied-config receipt shows up in the status the console renders as "已同步".
+    await call("/admin/relay-health", { method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify({ source: "relay@192.168.31.250", ttl: 120, healthy: true, appliedConfigVersion: 999 }) });
+    const status = (await (await call("/admin/relay", { headers: { Authorization: "Bearer t" } })).json()) as { relay: { appliedConfigVersion: number } };
+    expect(status.relay.appliedConfigVersion).toBeGreaterThanOrEqual(999);
   });
 });

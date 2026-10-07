@@ -34,8 +34,11 @@ const LISTEN_IP = required("RELAY_LISTEN_IP");
 const LISTEN_PORT = integer("RELAY_LISTEN_PORT", 443, 1, 65535);
 const [PROXY_HOST, PROXY_PORT_RAW] = required("RELAY_PROXY").split(":");
 const PROXY_PORT = Number.parseInt(PROXY_PORT_RAW, 10);
-const DOMAINS = (process.env.RELAY_DOMAINS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-const EXCLUDE = (process.env.RELAY_EXCLUDE_DOMAINS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+// The env values are the bootstrap; once the DoH server answers a health report it owns the list
+// (console edits flow through /admin/relay-config), so patterns sync without restarting this daemon.
+let DOMAINS = (process.env.RELAY_DOMAINS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+let EXCLUDE = (process.env.RELAY_EXCLUDE_DOMAINS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+let appliedConfigVersion = 0;
 const ADMIN_URL = process.env.RELAY_ADMIN_URL || "http://127.0.0.1:8787";
 const ADMIN_TOKEN = process.env.RELAY_ADMIN_TOKEN ?? "";
 const REPORT_TTL_SECONDS = integer("RELAY_REPORT_TTL", 120, 30, 3600); // server withdraws ~3 missed reports later
@@ -77,6 +80,20 @@ function matches(name, pattern) {
 
 function relayedName(name) {
   return !EXCLUDE.some((pattern) => matches(name, pattern)) && DOMAINS.some((pattern) => matches(name, pattern));
+}
+
+/** Applies a domain-list/configVersion pair served with a health-report response. */
+function syncFromServer(relay) {
+  const clean = (value) =>
+    Array.isArray(value) ? [...new Set(value.filter((entry) => typeof entry === "string").map((entry) => entry.trim().toLowerCase()).filter(Boolean))].slice(0, 64) : null;
+  const domains = clean(relay?.domains);
+  const excludes = clean(relay?.excludes);
+  if (!domains || !excludes) return; // a server without the fields (or an error body) keeps the current sets
+  const changed = JSON.stringify(domains) !== JSON.stringify(DOMAINS) || JSON.stringify(excludes) !== JSON.stringify(EXCLUDE);
+  DOMAINS = domains;
+  EXCLUDE = excludes;
+  if (typeof relay.configVersion === "number" && Number.isFinite(relay.configVersion)) appliedConfigVersion = relay.configVersion;
+  if (changed) console.log(JSON.stringify({ event: "config_applied", configVersion: appliedConfigVersion, domains: DOMAINS.length, excludes: EXCLUDE.length }));
 }
 
 // ---------------------------------------------------------------- ClientHello SNI
@@ -291,20 +308,8 @@ async function probeAndReport() {
   const healthy = consecutiveFailures < 3;
   const entries = await Promise.all(PROBE_HOSTS.map(async (host) => [host, await probeDirect(host)]));
   const direct = Object.fromEntries(entries.filter(([, sample]) => sample !== undefined));
-  if (!ADMIN_TOKEN) {
-    console.log(JSON.stringify({ event: "probe", healthy, hosts: Object.keys(direct).length }));
-    return;
-  }
-  try {
-    await fetch(`${ADMIN_URL}/admin/relay-health`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ source: `relay@${LISTEN_IP}`, ttl: REPORT_TTL_SECONDS, healthy, direct }),
-    });
-    console.log(JSON.stringify({ event: "probe", healthy, hosts: Object.keys(direct).length }));
-  } catch (error) {
-    log("report_error", { error: String(error) });
-  }
+  console.log(JSON.stringify({ event: "probe", healthy, hosts: Object.keys(direct).length }));
+  await postReport({ source: `relay@${LISTEN_IP}`, ttl: REPORT_TTL_SECONDS, healthy, direct });
 }
 
 // ---------------------------------------------------------------- self-check + reporting
@@ -328,21 +333,31 @@ function selfCheck() {
   });
 }
 
-async function report() {
-  const healthy = consecutiveFailures < 3;
-  console.log(JSON.stringify({ event: "self_check", healthy, consecutiveFailures }));
+/** Posts one health report; the response carries the effective domain lists for hot syncing. */
+async function postReport(payload) {
   if (!ADMIN_TOKEN) return;
   try {
-    await fetch(`${ADMIN_URL}/admin/relay-health`, {
+    const response = await fetch(`${ADMIN_URL}/admin/relay-health`, {
       method: "POST",
       headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ source: `relay@${LISTEN_IP}`, ttl: REPORT_TTL_SECONDS, healthy }),
+      body: JSON.stringify({ ...payload, appliedConfigVersion }),
     });
+    if (response.ok) syncFromServer((await response.json())?.relay);
   } catch (error) {
     log("report_error", { error: String(error) });
   }
 }
 
+async function report() {
+  const healthy = consecutiveFailures < 3;
+  console.log(JSON.stringify({ event: "self_check", healthy, consecutiveFailures }));
+  await postReport({ source: `relay@${LISTEN_IP}`, ttl: REPORT_TTL_SECONDS, healthy });
+}
+
+// The self-check loop keeps liveness fresh between probes; the prober adds the per-host direct
+// samples that drive auto mode. Cadences are independent (30s vs 180s) on purpose: liveness must
+// withdraw fast, judgment must not flap. Both responses hot-sync the domain lists, so console
+// edits reach this daemon within one check interval (≤30s) without a restart.
 setInterval(async () => {
   const ok = await selfCheck();
   consecutiveFailures = ok ? 0 : consecutiveFailures + 1;
@@ -354,9 +369,6 @@ setTimeout(async () => {
   await report();
 }, 2000).unref();
 
-// The self-check loop keeps liveness fresh between probes; the prober adds the per-host direct
-// samples that drive auto mode. Cadences are independent (30s vs 180s) on purpose: liveness must
-// withdraw fast, judgment must not flap.
 setInterval(probeAndReport, PROBE_INTERVAL_SECONDS * 1000).unref();
 setTimeout(probeAndReport, 10_000).unref();
 
