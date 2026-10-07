@@ -46,7 +46,7 @@ const windowStub = { addEventListener() {} };
 const now = Date.now();
 const summary = {
   now,
-  console: { authRequired: false, control: false, session: null },
+  console: { authRequired: true, control: true, session: { valid: true, label: "ops-agent", ip: "127.0.0.1" } },
   monitor: { startedAt: now, intervalMs: 10000, dohUrl: "http://127.0.0.1:8787", allow: "private", cycles: 3 },
   doh: { ok: true, latencyMs: 2, error: null, lastCheck: now },
   stats: {
@@ -115,7 +115,12 @@ expect("最近查询路径徽章", html("recent-body"), "badge");
 expect("池状态含主池档位", html("pools-body"), "主池 auto");
 expect("池状态含走中转主机", html("pools-body"), "走中转");
 expect("池状态含强制池", html("pools-body"), "强制池");
-expect("页脚模式", text("foot-mode"), "纯监控");
+expect("甲板主池档位", text("relay-mode-text"), "auto");
+expect("甲板强制池档位", text("forced-mode-text"), "always");
+expect("甲板强制名单 chips", html("forced-chips"), "*.google.com");
+expect("甲板同步状态", html("relay-sync"), "中转已应用 v2");
+expect("页脚模式", text("foot-mode"), "控制台模式");
+expect("会话徽标", text("session-label"), "ops-agent");
 if (failures.length) {
   console.error("FAIL\n" + failures.join("\n"));
   process.exit(1);
