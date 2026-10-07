@@ -48,6 +48,8 @@ RELAY_ENABLED=0                      # 1 = 安装 SNI 中转（contrib/home/rela
                                      #     auto 档在直连质量差时自动接管；0 = 完全不装
 RELAY_IP_CFG=""                      # 中转监听的第二内网 IP（如 192.168.1.250）；留空=首跑询问并持久化
 RELAY_DOMAINS_CFG=""                 # 走中转的域名（支持 *. 通配）；留空=GitHub 族默认四条通配
+RELAY_FORCED_DOMAINS_CFG=""          # 强制池域名（只有 off/always 两档、无 auto——这些域名没有实测池
+                                     #     可供判定，例如 Google 族）；留空=不启用（档位默认 off）
 # ==========================================================
 
 LOG_FILE="/var/log/deploy-home.log"
@@ -539,9 +541,13 @@ EOF
     set_env_value RELAY_IP "$RELAY_IP_CFG"
     set_env_value RELAY_DOMAINS "$RELAY_DOMAINS_CFG"
     env_has_value RELAY_EXCLUDE_DOMAINS || set_env_value RELAY_EXCLUDE_DOMAINS "ssh.github.com"
+    # 强制池（第二档名单，只有 off/always）：档位尊重已改过的值；名单只在配置区给出时才写，
+    # 留空绝不覆盖——用户可能已在 env 或控制台配好 Google 族名单，重跑部署不该清掉
+    env_has_value RELAY_FORCED_MODE || set_env_value RELAY_FORCED_MODE off
+    [[ -n "$RELAY_FORCED_DOMAINS_CFG" ]] && set_env_value RELAY_FORCED_DOMAINS "$RELAY_FORCED_DOMAINS_CFG"
     # 控制台（8788）改档位/名单走 POST /admin/relay-config 的运行时覆盖；落在这里重启才不丢
     env_has_value RELAY_CONFIG_PATH || set_env_value RELAY_CONFIG_PATH /var/lib/edge-smart-doh/relay-config.json
-    ok "主服务 env：RELAY_MODE=$(sed -n 's/^RELAY_MODE=//p' "$ENV_FILE") RELAY_IP=$RELAY_IP_CFG"
+    ok "主服务 env：RELAY_MODE=$(sed -n 's/^RELAY_MODE=//p' "$ENV_FILE") RELAY_FORCED_MODE=$(sed -n 's/^RELAY_FORCED_MODE=//p' "$ENV_FILE") RELAY_IP=$RELAY_IP_CFG"
 
     # --- 3c-3 relay 守护进程（独立最小 env，不读主 env 的解析配置）---
     install -D -m 0755 "$PROJECT_DIR/contrib/home/relay/relay.mjs" /opt/edge-smart-doh/relay.mjs
@@ -551,11 +557,14 @@ EOF
     RELAY_PROXY_HOSTPORT="${PROXY_ADDR#http://}"
     # 探测主机 = GITHUB_DOMAINS（具体主机名；去掉可能的 *. 前缀；无池的主机采不到样，自动保持直连）
     RELAY_PROBE_HOSTS_VALUE="$(sed -n 's/^GITHUB_DOMAINS=//p' "$ENV_FILE" | sed 's/\*\.//g')"
+    # 强制池引导名单与主 env 同源（控制台上线后由健康上报热同步接管）
+    RELAY_FORCED_VALUE="$(sed -n 's/^RELAY_FORCED_DOMAINS=//p' "$ENV_FILE")"
     umask 077
     {
       printf 'RELAY_LISTEN_IP=%s\n' "$RELAY_IP_CFG"
       printf 'RELAY_PROXY=%s\n' "$RELAY_PROXY_HOSTPORT"
       printf 'RELAY_DOMAINS=%s\n' "$RELAY_DOMAINS_CFG"
+      printf 'RELAY_FORCED_DOMAINS=%s\n' "${RELAY_FORCED_VALUE:-$RELAY_FORCED_DOMAINS_CFG}"
       printf 'RELAY_EXCLUDE_DOMAINS=ssh.github.com\n'
       printf 'RELAY_ADMIN_URL=http://127.0.0.1:8787\n'
       printf 'RELAY_ADMIN_TOKEN=%s\n' "$RELAY_ADMIN_TOKEN_VALUE"
@@ -578,8 +587,9 @@ EOF
     fi
 
     # --- 3c-4 前置条件：mihomo 的 DOMAIN 规则（无池回退按域名 CONNECT 时靠它远程解析防回环）---
-    warn "请确认代理配置里有名单域名的 DOMAIN 规则（如 DOMAIN-SUFFIX,github.com,<代理组>），并执行
-      curl -x ${PROXY_ADDR} -sI https://github.com -o /dev/null -w '%{http_code}' 验证走代理（期望 200）。
+    warn "请确认代理配置里有名单域名的 DOMAIN 规则（如 DOMAIN-SUFFIX,github.com,<代理组>；
+      强制池同理，如 DOMAIN-SUFFIX,google.com,<代理组>——Google 族没有实测池，全靠这条规则），
+      并执行 curl -x ${PROXY_ADDR} -sI https://github.com -o /dev/null -w '%{http_code}' 验证走代理（期望 200）。
       缺这条规则时 relay 仍可用（按实测池 IP 拨号），但池空的域名会依赖本地解析路径。"
   fi
 fi

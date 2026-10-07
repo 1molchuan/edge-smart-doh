@@ -585,12 +585,13 @@ async function handleAdminRelay(request: Request, env: Env): Promise<Response> {
 }
 
 /**
- * The console's control plane: overrides RELAY_MODE / RELAY_DOMAINS / RELAY_EXCLUDE_DOMAINS at
- * runtime. A change takes effect on the next resolution (the relay cache tag re-keys answers), is
- * persisted by the Node server across restarts, and is pushed to the relay daemon through the
- * health-report response. `reset: true` clears the override, returning to the env values.
- * `expectedVersion` is the configVersion the caller last saw: a mismatch means someone else changed
- * the config in between and yields 409 rather than a silent last-write-wins.
+ * The console's control plane: overrides RELAY_MODE / RELAY_DOMAINS / RELAY_EXCLUDE_DOMAINS and the
+ * forced pool's RELAY_FORCED_MODE / RELAY_FORCED_DOMAINS at runtime. A change takes effect on the
+ * next resolution (the relay cache tag re-keys answers), is persisted by the Node server across
+ * restarts, and is pushed to the relay daemon through the health-report response. `reset: true`
+ * clears the override, returning to the env values. `expectedVersion` is the configVersion the
+ * caller last saw: a mismatch means someone else changed the config in between and yields 409
+ * rather than a silent last-write-wins.
  */
 async function handleAdminRelayConfig(request: Request, env: Env): Promise<Response> {
   const denied = await adminAuth(request, env);
@@ -598,7 +599,7 @@ async function handleAdminRelayConfig(request: Request, env: Env): Promise<Respo
   if (request.method !== "GET" && request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
   const config = readConfig(env);
   if (request.method === "GET") return json({ ok: true, relay: relayStatus(config) });
-  let body: { mode?: unknown; domains?: unknown; excludeDomains?: unknown; reset?: unknown; expectedVersion?: unknown };
+  let body: { mode?: unknown; domains?: unknown; excludeDomains?: unknown; forcedMode?: unknown; forcedDomains?: unknown; reset?: unknown; expectedVersion?: unknown };
   try {
     body = await request.json();
   } catch {
@@ -612,12 +613,19 @@ async function handleAdminRelayConfig(request: Request, env: Env): Promise<Respo
     setRelayOverride(null, config);
     return json({ ok: true, changed: true, relay: relayStatus(config) });
   }
-  const patch: { mode?: typeof config.relayMode; domains?: string[]; excludeDomains?: string[] } = {};
+  const patch: { mode?: typeof config.relayMode; domains?: string[]; excludeDomains?: string[]; forcedMode?: typeof config.relayForcedMode; forcedDomains?: string[] } = {};
   if (body.mode !== undefined) {
     if (body.mode !== "off" && body.mode !== "auto" && body.mode !== "always") {
       return new Response("mode must be \"off\", \"auto\" or \"always\"", { status: 400 });
     }
     patch.mode = body.mode;
+  }
+  if (body.forcedMode !== undefined) {
+    // The forced pool has no measurement loop, so "auto" is not a value it can honor.
+    if (body.forcedMode !== "off" && body.forcedMode !== "always") {
+      return new Response("forcedMode must be \"off\" or \"always\" (the forced pool has no auto: its names have no measured pool to judge them by)", { status: 400 });
+    }
+    patch.forcedMode = body.forcedMode;
   }
   // ECH names cannot go through the relay: the relay steers by reading SNI, and an ECH name's outer
   // SNI no longer points at the real target (the HTTPS cleanup would strip the ECH key anyway —
@@ -649,11 +657,20 @@ async function handleAdminRelayConfig(request: Request, env: Env): Promise<Respo
     if (excludes instanceof Response) return excludes;
     patch.excludeDomains = excludes;
   }
-  if (Object.keys(patch).length === 0) return new Response("nothing to change: mode, domains, excludeDomains or reset required", { status: 400 });
+  if (body.forcedDomains !== undefined) {
+    const forced = readPatterns(body.forcedDomains, "forcedDomains");
+    if (forced instanceof Response) return forced;
+    patch.forcedDomains = forced;
+  }
+  if (Object.keys(patch).length === 0) return new Response("nothing to change: mode, domains, excludeDomains, forcedMode, forcedDomains or reset required", { status: 400 });
   // Turning the relay up needs a usable address; env typos must surface here rather than degrade silently.
   const nextMode = patch.mode ?? current.mode;
   if (nextMode !== "off" && !config.relayIp) {
     return new Response("relay not deployed: RELAY_IP is missing or not a private address (mode stays as-is)", { status: 400 });
+  }
+  const nextForcedMode = patch.forcedMode ?? current.forcedMode;
+  if (nextForcedMode !== "off" && !config.relayIp) {
+    return new Response("relay not deployed: RELAY_IP is missing or not a private address (forcedMode stays as-is)", { status: 400 });
   }
   // Fields left out of the request keep their current override values (absent = env), like a PATCH.
   const merged = { ...(relayOverrideSnapshot() ?? {}), ...patch } as typeof patch;

@@ -36,6 +36,8 @@ export function config(overrides: Partial<AppConfig> = {}): AppConfig {
     relayMode: "off" as const,
     relayDomains: [],
     relayExcludeDomains: [],
+    relayForcedMode: "off" as const,
+    relayForcedDomains: [],
     safeListUrls: [],
     safeAllow: [],
     dynamicRuleHosts: ["paste.rs"],

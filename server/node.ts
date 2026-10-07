@@ -49,6 +49,8 @@ const DEFAULTS = {
   RELAY_IP: "",
   RELAY_DOMAINS: "",
   RELAY_EXCLUDE_DOMAINS: "",
+  RELAY_FORCED_MODE: "off",
+  RELAY_FORCED_DOMAINS: "",
   // Where the console's relay overrides (POST /admin/relay-config) persist across restarts; empty
   // disables persistence (overrides then live in memory only, which workers also get).
   RELAY_CONFIG_PATH: "",
@@ -254,16 +256,19 @@ function warnOnMixedUpstreamTrust(): void {
 }
 
 /**
- * RELAY_MODE without a usable private RELAY_IP degrades to off inside readConfig; naming that here
- * keeps a typo from silently disabling the relay (the failure would look like "GitHub is flaky
- * again", not like a configuration problem).
+ * RELAY_MODE / RELAY_FORCED_MODE without a usable private RELAY_IP degrades to off inside
+ * readConfig; naming that here keeps a typo from silently disabling the relay (the failure would
+ * look like "GitHub is flaky again", not like a configuration problem).
  */
 function warnOnRelayConfig(): void {
-  const mode = (process.env.RELAY_MODE ?? "").toLowerCase();
-  if (mode !== "auto" && mode !== "always") return;
   const ip = (process.env.RELAY_IP ?? "").trim();
+  const modes = [
+    ["RELAY_MODE", (process.env.RELAY_MODE ?? "").toLowerCase()].filter(([, mode]) => mode === "auto" || mode === "always"),
+    ["RELAY_FORCED_MODE", (process.env.RELAY_FORCED_MODE ?? "").toLowerCase()].filter(([, mode]) => mode === "always"),
+  ].flat();
+  if (modes.length === 0) return;
   if (!ip) {
-    console.warn(JSON.stringify({ event: "relay_config_warning", message: `RELAY_MODE=${mode} but RELAY_IP is empty: the relay path is disabled` }));
+    for (const [name, mode] of modes) console.warn(JSON.stringify({ event: "relay_config_warning", message: `${name}=${mode} but RELAY_IP is empty: the relay path is disabled` }));
     return;
   }
   const bytes = (() => {
@@ -276,9 +281,9 @@ function warnOnRelayConfig(): void {
   const [a, b] = bytes ? [bytes[0]!, bytes[1]!] : [undefined, undefined];
   const priv = a === 10 || a === 127 || (a === 172 && b! >= 16 && b! <= 31) || (a === 192 && b === 168);
   if (!priv) {
-    console.warn(JSON.stringify({
+    for (const [name, mode] of modes) console.warn(JSON.stringify({
       event: "relay_config_warning",
-      message: `RELAY_MODE=${mode} but RELAY_IP=${ip} is not a private address: the relay path is disabled`,
+      message: `${name}=${mode} but RELAY_IP=${ip} is not a private address: the relay path is disabled`,
       hint: "the relay must only ever point at an address a stranger cannot reach; use a second private IP on the LAN interface",
     }));
   }

@@ -43,31 +43,36 @@ curl -s -c /tmp/cj -H 'Content-Type: application/json' \
 
 ```bash
 curl -s -b /tmp/cj $BASE/api/summary | jq '{健康:.doh, 路径:.stats.paths, relay:.stats.pools.relay}'
-curl -s -b /tmp/cj $BASE/api/relay | jq '.relay | {mode, modeSource, domains, excludes, configVersion, appliedConfigVersion, healthy, lastReportAt}'
+curl -s -b /tmp/cj $BASE/api/relay | jq '.relay | {mode, modeSource, domains, excludes, forcedMode, forcedModeSource, forcedDomains, configVersion, appliedConfigVersion, healthy, lastReportAt}'
 ```
 
 **改配置**（`POST /api/relay-config`，未出现的字段不修改）：
 
 ```bash
-# 切档位（off | auto | always）
+# 切主池档位（off | auto | always）
 curl -s -b /tmp/cj -X POST -H 'Content-Type: application/json' \
   -d '{"mode":"auto"}' $BASE/api/relay-config
-# 改名单（整体替换该字段；支持 精确域名 / *.通配；排除优先）
+# 改名单（整体替换该字段；支持 精确域名 / *.通配；排除优先，两池共用）
 curl -s -b /tmp/cj -X POST -H 'Content-Type: application/json' \
   -d '{"domains":["*.github.com","*.githubusercontent.com"],"excludeDomains":["ssh.github.com"]}' \
   $BASE/api/relay-config
+# 强制池：只有 off | always（没有 auto）+ 独立名单
+curl -s -b /tmp/cj -X POST -H 'Content-Type: application/json' \
+  -d '{"forcedDomains":["*.google.com","*.googleapis.com","*.gstatic.com"]}' $BASE/api/relay-config
+curl -s -b /tmp/cj -X POST -H 'Content-Type: application/json' \
+  -d '{"forcedMode":"always"}' $BASE/api/relay-config
 # 带 expectedVersion=读到的 configVersion 防并发覆盖（不符会 409，刷新后重试）
 # 恢复 env 默认（清掉运行时覆盖）
 curl -s -b /tmp/cj -X POST -H 'Content-Type: application/json' -d '{"reset":true}' $BASE/api/relay-config
 ```
 
-响应的 `relay.modeSource`：`env`=来自 env 文件，`override`=控制台覆盖中。成功返回 `{ok, changed, relay:{...}}`。
+响应的 `relay.modeSource` / `relay.forcedModeSource`：`env`=来自 env 文件，`override`=控制台覆盖中。成功返回 `{ok, changed, relay:{...}}`。
 
 **审计**：`curl -s -b /tmp/cj $BASE/api/audit | jq '.entries[-10:]'`（时间/来源 IP/label/动作/结果）。
 
 ## 4. 语义速查
 
-**三档 `RELAY_MODE`**：
+**三档 `RELAY_MODE`（主池，GitHub 族）**：
 
 | 档 | 语义 | 何时用 |
 |---|---|---|
@@ -75,17 +80,26 @@ curl -s -b /tmp/cj -X POST -H 'Content-Type: application/json' -d '{"reset":true
 | `auto`（默认推荐） | 每主机健康门控：直连 15 分钟成功率 <50% 切中转，30 分钟 >80% 切回；relay 挂则立即全部回直连 | 常态 |
 | `always` | 名单内无条件中转（不看健康） | 直连长期很差时；**代价：这些站点的全部流量吃代理节点带宽** |
 
+**两档 `RELAY_FORCED_MODE`（强制池，Google 族等无实测池的域名）**：
+
+| 档 | 语义 | 何时用 |
+|---|---|---|
+| `off`（默认） | 强制名单不生效 | 常态 |
+| `always` | `RELAY_FORCED_DOMAINS` 内无条件中转（无 auto——这些域名没有实测池，auto 永远判不出"该切"；仍受 relay 健康上报约束，守护挂 ≤60s 回退直连） | Google 族这类"握手能通但质量差"的站点 |
+
+两池共享 `RELAY_IP` / `RELAY_EXCLUDE_DOMAINS` / relay 守护与健康状态；`reset` 同时清两池的覆盖。
+
 **生效时序（三层）**：改档位/删域名 → 新 DNS 答案即刻生效，存量客户端 ≤60s 收敛（中转答案 TTL≤60）；**新增域名** → relay 进程 ≤30s 才拿到新名单（同步前该域名的连接会被 relay 拒连，等 `appliedConfigVersion` 追平再用）。
 
 **同步判据**：`configVersion` ≥ `appliedConfigVersion`（且 `healthy:true`）= 名单已同步。`healthy:false` 或 `lastReportAt` 停更 = relay 守护/代理出口故障，DNS 已自动回退直连。
 
-**校验规则（服务端强校验，400 附原因）**：域名条目仅支持 精确域名 / `*.通配`；单名单 ≤64 条；ECH 域名（ECH/META/X 名单内）会被拒绝（中转读 SNI，ECH 加密 SNI，天然冲突）；`mode≠off` 且未部署（RELAY_IP 缺失/非私网）会 400 而不是静默降级。
+**校验规则（服务端强校验，400 附原因）**：域名条目仅支持 精确域名 / `*.通配`；单名单 ≤64 条；ECH 域名（ECH/META/X 名单内）会被拒绝（中转读 SNI，ECH 加密 SNI，天然冲突）；`mode`/`forcedMode` ≠`off` 且未部署（RELAY_IP 缺失/非私网）会 400 而不是静默降级；`forcedMode:"auto"` 400（强制池没有 auto）。
 
 **统计口径**：`paths`（relay/ech/pool/cn/direct）只统计**回源**解析，按回源时刻归类；命中缓存的查询单列"缓存应答"。重启主服务后计数清零。
 
 ## 5. 危险动作约定（Agent 必读）
 
-1. 切 `always` 前必须先读 `/api/relay` 确认名单条数，并在结果中向主人说明带宽代价；
+1. 切 `always`（任一池）前必须先读 `/api/relay` 确认名单条数，并在结果中向主人说明带宽代价；
 2. 新增域名后必须等 `appliedConfigVersion` 追平（≤30s）才算完成，并提醒"同步前该域名连不上是预期"；
 3. 无实测池的新域名依赖代理的 `DOMAIN-SUFFIX` 规则远程解析——添加非 GitHub 族域名前验证：`curl -x <代理地址> -sI https://<域名>`；
 4. 主服务不可达时禁止重试写操作超过 2 次，转 §6 应急通道或 systemd 检查；

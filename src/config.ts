@@ -2,6 +2,8 @@ import { parseIpv4 } from "./dns/packet";
 
 export type EcsMode = "off" | "always" | "rules";
 export type RelayMode = "off" | "auto" | "always";
+/** The forced pool skips the auto measurement entirely, so it has no "auto" to offer. */
+export type RelayForcedMode = "off" | "always";
 
 export interface AppConfig {
   upstreams: string[];
@@ -84,6 +86,17 @@ export interface AppConfig {
   relayIp?: string;
   relayDomains: string[];
   relayExcludeDomains: string[];
+  /**
+   * Forced SNI relay pool, the second tier next to relayDomains (the GitHub family): names here are
+   * pinned to the relay with no auto gating at all — only "off" and "always". Auto cannot judge
+   * them: its samples come from the measured pools (githubPoolFor/sitePoolFor) and hosts like the
+   * Google family have no pool, so they would sit on the direct path forever even while the path is
+   * unusable; their pain is link quality, not handshake failures the prober could see. Still bound
+   * by the shared invariants: the same relayIp, the same exclude list, and the daemon's liveness
+   * report — a dead relay withdraws these answers too.
+   */
+  relayForcedMode: RelayForcedMode;
+  relayForcedDomains: string[];
   /** Block lists for ?safe=1 (see safe.ts); empty disables the feature. */
   safeListUrls: string[];
   /** Domains (and their subdomains) ?safe=1 never blocks. */
@@ -129,6 +142,10 @@ function isPrivateIpv4(value: string): boolean {
 function relayModeOf(value: string | undefined): RelayMode {
   const raw = (value ?? "").toLowerCase();
   return raw === "auto" || raw === "always" ? raw : "off";
+}
+
+function relayForcedModeOf(value: string | undefined): RelayForcedMode {
+  return (value ?? "").toLowerCase() === "always" ? "always" : "off";
 }
 
 export function readConfig(env: Env): AppConfig {
@@ -182,6 +199,8 @@ export function readConfig(env: Env): AppConfig {
     relayIp: isPrivateIpv4((env.RELAY_IP ?? "").trim()) ? env.RELAY_IP!.trim() : undefined,
     relayDomains: list(env.RELAY_DOMAINS).map((item) => item.toLowerCase()),
     relayExcludeDomains: list(env.RELAY_EXCLUDE_DOMAINS).map((item) => item.toLowerCase()),
+    relayForcedMode: relayForcedModeOf(env.RELAY_FORCED_MODE),
+    relayForcedDomains: list(env.RELAY_FORCED_DOMAINS).map((item) => item.toLowerCase()),
     safeListUrls: list(env.SAFE_LIST_URLS).filter((item) => item.startsWith("https://") || item.startsWith("http://127.0.0.1")),
     safeAllow: list(env.SAFE_ALLOW).map((item) => item.toLowerCase().replace(/^\*?\./, "").replace(/\.$/, "")),
     dynamicRuleHosts: list(env.DYNAMIC_RULE_HOSTS).map((item) => item.toLowerCase()),

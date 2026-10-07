@@ -108,11 +108,13 @@ sudo systemctl start edge-smart-doh
 
 **只在局域网访问**是两层防线：控制台按 TCP 对端地址过滤（只放行回环与私网网段，可 `MONITOR_ALLOW` 覆盖，绝不信任 `X-Forwarded-For` 一类可伪造头）；`SETUP_FIREWALL=1` 时 nftables 只对内网网段放行 8788。`ADMIN_TOKEN` 与 `CONSOLE_PASSWORD` 只存在于控制台进程内存/本机 env，页面不带任何凭据（浏览器只见会话 cookie）。
 
-## SNI 中转（GitHub 族域名，可选）
+## SNI 中转（可选）
 
 直连 GitHub 的 SNI 级抖动（时好时坏）是数据面问题，DNS 答案再准也治不了。中转是给系统补的数据面杠杆：把网卡的**第二个内网 IP**（如 192.168.1.250）答给名单域名，本机 relay 进程在该 IP 的 443 上读 TLS ClientHello 的 SNI，把 TCP 流经代理（HTTP CONNECT）转给真实目标——**TLS 端到端，relay 绝不终结**，客户端看到的证书仍是真 GitHub 的。设计与完整方案见 `contrib/home/relay/DESIGN.md`。
 
-三档 `RELAY_MODE`（env 为默认值，控制台可运行时切换）：
+中转分两个池，共享 `RELAY_IP`、排除名单、relay 守护与健康状态：
+
+**主池（GitHub 族）**，三档 `RELAY_MODE`（env 为默认值，控制台可运行时切换）：
 
 | 档 | 语义 |
 |---|---|
@@ -120,7 +122,9 @@ sudo systemctl start edge-smart-doh
 | `auto` | 按主机健康门控：relay 每 3 分钟直连实测池 IP 握手，某主机 15 分钟内成功率 <50% 切中转，30 分钟内 >80% 切回直连 |
 | `always` | 名单内域名无条件走中转 |
 
-域名集合独立于档位：`RELAY_DOMAINS`（支持 `*.github.com` 通配）+ `RELAY_EXCLUDE_DOMAINS`（排除优先，默认排掉无 SNI 的 `ssh.github.com`）。HTTPS RR 会同步清洗（hint 指向中转 IP、删 ECH、ALPN 压 h2），AAAA 答空，TTL 压到 60。
+**强制池（Google 族这类没有实测池的域名）**，只有两档 `RELAY_FORCED_MODE`：`off`（默认）/ `always`（`RELAY_FORCED_DOMAINS` 内无条件走中转）。它没有 auto——auto 的判定样本只能来自实测池（GitHub/site 池），Google 族域名永远无样本、永远不切；而且这类域名"握手能通但质量差"，本来就测不出。`always` 仍受健康上报约束：relay 守护停止上报 ≤60 秒整体回退直连。
+
+域名集合独立于档位：`RELAY_DOMAINS` + `RELAY_FORCED_DOMAINS`（支持 `*.github.com` 通配）+ `RELAY_EXCLUDE_DOMAINS`（两池共用，排除优先，默认排掉无 SNI 的 `ssh.github.com`）。HTTPS RR 会同步清洗（hint 指向中转 IP、删 ECH、ALPN 压 h2），AAAA 答空，TTL 压到 60。
 
 启用：`deploy-home.sh` 配置区设 `RELAY_ENABLED=1` 重跑。脚本会问第二 IP，装 `edge-smart-doh-relay-ip.service`（`Type=oneshot` + `RemainAfterExit`，每次开机幂等补齐地址，重试覆盖 DHCP 迟到；relay 单元用 drop-in `Wants=/After=` 它），再装 `edge-smart-doh-relay.service`、生成最小权限的 `/etc/edge-smart-doh/relay.env`、种好 `RELAY_MODE=auto`。启 relay 前还会自动处理两个部署坑：
 
@@ -129,10 +133,10 @@ sudo systemctl start edge-smart-doh
 
 两个前置认知：
 
-- **防回环靠"按实测池 IP 拨号"**：relay 拨号用 `/admin/pool` 给的池 IP，不经 DNS，从根上避免"解析到中转 IP→连到自己"。仅池空时按域名 CONNECT，此时依赖代理配置里的 `DOMAIN-SUFFIX,github.com,<代理组>` 规则远程解析——装完用 `curl -x <代理> -sI https://github.com` 验证一次。
-- **降级不变量**：relay 挂了/代理挂了 → 健康上报停止 → DNS 在 TTL 内回退直连路径，最坏情况 = 没装中转。`RELAY_IP` 只接受私网地址，服务端直接拒绝公网值。
+- **防回环靠"按实测池 IP 拨号"**：relay 拨号用 `/admin/pool` 给的池 IP，不经 DNS，从根上避免"解析到中转 IP→连到自己"。仅池空时按域名 CONNECT，此时依赖代理配置里的 `DOMAIN-SUFFIX,github.com,<代理组>` 一类规则远程解析——装完用 `curl -x <代理> -sI https://github.com` 验证一次。强制池域名（Google 族）没有实测池，**全部**依赖这条路径：加名单前先确认代理里已有对应 `DOMAIN-SUFFIX` 规则。
+- **降级不变量**：relay 挂了/代理挂了 → 健康上报停止 → DNS 在 TTL 内回退直连路径（两池一起），最坏情况 = 没装中转。`RELAY_IP` 只接受私网地址，服务端直接拒绝公网值。
 
-控制台会显示中转状态（档位、健康、每主机直连成功率与是否走中转），并且**档位与两个名单都能在控制台上直接改**（运行时覆盖，立即生效、重启保留，relay 进程 ≤30 秒热同步名单，无需改 env 重启）；中转档开着但守护进程没上报时首页给黄牌。代价要想清楚：走中转的流量吃代理节点的带宽。回滚：控制台切回 `off`（或 `systemctl disable --now edge-smart-doh-relay`），60 秒内收敛。
+控制台会显示中转状态（两池档位、健康、每主机直连成功率与是否走中转），并且**两池的档位与三份名单都能在控制台上直接改**（运行时覆盖，立即生效、重启保留，relay 进程 ≤30 秒热同步名单，无需改 env 重启）；中转档开着但守护进程没上报时首页给黄牌。代价要想清楚：走中转的流量吃代理节点的带宽。回滚：控制台切回 `off`（或 `systemctl disable --now edge-smart-doh-relay`），60 秒内收敛。
 
 ## 回滚
 

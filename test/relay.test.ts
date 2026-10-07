@@ -4,7 +4,7 @@ import { DnsType, type DnsPacket } from "../src/dns/types";
 import { describeHttpsParams } from "../src/dns/https-rr";
 import { readConfig } from "../src/config";
 import { handleRequest } from "../src/index";
-import { relayCacheTag, relayServes, relayStatus, resetRelayState, setRelayHealth, setRelayOverride } from "../src/relay";
+import { relayCacheTag, relayServes, relayStatus, resetRelayState, sanitizeRelayOverride, setRelayHealth, setRelayOverride } from "../src/relay";
 import { clearGithubPools, setGithubPools } from "../src/preferred";
 import { strategyCacheTags } from "../src/plan";
 import { PUBLIC_STRATEGIES } from "../src/strategies";
@@ -52,6 +52,14 @@ describe("RELAY_* configuration", () => {
     expect(readConfig(env({ RELAY_IP: RELAY_IP })).relayDomains).toEqual(["*.github.com"]);
     expect(readConfig(env({ RELAY_IP: RELAY_IP })).relayExcludeDomains).toEqual(["ssh.github.com"]);
   });
+
+  it("forced pool: only off/always are modes, everything else (including auto) is off", () => {
+    const env = (extra: Record<string, string>) => ({ RELAY_IP: RELAY_IP, ...extra } as unknown as Env);
+    expect(readConfig(env({ RELAY_FORCED_MODE: "always", RELAY_FORCED_DOMAINS: "*.google.com" }))).toMatchObject({ relayForcedMode: "always", relayForcedDomains: ["*.google.com"] });
+    expect(readConfig(env({ RELAY_FORCED_MODE: "off" })).relayForcedMode).toBe("off");
+    expect(readConfig(env({ RELAY_FORCED_MODE: "auto" })).relayForcedMode).toBe("off");
+    expect(readConfig(env({})).relayForcedMode).toBe("off");
+  });
 });
 
 describe("relayServes", () => {
@@ -86,6 +94,81 @@ describe("relayServes", () => {
     healthyRelay();
     expect(relayServes("github.com", config({ relayMode: "off", relayIp: RELAY_IP, relayDomains: ["*.github.com"] }))).toBe(false);
     expect(relayServes("github.com", config({ relayMode: "always", relayDomains: ["*.github.com"] }))).toBe(false);
+  });
+});
+
+describe("forced pool (RELAY_FORCED_*)", () => {
+  const forcedCfg = config({ relayMode: "auto", relayIp: RELAY_IP, relayDomains: ["*.github.com"], relayForcedMode: "always", relayForcedDomains: ["*.google.com", "*.youtube.com"] });
+
+  it("serves forced names with no measurement and the main pool still in auto", () => {
+    healthyRelay();
+    // The Google-family scenario exactly: auto has no samples for these hosts, forced answers anyway.
+    expect(relayServes("www.google.com", forcedCfg)).toBe(true);
+    expect(relayServes("google.com", forcedCfg)).toBe(true);
+    expect(relayServes("youtu.be", forcedCfg)).toBe(false);
+    // Main pool stays measurement-gated: an unmeasured github host is not served.
+    expect(relayServes("github.com", forcedCfg)).toBe(false);
+  });
+
+  it("forced off, exclusions, liveness and a missing address all withdraw the forced answers", () => {
+    healthyRelay();
+    expect(relayServes("www.google.com", config({ ...forcedCfg, relayForcedMode: "off" }))).toBe(false);
+    expect(relayServes("www.google.com", config({ ...forcedCfg, relayExcludeDomains: ["www.google.com"] }))).toBe(false);
+    setRelayHealth({ source: "test", ttlSeconds: 120, healthy: false });
+    expect(relayServes("www.google.com", forcedCfg)).toBe(false);
+    healthyRelay();
+    expect(relayServes("www.google.com", config({ ...forcedCfg, relayIp: undefined }))).toBe(false);
+  });
+
+  it("forced names ride the same answers as the main pool (pin, TTL, HTTPS scrub, cache tag)", async () => {
+    healthyRelay();
+    const env = {
+      UPSTREAMS: "https://up.example/dns-query",
+      GITHUB_DOMAINS: "github.com",
+      RELAY_MODE: "auto",
+      RELAY_IP: RELAY_IP,
+      RELAY_DOMAINS: "*.github.com",
+      RELAY_FORCED_MODE: "always",
+      RELAY_FORCED_DOMAINS: "*.google.com",
+      ADMIN_TOKEN: "t",
+    } as unknown as Env;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("ips-v4")) return new Response("104.16.0.0/13\n");
+      if (String(input).includes("ips-v6")) return new Response("2606:4700::/32\n");
+      const query = parseDnsPacket(new Uint8Array(init!.body as ArrayBuffer));
+      const { name: qname, type: qtype } = query.questions[0]!;
+      const answers: DnsPacket["answers"] = [];
+      if (qtype === DnsType.A) answers.push({ name: qname, type: DnsType.A, class: 1, ttl: 3600, rdata: { kind: "a", address: "142.250.72.196" } });
+      else if (qtype === DnsType.AAAA) answers.push({ name: qname, type: DnsType.AAAA, class: 1, ttl: 3600, rdata: { kind: "aaaa", address: "2606:50c0:8000::153" } });
+      else if (qtype === DnsType.HTTPS) answers.push({ name: qname, type: DnsType.HTTPS, class: 1, ttl: 300, rdata: { kind: "https", value: { priority: 1, target: "", params: [
+        { key: 1, value: Uint8Array.from([2, 0x68, 0x33, 2, 0x68, 0x32]) },
+        { key: 4, value: Uint8Array.from([142, 250, 1, 1]) },
+        { key: 5, value: Uint8Array.from([0xfe, 0x0d, 1, 2, 3]) },
+        { key: 6, value: new Uint8Array(16).fill(1) },
+      ] } } });
+      const packet = encodeDnsPacket({ header: { id: query.header.id, flags: 0x8180, qdcount: 1, ancount: answers.length, nscount: 0, arcount: 0 }, questions: query.questions, answers, authorities: [], additionals: [] });
+      return new Response(Uint8Array.from(packet).buffer, { headers: { "Content-Type": "application/dns-message" } });
+    }));
+    const cache = new MemoryCache();
+    vi.stubGlobal("caches", { open: async () => cache });
+    const ask = async (name: string, type: number): Promise<DnsPacket> => {
+      const body = encodeDnsPacket({ header: { id: 0x4321, flags: 0x0100, qdcount: 1, ancount: 0, nscount: 0, arcount: 0 }, questions: [{ name, type, class: 1 }], answers: [], authorities: [], additionals: [] });
+      const res = await handleRequest(new Request("https://doh.example/dns-query", {
+        method: "POST",
+        headers: { Accept: "application/dns-message", "Content-Type": "application/dns-message" },
+        body: Uint8Array.from(body).buffer,
+      }), env, { waitUntil: () => undefined }, { clientIp: () => undefined, probe: () => ({}) });
+      return parseDnsPacket(new Uint8Array(await res.arrayBuffer()));
+    };
+    const a = await ask("www.google.com", DnsType.A);
+    expect(a.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: RELAY_IP }]);
+    expect(Math.min(...a.answers.filter((r) => r.type === DnsType.A).map((r) => r.ttl))).toBe(60);
+    const https = await ask("www.google.com", DnsType.HTTPS);
+    const record = https.answers.find((r) => r.type === DnsType.HTTPS);
+    const params = describeHttpsParams((record!.rdata as { kind: "https"; value: never }).value);
+    expect(params.ipv4hint).toEqual([RELAY_IP]);
+    expect(params.ech).toBeUndefined();
+    expect(params.alpn).toEqual(["h2"]);
   });
 });
 
@@ -277,6 +360,35 @@ describe("runtime relay override (console control plane)", () => {
     expect(relayServes("www.example.com", base)).toBe(false);
     expect(relayServes("github.com", base)).toBe(true);
   });
+
+  it("forced overrides: mode and domains, version bump, reset back to the env", () => {
+    const base = config({ relayMode: "off", relayIp: RELAY_IP, relayDomains: ["*.github.com"], relayForcedMode: "off", relayForcedDomains: [] });
+    healthyRelay();
+    expect(relayServes("www.google.com", base)).toBe(false);
+    const before = relayCacheTag();
+    expect(setRelayOverride({ forcedMode: "always", forcedDomains: ["*.google.com"] }, base)).toBe(true);
+    expect(relayCacheTag()).not.toBe(before);
+    expect(relayServes("www.google.com", base)).toBe(true);
+    const status = relayStatus(base);
+    expect(status).toMatchObject({ forcedMode: "always", forcedModeSource: "override", overridden: expect.arrayContaining(["forcedMode", "forcedDomains"]), forcedDomains: ["*.google.com"] });
+    expect(setRelayOverride({ forcedMode: "always", forcedDomains: ["*.google.com"] }, base)).toBe(false); // same values: no bump
+    expect(setRelayOverride(null, base)).toBe(true);
+    expect(relayServes("www.google.com", base)).toBe(false);
+    expect(relayStatus(base)).toMatchObject({ forcedMode: "off", forcedModeSource: "env", overridden: [] });
+  });
+
+  it("sanitized persisted overrides drop an unknown forced mode but keep valid fields", () => {
+    const base = config({ relayMode: "off", relayIp: RELAY_IP, relayDomains: ["*.github.com"] });
+    healthyRelay();
+    // sanitizeRelayOverride is what the Node boot path runs on the persisted JSON.
+    const patch = sanitizeRelayOverride({ forcedMode: "auto", forcedDomains: ["*.google.com", "not a domain!"] });
+    expect(patch).toEqual({ forcedDomains: ["*.google.com"] });
+    setRelayOverride(patch, base);
+    expect(relayServes("www.google.com", base)).toBe(false); // forcedMode "auto" was dropped → env off
+    const patch2 = sanitizeRelayOverride({ forcedMode: "always", forcedDomains: ["*.google.com"] });
+    setRelayOverride(patch2, base);
+    expect(relayServes("www.google.com", base)).toBe(true);
+  });
 });
 
 describe("relay admin endpoints", () => {
@@ -341,9 +453,42 @@ describe("relay admin endpoints", () => {
     const reported = (await (await post({ source: "relay@192.168.31.250", ttl: 120, healthy: true })).json()) as { relay: { domains: string[]; excludes: string[] } };
     expect(reported.relay).toMatchObject({ domains: ["*.github.com"], excludes: [] });
     await call("/admin/relay-config", { method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify({ domains: ["a.example", "*.b.example"], excludeDomains: ["x.a.example"] }) });
-    const after = (await (await post({ source: "relay@192.168.31.250", ttl: 120, healthy: true })).json()) as { relay: { domains: string[]; excludes: string[] } };
+    const after = (await (await post({ source: "relay@192.168.31.250", ttl: 120, healthy: true })).json()) as { relay: { domains: string[]; excludes: string[]; forcedDomains: string[] } };
     expect(after.relay.domains).toEqual(["a.example", "*.b.example"]);
     expect(after.relay.excludes).toEqual(["x.a.example"]);
+    expect(after.relay.forcedDomains).toEqual([]);
+  });
+
+  it("POST /admin/relay-config drives the forced pool: auto rejected, ECH conflicts rejected, no RELAY_IP rejected, valid turns on", async () => {
+    const post = (payload: unknown): Promise<Response> =>
+      call("/admin/relay-config", { method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const auto = await post({ forcedMode: "auto" });
+    expect(auto.status).toBe(400);
+    expect(await auto.text()).toContain("forcedMode");
+    const badPattern = await post({ forcedDomains: ["not a domain!"] });
+    expect(badPattern.status).toBe(400);
+    const echEnv = { UPSTREAMS: "https://up.example/dns-query", ADMIN_TOKEN: "t", X_DOMAINS: "x.com,.x.com,twimg.com", RELAY_MODE: "always", RELAY_IP: RELAY_IP, RELAY_DOMAINS: "*.github.com" } as unknown as Env;
+    const ech = await handleRequest(new Request("https://doh.example/admin/relay-config", {
+      method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify({ forcedDomains: ["*.twimg.com"] }),
+    }), echEnv, { waitUntil: () => undefined }, { clientIp: () => undefined, probe: () => ({}) });
+    expect(ech.status).toBe(400);
+    expect(await ech.text()).toContain("ECH");
+    const noIp = await handleRequest(new Request("https://doh.example/admin/relay-config", {
+      method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify({ forcedMode: "always" }),
+    }), { UPSTREAMS: "https://up.example/dns-query", ADMIN_TOKEN: "t", RELAY_DOMAINS: "*.github.com" } as unknown as Env, { waitUntil: () => undefined }, { clientIp: () => undefined, probe: () => ({}) });
+    expect(noIp.status).toBe(400);
+    expect(await noIp.text()).toContain("RELAY_IP");
+    // Valid: forced on, and a forced name is served over an env of forced off.
+    healthyRelay();
+    const cfg = () => readConfig(env);
+    expect(relayServes("www.google.com", cfg())).toBe(false);
+    const applied = await post({ forcedMode: "always", forcedDomains: ["*.google.com"] });
+    expect(applied.status).toBe(200);
+    expect(((await applied.json()) as { relay: { forcedMode: string; forcedModeSource: string } }).relay).toMatchObject({ forcedMode: "always", forcedModeSource: "override" });
+    expect(relayServes("www.google.com", cfg())).toBe(true);
+    // The daemon side channel carries the forced list alongside the main lists.
+    const health = (await (await call("/admin/relay-health", { method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify({ source: "relay@192.168.31.250", ttl: 120, healthy: true }) })).json()) as { relay: { forcedDomains: string[]; forcedMode: string } };
+    expect(health.relay).toMatchObject({ forcedMode: "always", forcedDomains: ["*.google.com"] });
   });
 
   it("guards the control plane: version conflicts, ECH-domain conflicts, missing RELAY_IP", async () => {

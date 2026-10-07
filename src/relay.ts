@@ -1,4 +1,4 @@
-import type { AppConfig, RelayMode } from "./config";
+import type { AppConfig, RelayForcedMode, RelayMode } from "./config";
 import { domainMatches } from "./dns/ecs";
 
 /**
@@ -13,11 +13,16 @@ import { domainMatches } from "./dns/ecs";
  * path (ENTER: <50% handshakes over 15 minutes) to hand a host to the relay and a persistently good
  * one (EXIT: >80% over 30 minutes) to take it back, so minute-scale SNI flapping cannot ping-pong
  * answers between paths. A host with no samples is never handed over (like an unmeasured pool, the
- * answer stays untouched).
+ * answer stays untouched). That is exactly why the forced pool exists: hosts without a measured
+ * pool (the Google family) can never earn their way into the relay under auto, so their names live
+ * in relayForcedDomains, which only has "off" and "always" — no measurement, no hysteresis, the
+ * name is pinned whenever the daemon is alive. Both pools share the relay IP, the exclude list and
+ * the liveness report.
  *
  * On top of the env there is a runtime override layer (the console's control plane, POST
- * /admin/relay-config): mode and the two domain lists can be changed without a restart, the change
- * bumps the version (so cached answers re-key at once) and is persisted by the Node server.
+ * /admin/relay-config): mode and the domain lists of both pools can be changed without a restart,
+ * the change bumps the version (so cached answers re-key at once) and is persisted by the Node
+ * server.
  */
 
 /** Answer TTL for relay-pinned names: how fast a withdrawn relay stops being served. */
@@ -45,6 +50,8 @@ export interface RelayOverride {
   mode?: RelayMode;
   domains?: string[];
   excludeDomains?: string[];
+  forcedMode?: RelayForcedMode;
+  forcedDomains?: string[];
 }
 
 let override: RelayOverride | null = null;
@@ -55,6 +62,8 @@ export interface EffectiveRelayConfig {
   ip?: string;
   domains: string[];
   excludeDomains: string[];
+  forcedMode: RelayForcedMode;
+  forcedDomains: string[];
   /** Fields the console override owns; empty = the env values are in effect. */
   overridden: string[];
 }
@@ -64,17 +73,21 @@ export function effectiveRelayConfig(config: AppConfig): EffectiveRelayConfig {
   if (override?.mode !== undefined) overridden.push("mode");
   if (override?.domains !== undefined) overridden.push("domains");
   if (override?.excludeDomains !== undefined) overridden.push("excludeDomains");
+  if (override?.forcedMode !== undefined) overridden.push("forcedMode");
+  if (override?.forcedDomains !== undefined) overridden.push("forcedDomains");
   return {
     mode: override?.mode ?? config.relayMode,
     ip: config.relayIp,
     domains: override?.domains ?? config.relayDomains,
     excludeDomains: override?.excludeDomains ?? config.relayExcludeDomains,
+    forcedMode: override?.forcedMode ?? config.relayForcedMode,
+    forcedDomains: override?.forcedDomains ?? config.relayForcedDomains,
     overridden,
   };
 }
 
 function relayFingerprint(effective: EffectiveRelayConfig): string {
-  return JSON.stringify([effective.mode, effective.ip ?? "", [...effective.domains].sort(), [...effective.excludeDomains].sort()]);
+  return JSON.stringify([effective.mode, effective.ip ?? "", [...effective.domains].sort(), [...effective.excludeDomains].sort(), effective.forcedMode, [...effective.forcedDomains].sort()]);
 }
 
 /** Applies a console override (validated by the caller); bumps the cache version when the effective config changed. */
@@ -84,6 +97,8 @@ export function setRelayOverride(patch: RelayOverride | null, config: AppConfig)
     ...(patch.mode !== undefined ? { mode: patch.mode } : {}),
     ...(patch.domains !== undefined ? { domains: [...new Set(patch.domains)].slice(0, MAX_RELAY_DOMAINS) } : {}),
     ...(patch.excludeDomains !== undefined ? { excludeDomains: [...new Set(patch.excludeDomains)].slice(0, MAX_RELAY_DOMAINS) } : {}),
+    ...(patch.forcedMode !== undefined ? { forcedMode: patch.forcedMode } : {}),
+    ...(patch.forcedDomains !== undefined ? { forcedDomains: [...new Set(patch.forcedDomains)].slice(0, MAX_RELAY_DOMAINS) } : {}),
   } : null;
   const changed = relayFingerprint(effectiveRelayConfig(config)) !== before;
   if (changed) {
@@ -95,7 +110,12 @@ export function setRelayOverride(patch: RelayOverride | null, config: AppConfig)
 }
 
 export function relayOverrideSnapshot(): RelayOverride | null {
-  return override ? { ...override, domains: override.domains ? [...override.domains] : undefined, excludeDomains: override.excludeDomains ? [...override.excludeDomains] : undefined } : null;
+  return override ? {
+    ...override,
+    domains: override.domains ? [...override.domains] : undefined,
+    excludeDomains: override.excludeDomains ? [...override.excludeDomains] : undefined,
+    forcedDomains: override.forcedDomains ? [...override.forcedDomains] : undefined,
+  } : null;
 }
 
 /** Registers the persistence hook; the Node server writes the override to its state directory, workers keep it in memory. */
@@ -124,7 +144,15 @@ export function sanitizeRelayOverride(value: unknown): RelayOverride | null {
   const mode = source.mode === "off" || source.mode === "auto" || source.mode === "always" ? source.mode : undefined;
   const domains = patterns(source.domains);
   const excludeDomains = patterns(source.excludeDomains);
-  const patch: RelayOverride = { ...(mode !== undefined ? { mode } : {}), ...(domains !== undefined ? { domains } : {}), ...(excludeDomains !== undefined ? { excludeDomains } : {}) };
+  const forcedMode = source.forcedMode === "off" || source.forcedMode === "always" ? source.forcedMode : undefined;
+  const forcedDomains = patterns(source.forcedDomains);
+  const patch: RelayOverride = {
+    ...(mode !== undefined ? { mode } : {}),
+    ...(domains !== undefined ? { domains } : {}),
+    ...(excludeDomains !== undefined ? { excludeDomains } : {}),
+    ...(forcedMode !== undefined ? { forcedMode } : {}),
+    ...(forcedDomains !== undefined ? { forcedDomains } : {}),
+  };
   return Object.keys(patch).length > 0 ? patch : null;
 }
 
@@ -235,13 +263,16 @@ export function setRelayHealth(report: RelayHealthReport): void {
   if (changed) state.version += 1;
 }
 
-/** Whether the answer for `name` should point at the relay right now (mode, health, auto gating). */
+/** Whether the answer for `name` should point at the relay right now (either pool: mode, health, auto gating). */
 export function relayServes(name: string, config: AppConfig): boolean {
   const effective = effectiveRelayConfig(config);
-  if (effective.mode === "off" || !effective.ip) return false;
+  if (!effective.ip || !relayAlive()) return false;
   if (domainMatches(name, effective.excludeDomains)) return false;
+  // The forced pool answers unconditionally (within liveness): its hosts have no measured pool, so
+  // auto could never judge them — see the interface comment on AppConfig.relayForcedDomains.
+  if (effective.forcedMode === "always" && domainMatches(name, effective.forcedDomains)) return true;
+  if (effective.mode === "off") return false;
   if (!domainMatches(name, effective.domains)) return false;
-  if (!relayAlive()) return false;
   return effective.mode === "always" || hosts.get(name)?.relayed === true;
 }
 
@@ -258,6 +289,10 @@ export function relayStatus(config: AppConfig): {
   excludes: string[];
   envDomains: string[];
   envExcludes: string[];
+  forcedMode: RelayForcedMode;
+  forcedModeSource: "env" | "override";
+  forcedDomains: string[];
+  envForcedDomains: string[];
   healthy: boolean;
   livenessUntil: number;
   lastSource: string;
@@ -277,6 +312,10 @@ export function relayStatus(config: AppConfig): {
     excludes: effective.excludeDomains,
     envDomains: config.relayDomains,
     envExcludes: config.relayExcludeDomains,
+    forcedMode: effective.forcedMode,
+    forcedModeSource: effective.overridden.includes("forcedMode") ? "override" : "env",
+    forcedDomains: effective.forcedDomains,
+    envForcedDomains: config.relayForcedDomains,
     healthy: relayAlive(),
     livenessUntil: state.livenessUntil,
     lastSource: state.lastSource,

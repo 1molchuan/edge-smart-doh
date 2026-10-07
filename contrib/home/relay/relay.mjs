@@ -34,16 +34,20 @@ const LISTEN_IP = required("RELAY_LISTEN_IP");
 const LISTEN_PORT = integer("RELAY_LISTEN_PORT", 443, 1, 65535);
 const [PROXY_HOST, PROXY_PORT_RAW] = required("RELAY_PROXY").split(":");
 const PROXY_PORT = Number.parseInt(PROXY_PORT_RAW, 10);
-// The env values are the bootstrap; once the DoH server answers a health report it owns the list
+// The env values are the bootstrap; once the DoH server answers a health report it owns the lists
 // (console edits flow through /admin/relay-config), so patterns sync without restarting this daemon.
+// DOMAINS is the auto-capable pool (GitHub family); FORCED is the always-only pool (Google family:
+// no measured pool, nothing for auto to judge) — for SNI forwarding both pools are just "names we
+// relay", so the match set is their union.
 let DOMAINS = (process.env.RELAY_DOMAINS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+let FORCED = (process.env.RELAY_FORCED_DOMAINS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 let EXCLUDE = (process.env.RELAY_EXCLUDE_DOMAINS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 let appliedConfigVersion = 0;
 const ADMIN_URL = process.env.RELAY_ADMIN_URL || "http://127.0.0.1:8787";
 const ADMIN_TOKEN = process.env.RELAY_ADMIN_TOKEN ?? "";
 const REPORT_TTL_SECONDS = integer("RELAY_REPORT_TTL", 120, 30, 3600); // server withdraws ~3 missed reports later
 const CHECK_INTERVAL_SECONDS = integer("RELAY_CHECK_INTERVAL", 30, 5, 600);
-const SELF_CHECK_HOST = process.env.RELAY_SELF_CHECK_HOST || "github.com";
+const SELF_CHECK_HOST_ENV = process.env.RELAY_SELF_CHECK_HOST || "";
 // Auto mode's direct-path measurement: handshake the measured pool IPs straight from this line and
 // report per-host verdicts; the server's hysteresis (relay.ts) decides when a host moves to the
 // relay. Hosts without a measured pool cannot be judged and stay on the direct path.
@@ -79,7 +83,8 @@ function matches(name, pattern) {
 }
 
 function relayedName(name) {
-  return !EXCLUDE.some((pattern) => matches(name, pattern)) && DOMAINS.some((pattern) => matches(name, pattern));
+  if (EXCLUDE.some((pattern) => matches(name, pattern))) return false;
+  return DOMAINS.some((pattern) => matches(name, pattern)) || FORCED.some((pattern) => matches(name, pattern));
 }
 
 /** Applies a domain-list/configVersion pair served with a health-report response. */
@@ -89,11 +94,14 @@ function syncFromServer(relay) {
   const domains = clean(relay?.domains);
   const excludes = clean(relay?.excludes);
   if (!domains || !excludes) return; // a server without the fields (or an error body) keeps the current sets
-  const changed = JSON.stringify(domains) !== JSON.stringify(DOMAINS) || JSON.stringify(excludes) !== JSON.stringify(EXCLUDE);
+  const forced = clean(relay?.forcedDomains);
+  const changed = JSON.stringify(domains) !== JSON.stringify(DOMAINS) || JSON.stringify(excludes) !== JSON.stringify(EXCLUDE) || (forced && JSON.stringify(forced) !== JSON.stringify(FORCED));
   DOMAINS = domains;
   EXCLUDE = excludes;
+  // A pre-forced-pool server never sends forcedDomains: its env bootstrap list then stays in force.
+  if (forced) FORCED = forced;
   if (typeof relay.configVersion === "number" && Number.isFinite(relay.configVersion)) appliedConfigVersion = relay.configVersion;
-  if (changed) console.log(JSON.stringify({ event: "config_applied", configVersion: appliedConfigVersion, domains: DOMAINS.length, excludes: EXCLUDE.length }));
+  if (changed) console.log(JSON.stringify({ event: "config_applied", configVersion: appliedConfigVersion, domains: DOMAINS.length, forced: FORCED.length, excludes: EXCLUDE.length }));
 }
 
 // ---------------------------------------------------------------- ClientHello SNI
@@ -263,7 +271,7 @@ server.on("error", (error) => {
   process.exit(1);
 });
 server.listen(LISTEN_PORT, LISTEN_IP, () => {
-  console.log(JSON.stringify({ event: "listening", ip: LISTEN_IP, port: LISTEN_PORT, domains: DOMAINS.length, proxy: `${PROXY_HOST}:${PROXY_PORT}` }));
+  console.log(JSON.stringify({ event: "listening", ip: LISTEN_IP, port: LISTEN_PORT, domains: DOMAINS.length, forced: FORCED.length, proxy: `${PROXY_HOST}:${PROXY_PORT}` }));
 });
 
 // ---------------------------------------------------------------- direct-path prober
@@ -319,9 +327,26 @@ async function probeAndReport() {
 
 let consecutiveFailures = 0;
 
+/**
+ * The SNI the self-check dials with. It must be a name this daemon would actually forward — the
+ * check walks our own listener — so a fixed "github.com" would false-fail (and report unhealthy,
+ * withdrawing the forced pool too) once the main pool no longer lists it. Prefer the env override,
+ * then github.com while the main pool has it, then the bare domain of the first pattern of either
+ * pool. The lists hot-sync, so this is recomputed on every check.
+ */
+function selfCheckHost() {
+  if (SELF_CHECK_HOST_ENV) return SELF_CHECK_HOST_ENV;
+  if (relayedName("github.com")) return "github.com";
+  for (const pattern of [...FORCED, ...DOMAINS]) {
+    const bare = pattern.replace(/^\*\./, "").replace(/^\./, "");
+    if (relayedName(bare)) return bare;
+  }
+  return "github.com";
+}
+
 function selfCheck() {
   return new Promise((resolve) => {
-    const socket = tls.connect({ host: LISTEN_IP, port: LISTEN_PORT, servername: SELF_CHECK_HOST, rejectUnauthorized: false, timeout: 8000 }, () => {
+    const socket = tls.connect({ host: LISTEN_IP, port: LISTEN_PORT, servername: selfCheckHost(), rejectUnauthorized: false, timeout: 8000 }, () => {
       socket.destroy();
       resolve(true);
     });

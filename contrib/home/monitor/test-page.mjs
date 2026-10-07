@@ -29,6 +29,7 @@ function makeEl(id) {
   return {
     id, textContent: "", innerHTML: "", value: "", hidden: false, disabled: false, open: false,
     className: "", dataset: {},
+    style: { setProperty() {} },
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
     addEventListener() {}, appendChild() {},
     querySelectorAll() { return []; }, querySelector() { return null; },
@@ -67,6 +68,7 @@ const summary = {
       relay: {
         mode: "auto", modeSource: "env", overridden: [], ip: "192.168.3.250",
         domains: ["*.github.com"], excludes: ["ssh.github.com"], envDomains: ["*.github.com"], envExcludes: ["ssh.github.com"],
+        forcedMode: "always", forcedDomains: ["*.google.com"], envForcedDomains: ["*.google.com"],
         healthy: true, livenessUntil: now + 60000, lastSource: "relay@192.168.3.250", lastReportAt: now - 5000,
         version: 3, configVersion: 2, appliedConfigVersion: 2,
         hosts: [{ host: "github.com", relayed: true, samples: 10, enterRate: 0.2, exitRate: null, lastSampleAt: now - 3000 }],
@@ -104,12 +106,15 @@ const expect = (label, actual, includes) => {
 expect("健康判定 #v-text", text("v-text"), "运行正常");
 if (text("v-sub").includes("正在连接")) failures.push(`#v-sub 仍是初始文案: ${text("v-sub")}`);
 expect("#v-sub 含上游地址", text("v-sub"), "127.0.0.1:8787");
+expect("状态磁贴活动条摘要", text("status-activity-cap"), "近 1 小时");
+if ((elements.get("status-activity")?.innerHTML ?? "").length < 100) failures.push("#status-activity 迷你柱条未渲染");
 expect("总查询卡", text("stat-total"), "1,018");
 expect("路径面板含 SNI 中转", html("paths-panel"), "SNI 中转");
 expect("路径面板含 ECH 注入", html("paths-panel"), "ECH 注入");
 expect("最近查询路径徽章", html("recent-body"), "badge");
-expect("池状态含中转档位", html("pools-body"), "档位 auto");
+expect("池状态含主池档位", html("pools-body"), "主池 auto");
 expect("池状态含走中转主机", html("pools-body"), "走中转");
+expect("池状态含强制池", html("pools-body"), "强制池");
 expect("页脚模式", text("foot-mode"), "纯监控");
 if (failures.length) {
   console.error("FAIL\n" + failures.join("\n"));

@@ -52,8 +52,17 @@ relay 内置 prober（180s 周期）─ 直连池 IP 握手 + 经自身链路握
 RELAY_MODE=off            # off | auto | always；未设置 = off
 RELAY_IP=192.168.x.250    # 网卡第二内网 IP；mode≠off 时必填
 RELAY_DOMAINS=*.github.com,*.githubusercontent.com,*.githubassets.com,*.github.io
-RELAY_EXCLUDE_DOMAINS=ssh.github.com   # 排除优先于命中
+RELAY_EXCLUDE_DOMAINS=ssh.github.com   # 排除优先于命中（两池共用）
+# 强制池（第二档名单，与主池分开）：只有 off | always 两档
+RELAY_FORCED_MODE=off
+RELAY_FORCED_DOMAINS=*.google.com,*.googleapis.com,*.gstatic.com
 ```
+
+**强制池为什么没有 auto**：auto 的判定回路是"relay 每 180s 直连实测池 IP 握手 → 滑窗 + 滞回"，
+样本只能来自实测池（`/admin/pool` = githubPool/sitePool）。Google 族域名不在任何池里 → 永远无
+样本 → auto 下永远保持直连，即使链路早已不可用；而这类域名的劣化形态（握手能通、质量差）本来
+就不是握手探测能测出的。所以第二池不测量：`always` 时名单即钉死（仍受 daemon 健康上报约束，
+停止上报 ≤60s 内整体回退直连，不变量不变）。两池共享 `RELAY_IP`、排除名单、daemon 与健康状态。
 
 ### 2.2 src/config.ts
 
@@ -81,7 +90,8 @@ relayCacheTag(): string | undefined                      // `relay=v<n>`，版�
 ```
 
 - 档位语义：`always` → 名单命中即服务；`auto` → 名单命中 **且** 该主机状态机在 relayed 态；
-  `off` → 一律不服务（`relayCacheTag()` 恒 undefined）。
+  `off` → 一律不服务（`relayCacheTag()` 恒 undefined）。强制池（`relayForcedDomains`）：
+  `always` → 名单命中即服务（无 auto，理由见 §2.1）；两池共用 liveness 与排除名单。
 - per-host 状态机（auto 档）：默认 `direct`。
   - `direct → relayed`：直连滑窗（15 分钟）成功率 < 50% **且** relayHealthy；
   - `relayed → direct`：直连滑窗（30 分钟）成功率 > 80%，或 relayHealthy 变 false（**立即**，全主机）；
@@ -152,7 +162,9 @@ relay 想测"直连质量"必须有一条**不经过覆写**的取 IP 通道；�
   （record 5B → handshake 头 4B → ClientHello 里 extensions 找 type 0x0000；
   TLS 1.2/1.3 的 ClientHello 明文层结构相同）。解析失败 / 无 SNI → destroy（**不猜**，
   完整版 sniffer 的容错哲学）。
-- SNI 名单检查：内置一份与 `domainMatches` 等价的通配匹配（~10 行），含排除优先。
+- SNI 名单检查：内置一份与 `domainMatches` 等价的通配匹配（~10 行），含排除优先。匹配集是
+  两池名单的并集（`RELAY_DOMAINS ∪ RELAY_FORCED_DOMAINS`）——对转发而言只有"转不转"之分，
+  池是服务端的概念；auto 未接管的主机 DNS 不答中转 IP，客户端本来就不会连过来。
 - 拨号：
   1. `GET http://127.0.0.1:8787/admin/pool?name=<sni>`（带 token，结果缓存 60s）；
   2. 有池 → 取前 2 个 IP 逐个尝试：TCP 连 `PROXY_ADDR`，手写 `CONNECT <ip>:443 HTTP/1.1`，
@@ -180,6 +192,7 @@ relay 想测"直连质量"必须有一条**不经过覆写**的取 IP 通道；�
 ```bash
 RELAY_LISTEN_IP=192.168.x.250
 RELAY_DOMAINS=...              # 与主 env 同源生成，不手工维护两份
+RELAY_FORCED_DOMAINS=...       # 同上；控制台编辑后由健康上报响应热同步
 RELAY_EXCLUDE_DOMAINS=...
 RELAY_PROXY=127.0.0.1:7890
 RELAY_ADMIN_TOKEN=...          # 与主 ADMIN_TOKEN 同值；不整份读主 env，最小权限
@@ -337,6 +350,7 @@ edge-smart-doh-relay` → 删第二 IP（`ip addr del` + 后端配置移除）�
   `ProxyCommand nc -X connect -x 127.0.0.1:7890 %h %p` 的客户端侧替代）；
 - 80 端口（http 明文访问 GitHub 场景可忽略）；
 - ECH 站点进名单（与 SNI 观察者天然冲突；要加就得接受"摘 ECH 走中转"）；
-- 按站点分档/站点分组配置（等第二个站点真的来了，只动 config.ts 解析层）；
+- 按站点分档/站点分组配置（~~等第二个站点真的来了~~——已来了：强制池即第二个站点分组，
+  以"并列的第二份名单 + 档位"实现，未做完全通用的分组层）；
 - relay 内直连优先+失败重拨（省节点带宽的 v1.1 优化项，默认关）；
 - 全网流量接管（那是 mihomo TUN + fake-ip 合体形态的定位，与本方案互不越界）。

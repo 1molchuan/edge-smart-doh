@@ -100,10 +100,13 @@ export const githubPool: Strategy = {
 /**
  * The home SNI relay (contrib/home/relay, see its DESIGN.md): the name is answered with the LAN
  * address of a local relay that forwards the TCP flow through the egress proxy by SNI, TLS staying
- * end to end. "always" serves every name in RELAY_DOMAINS; "auto" only hosts whose measured direct
- * path went bad (relay.ts); both step aside the moment the relay stops reporting healthy, so the
- * worst case is the un-relayed answer of yesterday. Sits between the site-pool and GitHub-pool
- * strategies: it takes the addresses decision for good (github-pool then leaves the name alone).
+ * end to end. Two pools share this one strategy: the main list (RELAY_DOMAINS, the GitHub family)
+ * serves under "always" or, in "auto", only hosts whose measured direct path went bad (relay.ts),
+ * while the forced list (RELAY_FORCED_DOMAINS, the Google family) answers unconditionally in
+ * "always" — its hosts have no measured pool for auto to judge them by. Both step aside the moment
+ * the relay stops reporting healthy, so the worst case is the un-relayed answer of yesterday. Sits
+ * between the site-pool and GitHub-pool strategies: it takes the addresses decision for good
+ * (github-pool then leaves the name alone).
  */
 export const relay: Strategy = {
   name: "relay",
@@ -111,13 +114,14 @@ export const relay: Strategy = {
   cacheTag: (ctx: RequestContext) => (relayServes(ctx.name, ctx.config) ? relayCacheTag() : undefined),
   async apply(ctx: PlanContext, plan) {
     if (!relayServes(ctx.name, ctx.config)) return;
-    const { ip, mode } = effectiveRelayConfig(ctx.config);
+    const { ip, mode, forcedMode } = effectiveRelayConfig(ctx.config);
+    const via = forcedMode === "always" ? "forced" : mode;
     if (ctx.type === DnsType.A || ctx.type === DnsType.AAAA) {
       plan.pin = [ip!];
       plan.pinTtl = RELAY_PIN_TTL;
       plan.locked.addresses = true;
       plan.strategy = "relay";
-      ctx.notes?.push(`relay: answer pinned to ${ip}, IPv6 dropped (mode ${mode})`);
+      ctx.notes?.push(`relay: answer pinned to ${ip}, IPv6 dropped (pool ${via})`);
     } else if (ctx.type === DnsType.HTTPS) {
       plan.locked.ech = true;
       plan.strategy = "relay";

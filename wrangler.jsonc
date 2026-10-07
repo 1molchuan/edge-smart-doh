@@ -51,6 +51,8 @@
     "RELAY_IP": "",
     "RELAY_DOMAINS": "",
     "RELAY_EXCLUDE_DOMAINS": "",
+    "RELAY_FORCED_MODE": "off",
+    "RELAY_FORCED_DOMAINS": "",
     "SAFE_LIST_URLS": "",
     "SAFE_ALLOW": "",
     "DYNAMIC_RULE_HOSTS": "paste.rs,raw.githubusercontent.com,gist.githubusercontent.com",

@@ -6,6 +6,9 @@
  *   · 监测（不变）：/health 可达性、/admin/stats 指标、主动解析探测；
  *   · 控制（新）：代理主服务 POST /admin/relay-config——relay 档位（off/auto/always）与
  *     域名名单（RELAY_DOMAINS / RELAY_EXCLUDE_DOMAINS）的运行时变更，改完即生效；
+ *     强制池（Google 族，只有 off/always 两档，无 auto——其域名没有实测池可判）的档位
+ *     与名单（RELAY_FORCED_MODE / RELAY_FORCED_DOMAINS）走同一接口，与主池共享
+ *     RELAY_IP / 排除名单 / relay 守护与健康状态；
  *   · 统计分类（新）：回源路径分布（SNI 中转 / ECH 注入 / 优选池 / 国内直连 / 直连 + 缓存应答）；
  *   · 访问控制（新）：CONSOLE_PASSWORD（monitor.env，0600 root）+ 内存会话 cookie。
  *
@@ -466,6 +469,8 @@ function sanitizeRelayConfigBody(value) {
   if (value?.mode !== undefined) out.mode = value.mode;
   if (value?.domains !== undefined) out.domains = value.domains;
   if (value?.excludeDomains !== undefined) out.excludeDomains = value.excludeDomains;
+  if (value?.forcedMode !== undefined) out.forcedMode = value.forcedMode;
+  if (value?.forcedDomains !== undefined) out.forcedDomains = value.forcedDomains;
   if (value?.expectedVersion !== undefined) out.expectedVersion = value.expectedVersion;
   if (value?.reset !== undefined) out.reset = value.reset;
   return out;
@@ -623,6 +628,15 @@ const PAGE = `<!doctype html>
   .vwhy { display: none; margin: 12px 0 0; padding: 9px 12px; border-radius: 10px; font-size: 13px; line-height: 1.6; }
   .vwhy.bad { display: block; background: #2c1216; border: 1px solid #7f1d1d; color: #fca5a5; }
   .vwhy.warn { display: block; background: #2a1c06; border: 1px solid #78350f; color: #fcd34d; }
+  /* 状态磁贴里的近 1 小时活动迷你柱条（与查询量图同语言：绿=命中 蓝=回源 红=失败） */
+  .activity { margin: 16px 0 4px; }
+  .activity .strip { display: flex; align-items: flex-end; gap: 2px; height: 42px; }
+  .activity .sb { flex: 1 1 0; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; border-radius: 1.5px; overflow: hidden; background: #141d38; }
+  .activity .sb i { display: block; width: 100%; }
+  .activity .sb i.h { background: rgba(52,211,153,.8); }
+  .activity .sb i.m { background: rgba(56,189,248,.8); }
+  .activity .sb i.e { background: rgba(248,113,113,.85); }
+  .activity .cap { color: var(--ink-3); font-size: 11.5px; margin-top: 8px; }
   .status .meta { margin-top: auto; padding-top: 14px; }
   .vsub { color: var(--ink-2); font-size: 12.5px; }
   #refresh-line { display: block; color: var(--ink-3); font-size: 12px; margin-top: 3px; min-height: 15px; }
@@ -718,13 +732,14 @@ const PAGE = `<!doctype html>
 
   /* ===================== 控制甲板（琥珀语言） ===================== */
   .deck { border-color: #6d3b0a; box-shadow: inset 0 1px 0 rgba(245,158,11,.12); padding: 0; overflow: hidden; }
-  .deck-head { display: grid; grid-template-columns: 1.1fr 1fr; gap: 0; }
+  .deck-head { display: grid; grid-template-columns: 1.15fr 1fr 1.15fr; gap: 0; }
   @media (max-width: 980px) { .deck-head { grid-template-columns: 1fr; } }
-  .deck-mode { padding: 16px 18px; border-right: 1px dashed #54320d; }
+  .deck-mode { padding: 16px 18px; border-right: 1px dashed #54320d; min-width: 0; }
   @media (max-width: 980px) { .deck-mode { border-right: none; border-bottom: 1px dashed #54320d; } }
   .deck-side { padding: 16px 18px; display: flex; flex-direction: column; justify-content: center; gap: 8px; }
-  .mode-now { display: flex; align-items: center; gap: 10px; margin: 2px 0 12px; }
+  .mode-now { display: flex; align-items: center; gap: 10px; margin: 2px 0 12px; flex-wrap: wrap; }
   .mode-now b { font-size: 23px; font-weight: 800; letter-spacing: .5px; }
+  .mode-now.sm b { font-size: 19px; }
   .srcbadge { color: var(--amber); border: 1px solid #78350f; background: #2a1c06; font-size: 11px; border-radius: 999px; padding: 1px 9px; }
   .srcbadge.env { color: var(--ink-2); border-color: var(--line); background: var(--s2); }
   .seg { display: inline-flex; border: 1px solid #54320d; border-radius: 11px; overflow: hidden; background: rgba(245,158,11,.05); }
@@ -741,7 +756,8 @@ const PAGE = `<!doctype html>
   .cresult.warn { background: #2a1c06; border: 1px solid #78350f; color: #fcd34d; }
   .cresult.err { background: #2c1216; border: 1px solid #7f1d1d; color: #fca5a5; }
   .deck-body { padding: 14px 18px 16px; border-top: 1px solid #54320d; }
-  .lists { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .lists { display: grid; grid-template-columns: 1fr 1fr .92fr; gap: 16px; }
+  @media (max-width: 1130px) { .lists { grid-template-columns: 1fr 1fr; } }
   @media (max-width: 980px) { .lists { grid-template-columns: 1fr; } }
   .list-edit h3 { font-size: 12px; color: #d7c9ae; margin: 0 0 8px; font-weight: 700; letter-spacing: .04em; }
   .list-edit h3 code { color: var(--ink-3); font-size: 11px; }
@@ -833,6 +849,10 @@ const PAGE = `<!doctype html>
         <span id="v-text">检测中…</span>
       </div>
       <div class="vwhy" id="v-why"></div>
+      <div class="activity">
+        <div class="strip" id="status-activity"></div>
+        <div class="cap" id="status-activity-cap"></div>
+      </div>
       <div class="meta">
         <div class="vsub" id="v-sub">正在连接 8788 控制台服务…</div>
         <span id="refresh-line"></span>
@@ -882,12 +902,20 @@ const PAGE = `<!doctype html>
   <div class="tile deck" id="control-panel" hidden>
     <div class="deck-head">
       <div class="deck-mode">
-        <div class="kk">档位 <span class="h2s">变更即刻生效 · 持久化（重启保留）</span></div>
+        <div class="kk">主池档位 <span class="h2s">GitHub 族 · 变更即刻生效 · 持久化（重启保留）</span></div>
         <div class="mode-now"><b id="relay-mode-text">—</b><span class="srcbadge" id="relay-mode-source"></span></div>
         <div class="seg" id="mode-seg">
           <button type="button" data-mode="off">off · 直连</button>
           <button type="button" data-mode="auto">auto · 自动</button>
           <button type="button" data-mode="always" class="danger">always · 常开</button>
+        </div>
+      </div>
+      <div class="deck-mode">
+        <div class="kk">强制池档位 <span class="h2s">Google 族 · 无 auto（无实测池可判）</span></div>
+        <div class="mode-now sm"><b id="forced-mode-text">—</b><span class="srcbadge" id="forced-mode-source"></span></div>
+        <div class="seg" id="forced-mode-seg">
+          <button type="button" data-fmode="off">off · 直连</button>
+          <button type="button" data-fmode="always" class="danger">always · 常开</button>
         </div>
       </div>
       <div class="deck-side">
@@ -906,7 +934,13 @@ const PAGE = `<!doctype html>
           <div class="field-err" id="domain-err"></div>
         </div>
         <div class="list-edit">
-          <h3>排除名单 <code>RELAY_EXCLUDE_DOMAINS</code> <span class="muted">排除优先于命中</span></h3>
+          <h3>强制名单 <code>RELAY_FORCED_DOMAINS</code> <span class="muted">不看测量，always 时全部走中转</span></h3>
+          <div class="chips" id="forced-chips"></div>
+          <div class="addrow"><input id="forced-input" placeholder="*.google.com"><button type="button" id="forced-add">添加</button></div>
+          <div class="field-err" id="forced-err"></div>
+        </div>
+        <div class="list-edit">
+          <h3>排除名单 <code>RELAY_EXCLUDE_DOMAINS</code> <span class="muted">两池共用 · 排除优先</span></h3>
           <div class="chips" id="excludes-chips"></div>
           <div class="addrow"><input id="exclude-input" placeholder="no-sni.example.com"><button type="button" id="exclude-add">添加</button></div>
           <div class="field-err" id="exclude-err"></div>
@@ -979,7 +1013,7 @@ const MODE_TEXT = { off: "off · 直连", auto: "auto · 自动", always: "alway
 
 let CONSOLE_STATE = { authRequired: false, control: false, session: null };
 let RELAY = null;           // 最新一份 relay 状态（stats.pools.relay）
-let EDIT = null;            // 名单编辑草稿 { domains: [], excludes: [] }，null = 未编辑
+let EDIT = null;            // 名单编辑草稿 { domains: [], forced: [], excludes: [] }，null = 未编辑
 
 // 命令栏时钟
 const clockEl = document.getElementById("clock");
@@ -1069,9 +1103,9 @@ function verdictOf(d) {
   const dead = (d.probes || []).filter((p) => p.ok === false);
   if (dead.length) return { cls: "bad", text: "解析异常", why: dead.map((p) => (p.label || p.name) + "：" + (p.error || "失败")).join("；") };
   if (d.statsError) return { cls: "warn", text: "统计不可用", why: "控制通道不可用（仅展示降级数据）：" + d.statsError };
-  // 中转档开着但守护进程没上报：名单域名已回退直连（可能变慢/抖动），值得黄牌提醒
+  // 中转档开着（任一池）但守护进程没上报：名单域名已回退直连（可能变慢/抖动），值得黄牌提醒
   const relay = d.stats && d.stats.pools && d.stats.pools.relay;
-  if (relay && relay.mode && relay.mode !== "off" && !relay.healthy) {
+  if (relay && ((relay.mode && relay.mode !== "off") || relay.forcedMode === "always") && !relay.healthy) {
     return { cls: "warn", text: "中转离线", why: "SNI 中转未上报健康（relay 进程或代理出口故障）；名单域名已回退直连路径" };
   }
   const s = d.stats;
@@ -1151,10 +1185,17 @@ function sparkline(history, ok) {
 function pathHealth(probes, relay) {
   const el = document.getElementById("path-health");
   if (!probes.length) { el.innerHTML = "未配置探测"; return; }
-  // 该探测域名此刻是否被中转接管（always=名单内即接管；auto=该主机状态机已切入）
+  // 该探测域名此刻是否被中转接管（强制池 always=名单内即接管；主池 always=名单内、auto=该主机状态机已切入）
+  const patternHit = (name, patterns) => (patterns || []).some((p) => {
+    const bare = String(p).replace(/^\\*\\./, "");
+    return name === bare || name.endsWith("." + bare);
+  });
+  const excluded = (name) => patternHit(name, relay && relay.excludes);
   const viaRelay = (name) => {
-    if (!relay || !relay.mode || relay.mode === "off" || !relay.healthy) return false;
-    if (relay.mode === "always") return /github/.test(name);
+    if (!relay || !relay.healthy) return false;
+    if ((relay.forcedMode === "always") && patternHit(name, relay.forcedDomains) && !excluded(name)) return true;
+    if (!relay.mode || relay.mode === "off" || excluded(name)) return false;
+    if (relay.mode === "always") return patternHit(name, relay.domains);
     return (relay.hosts || []).some((h) => h.relayed && (name === h.host || name.endsWith("." + h.host)));
   };
   el.classList.remove("muted");
@@ -1166,6 +1207,32 @@ function pathHealth(probes, relay) {
       '</span>' + sparkline(p.history, p.ok) +
       '<span class="pv' + (p.ok === false ? " err" : "") + '" title="' + esc(p.name + (p.error ? " · " + p.error : "")) + '">' + esc(val) + "</span></div>";
   }).join("");
+}
+
+// 状态磁贴：近 1 小时查询活动迷你柱条（数据来自 /admin/stats 的分钟桶，零新增请求）
+function statusActivity(s) {
+  const strip = document.getElementById("status-activity");
+  const cap = document.getElementById("status-activity-cap");
+  if (!s || !s.minutes || !s.minutes.length) {
+    strip.innerHTML = "";
+    cap.textContent = "暂无查询数据";
+    return;
+  }
+  const recent = s.minutes.slice(-60);
+  const total = recent.reduce((sum, b) => sum + b.queries, 0);
+  const hits = recent.reduce((sum, b) => sum + b.hits, 0);
+  const errors = recent.reduce((sum, b) => sum + b.errors, 0);
+  const max = Math.max(1, ...recent.map((b) => b.queries));
+  strip.innerHTML = recent.map((b) => {
+    const hp = b.queries ? Math.round(b.hits / b.queries * 100) : 0;
+    const ep = b.queries ? Math.round(b.errors / b.queries * 100) : 0;
+    const height = b.queries > 0 ? Math.max(8, Math.round(b.queries / max * 100)) : 2;
+    // 自下而上：命中（绿）、回源（蓝）、失败（红），与查询量图的堆叠顺序一致
+    return '<span class="sb" style="height:' + height + '%" title="' + hhmm(b.t) + " · " + fmt(b.queries) + ' 次">' +
+      '<i class="h" style="height:' + hp + '%"></i><i class="m" style="height:' + (100 - ep - hp) + '%"></i><i class="e" style="height:' + ep + '%"></i></span>';
+  }).join("");
+  cap.textContent = "近 1 小时 " + fmt(total) + " 次查询 · 命中率 " + Math.round(total ? hits / total * 100 : 0) + "%" +
+    (errors ? " · 失败 " + fmt(errors) + " 次" : "");
 }
 
 function heroCards(s) {
@@ -1300,10 +1367,14 @@ function poolsTable(p) {
   const isps = p.isp || [];
   for (const isp of isps) rows.push(["运营商池 " + isp.scope, "IPv4×" + isp.ipv4.length + " · IPv6×" + isp.ipv6.length + (isp.active ? " · 剩余 " + inMinTxt(isp.expiresAt) : ' · <span class="err">已过期</span>')]);
   if (p.github) rows.push(["GitHub 池", Object.keys(p.github.hosts).length + " 主机 · 来源 " + p.github.sources.map((s) => s.source).join(", ") + " · 剩余 " + inMinTxt(Math.max.apply(null, p.github.sources.map((s) => s.expiresAt)))]);
-  if (p.relay && p.relay.mode && p.relay.mode !== "off") {
+  if (p.relay && p.relay.mode && (p.relay.mode !== "off" || p.relay.forcedMode === "always")) {
     const rh = p.relay.hosts || [];
     const relayed = rh.filter((h) => h.relayed);
-    rows.push(["SNI 中转", (p.relay.healthy ? "健康" : '<span class="err">未上报</span>') + " · 档位 " + esc(p.relay.mode) + (p.relay.ip ? " · " + esc(p.relay.ip) : "") + " · " + relayed.length + "/" + rh.length + " 主机走中转 · 上报 " + ago(p.relay.lastReportAt)]);
+    const forcedCount = (p.relay.forcedDomains || []).length;
+    rows.push(["SNI 中转", (p.relay.healthy ? "健康" : '<span class="err">未上报</span>') + " · 主池 " + esc(p.relay.mode) + " · " + relayed.length + "/" + rh.length + " 主机走中转" + (p.relay.ip ? " · " + esc(p.relay.ip) : "") + " · 上报 " + ago(p.relay.lastReportAt)]);
+    if (p.relay.forcedMode === "always" || forcedCount > 0) {
+      rows.push(["　强制池", "档位 " + esc(p.relay.forcedMode) + " · " + forcedCount + " 条名单" + (p.relay.forcedMode === "always" ? ' · <span class="warn2">常开（不看测量）</span>' : "") + (forcedCount ? "：" + (p.relay.forcedDomains || []).slice(0, 6).map(esc).join("、") + (forcedCount > 6 ? " 等" : "") : "")]);
+    }
     for (const h of rh) {
       rows.push(["　" + esc(h.host), (h.relayed ? "走中转" : "直连") + " · 直连成功率 " + (h.enterRate == null ? "—" : Math.round(h.enterRate * 100) + "%") + " · 样本 " + h.samples + " · 测于 " + ago(h.lastSampleAt)]);
     }
@@ -1361,11 +1432,20 @@ function renderControl(relay) {
   const sourceEl = document.getElementById("relay-mode-source");
   sourceEl.textContent = relay.modeSource === "override" ? "控制台覆盖" : "env 默认";
   sourceEl.className = "srcbadge" + (relay.modeSource === "override" ? "" : " env");
-  const seg = document.getElementById("mode-seg");
+  document.getElementById("forced-mode-text").textContent = MODE_TEXT[relay.forcedMode] || relay.forcedMode || "off";
+  const forcedSourceEl = document.getElementById("forced-mode-source");
+  forcedSourceEl.textContent = relay.forcedModeSource === "override" ? "控制台覆盖" : "env 默认";
+  forcedSourceEl.className = "srcbadge" + (relay.forcedModeSource === "override" ? "" : " env");
   const deployed = Boolean(relay.ip);
-  for (const button of seg.querySelectorAll("button")) {
-    button.classList.toggle("on", button.dataset.mode === relay.mode);
-    if (button.dataset.mode !== "off" && !deployed) button.disabled = true;
+  for (const segId of ["mode-seg", "forced-mode-seg"]) {
+    const seg = document.getElementById(segId);
+    const key = segId === "mode-seg" ? "mode" : "forcedMode";
+    const current = key === "mode" ? relay.mode : relay.forcedMode;
+    for (const button of seg.querySelectorAll("button")) {
+      const value = key === "mode" ? button.dataset.mode : button.dataset.fmode;
+      button.classList.toggle("on", value === current);
+      if (value !== "off" && !deployed) button.disabled = true;
+    }
   }
   const notDeployed = document.getElementById("relay-not-deployed");
   notDeployed.hidden = deployed;
@@ -1386,25 +1466,25 @@ function renderControl(relay) {
   }
   // 名单（未在编辑时回显服务端生效清单）
   if (!EDIT) {
-    renderChips("domains-chips", relay.domains || [], false);
-    renderChips("excludes-chips", relay.excludes || [], true);
+    renderChips("domains-chips", relay.domains || [], "domains");
+    renderChips("forced-chips", relay.forcedDomains || [], "forced");
+    renderChips("excludes-chips", relay.excludes || [], "excludes");
     document.getElementById("domains-save").disabled = true;
     hideDiff();
   }
 }
 
-function renderChips(id, list, isExclude) {
+function renderChips(id, list, key) {
   const el = document.getElementById(id);
   el.innerHTML = list.length ? list.map((d, i) =>
-    '<span class="chip' + (isExclude ? " ex" : "") + '" title="' + esc(d) + '">' + esc(d) +
+    '<span class="chip' + (key === "excludes" ? " ex" : "") + '" title="' + esc(d) + '">' + esc(d) +
     ' <button type="button" data-i="' + i + '" aria-label="删除">×</button></span>').join("")
     : '<span class="muted" style="align-self:center">（空）</span>';
   for (const button of el.querySelectorAll("button")) {
     button.addEventListener("click", function () {
       if (!EDIT) startEdit();
-      const arr = isExclude ? EDIT.excludes : EDIT.domains;
-      arr.splice(Number(this.dataset.i), 1);
-      refreshEdit(isExclude);
+      EDIT[key].splice(Number(this.dataset.i), 1);
+      refreshEdit();
     });
   }
 }
@@ -1419,13 +1499,16 @@ function validPattern(value) {
 
 function startEdit() {
   if (!RELAY || EDIT) return;
-  EDIT = { domains: [...(RELAY.domains || [])], excludes: [...(RELAY.excludes || [])] };
+  EDIT = { domains: [...(RELAY.domains || [])], forced: [...(RELAY.forcedDomains || [])], excludes: [...(RELAY.excludes || [])] };
 }
 
-function refreshEdit(isExclude) {
-  renderChips("domains-chips", EDIT.domains, false);
-  renderChips("excludes-chips", EDIT.excludes, true);
-  const dirty = RELAY && (JSON.stringify(EDIT.domains) !== JSON.stringify(RELAY.domains || []) || JSON.stringify(EDIT.excludes) !== JSON.stringify(RELAY.excludes || []));
+function refreshEdit() {
+  renderChips("domains-chips", EDIT.domains, "domains");
+  renderChips("forced-chips", EDIT.forced, "forced");
+  renderChips("excludes-chips", EDIT.excludes, "excludes");
+  const dirty = RELAY && (JSON.stringify(EDIT.domains) !== JSON.stringify(RELAY.domains || [])
+    || JSON.stringify(EDIT.forced) !== JSON.stringify(RELAY.forcedDomains || [])
+    || JSON.stringify(EDIT.excludes) !== JSON.stringify(RELAY.excludes || []));
   document.getElementById("domains-save").disabled = !dirty;
   showDiff(dirty);
 }
@@ -1439,11 +1522,12 @@ function showDiff(show) {
     return { added, removed };
   };
   const d1 = diff(RELAY.domains || [], EDIT.domains);
-  const d2 = diff(RELAY.excludes || [], EDIT.excludes);
+  const d2 = diff(RELAY.forcedDomains || [], EDIT.forced);
+  const d3 = diff(RELAY.excludes || [], EDIT.excludes);
   const line = (label, d) => label + "：新增 " + d.added.length + " 条" + (d.added.length ? "（" + d.added.map(esc).join("、") + "）" : "") + " · 删除 " + d.removed.length + " 条" + (d.removed.length ? "（" + d.removed.map(esc).join("、") + "）" : "");
-  const hasNew = d1.added.length > 0;
+  const hasNew = d1.added.length > 0 || d2.added.length > 0;
   box.hidden = false;
-  box.innerHTML = "<div>" + line("中转名单", d1) + "</div><div>" + line("排除名单", d2) + "</div>" +
+  box.innerHTML = "<div>" + line("中转名单", d1) + "</div><div>" + line("强制名单", d2) + "</div><div>" + line("排除名单", d3) + "</div>" +
     (hasNew ? '<div class="warn2" style="margin-top:6px">新增域名有 ≤30 秒同步窗：relay 进程拿到新名单前，该域名的连接会被拒；无实测池的域名还依赖代理的 DOMAIN-SUFFIX 规则远程解析（curl -x &lt;代理&gt; -sI https://&lt;域名&gt; 验证）。</div>' : "");
 }
 
@@ -1453,7 +1537,7 @@ function hideDiff() {
   box.innerHTML = "";
 }
 
-function wireAdd(inputId, errId, addId, isExclude) {
+function wireAdd(inputId, errId, addId, key) {
   const input = document.getElementById(inputId);
   const err = document.getElementById(errId);
   const add = () => {
@@ -1461,38 +1545,39 @@ function wireAdd(inputId, errId, addId, isExclude) {
     const pattern = validPattern(input.value);
     if (!pattern) { err.textContent = "仅支持 精确域名 或 *.通配 两种写法"; return; }
     startEdit();
-    const arr = isExclude ? EDIT.excludes : EDIT.domains;
+    const arr = EDIT[key];
     if (arr.includes(pattern)) { err.textContent = "已在名单中"; return; }
     if (arr.length >= 64) { err.textContent = "名单上限 64 条"; return; }
     arr.push(pattern);
     input.value = "";
-    refreshEdit(isExclude);
+    refreshEdit();
   };
   document.getElementById(addId).addEventListener("click", add);
   input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); add(); } });
 }
-wireAdd("domain-input", "domain-err", "domain-add", false);
-wireAdd("exclude-input", "exclude-err", "exclude-add", true);
+wireAdd("domain-input", "domain-err", "domain-add", "domains");
+wireAdd("forced-input", "forced-err", "forced-add", "forced");
+wireAdd("exclude-input", "exclude-err", "exclude-add", "excludes");
 
 document.getElementById("domains-save").addEventListener("click", async function () {
   if (!EDIT || !RELAY) return;
   const go = await confirmDialog("保存名单变更", document.getElementById("domains-diff").innerHTML, "确认保存");
   if (!go) return;
-  const result = await postRelayConfig({ domains: EDIT.domains, excludeDomains: EDIT.excludes, expectedVersion: RELAY.configVersion }, "relay-domains");
+  const result = await postRelayConfig({ domains: EDIT.domains, forcedDomains: EDIT.forced, excludeDomains: EDIT.excludes, expectedVersion: RELAY.configVersion }, "relay-domains");
   if (result) { EDIT = null; } // 成功后以下一次 summary 回显为准
 });
 
 document.getElementById("relay-reset").addEventListener("click", async function () {
   if (!RELAY) return;
   const go = await confirmDialog("恢复 env 默认配置",
-    "<p>将清除控制台的运行时覆盖，回到 env 文件里的值：</p><ul><li>档位：<b>" + esc(MODE_TEXT.off) + "</b>（env RELAY_MODE）</li><li>中转名单：" + ((RELAY.envDomains || []).map(esc).join("、") || "（空）") + "</li><li>排除名单：" + ((RELAY.envExcludes || []).map(esc).join("、") || "（空）") + "</li></ul>",
+    "<p>将清除控制台的运行时覆盖，回到 env 文件里的值：</p><ul><li>主池档位：<b>" + esc(MODE_TEXT.off) + "</b>（env RELAY_MODE）</li><li>强制池档位：<b>" + esc(MODE_TEXT[RELAY.envForcedMode] || RELAY.envForcedMode || "off") + "</b>（env RELAY_FORCED_MODE）</li><li>中转名单：" + ((RELAY.envDomains || []).map(esc).join("、") || "（空）") + "</li><li>强制名单：" + ((RELAY.envForcedDomains || []).map(esc).join("、") || "（空）") + "</li><li>排除名单：" + ((RELAY.envExcludes || []).map(esc).join("、") || "（空）") + "</li></ul>",
     "恢复默认");
   if (!go) return;
   EDIT = null;
   await postRelayConfig({ reset: true }, "relay-reset");
 });
 
-// 档位切换
+// 档位切换（主池：off/auto/always）
 document.getElementById("mode-seg").addEventListener("click", async function (e) {
   const button = e.target.closest("button");
   if (!button || button.disabled || !RELAY) return;
@@ -1508,9 +1593,25 @@ document.getElementById("mode-seg").addEventListener("click", async function (e)
   await postRelayConfig({ mode, expectedVersion: RELAY.configVersion }, "relay-mode");
 });
 
+// 档位切换（强制池：off/always——没有 auto，这类域名没有实测池可供判定）
+document.getElementById("forced-mode-seg").addEventListener("click", async function (e) {
+  const button = e.target.closest("button");
+  if (!button || button.disabled || !RELAY) return;
+  const mode = button.dataset.fmode;
+  if (mode === RELAY.forcedMode) return;
+  if (mode === "always") {
+    const domains = (EDIT ? EDIT.forced : RELAY.forcedDomains) || [];
+    const go = await confirmDialog("切换强制池到 always（常开中转）",
+      "<p>将<b>不看任何测量</b>、把以下域名的全部流量答成中转 IP，经代理节点出境：</p><ul><li>强制名单共 <b>" + domains.length + "</b> 条" + (domains.length ? "：" + domains.slice(0, 5).map(esc).join("、") + (domains.length > 5 ? " 等" : "") : "（空）——先在下方添加域名") + "</li><li>这些站点的流量<b>消耗代理节点带宽</b>（视频站会显著走节点流量）</li><li>ECH 不适用：名单站点的 HTTPS RR 会被清洗（摘 ECH、hint 指中转、ALPN 压 h2）</li><li>安全不变量仍在：relay 守护停止上报健康即整体回退直连（≤60s）</li></ul><p>确认切换？</p>",
+      "确认切换到 always", true);
+    if (!go) return;
+  }
+  await postRelayConfig({ forcedMode: mode, expectedVersion: RELAY.configVersion }, "relay-forced-mode");
+});
+
 async function postRelayConfig(body, action) {
   const resultBox = document.getElementById("relay-result");
-  const before = RELAY ? { mode: RELAY.mode, domains: [...(RELAY.domains || [])], excludes: [...(RELAY.excludes || [])], version: RELAY.configVersion } : null;
+  const before = RELAY ? { mode: RELAY.mode, forcedMode: RELAY.forcedMode, domains: [...(RELAY.domains || [])], excludes: [...(RELAY.excludes || [])], version: RELAY.configVersion } : null;
   let response;
   try {
     response = await fetch("/api/relay-config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -1525,11 +1626,16 @@ async function postRelayConfig(body, action) {
   const payload = await response.json().catch(() => ({}));
   if (response.ok && payload.ok !== false && payload.relay) {
     const after = payload.relay;
-    const lines = ["已" + (action === "relay-mode" ? "切换档位 → <b>" + esc(MODE_TEXT[after.mode] || after.mode) + "</b>" : action === "relay-domains" ? "保存名单（中转 " + after.domains.length + " 条 · 排除 " + after.excludes.length + " 条）" : "恢复 env 默认配置") + "（配置 v" + after.configVersion + "）",
+    const lines = ["已" + (action === "relay-mode" ? "切换主池档位 → <b>" + esc(MODE_TEXT[after.mode] || after.mode) + "</b>"
+      : action === "relay-forced-mode" ? "切换强制池档位 → <b>" + esc(MODE_TEXT[after.forcedMode] || after.forcedMode) + "</b>"
+      : action === "relay-domains" ? "保存名单（中转 " + after.domains.length + " 条 · 强制 " + (after.forcedDomains || []).length + " 条 · 排除 " + after.excludes.length + " 条）"
+      : "恢复 env 默认配置") + "（配置 v" + after.configVersion + "）",
       "已持久化：主服务重启后保留",
       "新 DNS 答案即刻生效；存量客户端最迟 60 秒收敛（中转答案 TTL ≤ 60s）",
       "relay 进程 ≤30 秒收到新名单（下次健康上报）；新增域名请等'已同步'再使用"];
-    if (after.mode === "off" && before && before.mode !== "off") {
+    const mainOff = after.mode === "off" && before && before.mode !== "off";
+    const forcedOff = after.forcedMode === "off" && before && before.forcedMode !== "off";
+    if (mainOff || forcedOff) {
       showResult("warn", lines[0] + "<br>" + lines.slice(1).join("<br>") + "<br>⚠ 名单域名回到直连路径，GitHub 族 SNI 抖动可能复发；relay 进程未停止（无害），彻底停用：systemctl disable --now edge-smart-doh-relay");
     } else {
       showResult("ok", lines.join("<br>"));
@@ -1568,7 +1674,7 @@ async function loadAudit(force) {
     document.getElementById("audit-cnt").textContent = entries.length ? "最近 " + entries.length + " 条" : "";
     document.getElementById("audit-body").innerHTML = entries.length ? entries.map((e) => {
       const label = e.action === "login-ok" ? "登录" : e.action === "login-fail" ? "登录失败" : e.action === "logout" ? "退出"
-        : e.action === "relay-mode" ? "切换档位" : e.action === "relay-domains" ? "保存名单" : e.action === "relay-reset" ? "恢复默认" : esc(e.action);
+        : e.action === "relay-mode" ? "切换档位" : e.action === "relay-forced-mode" ? "强制池档位" : e.action === "relay-domains" ? "保存名单" : e.action === "relay-reset" ? "恢复默认" : esc(e.action);
       return "<tr><td class='muted'>" + hhmmss(e.t) + "</td><td>" + esc(e.ip) + (e.label ? '<br><span class="muted">' + esc(e.label) + "</span>" : "") + "</td><td>" + label + (e.count > 1 ? " ×" + e.count : "") + "</td><td class='muted'>" + esc(e.detail || "") + "</td><td>" + (e.result === "ok" ? '<span class="ok2">成功</span>' : '<span class="err">失败</span>') + "</td></tr>";
     }).join("") : '<tr><td class="muted">暂无操作记录</td></tr>';
   } catch {}
@@ -1596,12 +1702,13 @@ async function refresh(force) {
     setVerdict(d);
     applyConsoleState(d);
     if (d.stats) {
-      heroCards(d.stats); minuteChart(d.stats.minutes); latencyBars(d.stats.freshLatency);
+      heroCards(d.stats); statusActivity(d.stats); minuteChart(d.stats.minutes); latencyBars(d.stats.freshLatency);
       pathsPanel(d.stats); strategyChart(d.stats.strategies); upstreams(d.stats.upstreams);
       topTable(d.stats.top); recentTable(d.stats.recent); poolsTable(d.stats.pools);
     } else {
       ["stat-total", "stat-rate", "stat-p50"].forEach((id) => { document.getElementById(id).textContent = "—"; });
       document.getElementById("paths-panel").innerHTML = '<div class="muted" style="padding:10px 0 4px">统计不可用</div>';
+      statusActivity(null);
     }
     pathHealth(d.probes || [], d.stats && d.stats.pools ? d.stats.pools.relay : null); probeChart(d.probes || []);
   } catch (e) {
@@ -1701,20 +1808,26 @@ const server = createServer(async (request, response) => {
     const raw = await readJsonBody(request);
     if (!raw || typeof raw !== "object") return send(400, jsonHeaders, JSON.stringify({ error: "请求体必须是 JSON 对象" }));
     const body = sanitizeRelayConfigBody(raw);
-    const before = RELAY && { mode: RELAY.mode, domains: [...RELAY.domains], excludes: [...RELAY.excludes] };
+    const before = RELAY && { mode: RELAY.mode, domains: [...RELAY.domains], excludes: [...RELAY.excludes], forcedMode: RELAY.forcedMode, forced: [...(RELAY.forcedDomains || [])] };
     const [status, headers, text] = await relayConfigProxy(body);
     let after;
     try { after = JSON.parse(text); } catch { after = undefined; }
     if (status === 200 && after?.relay) {
+      const action = body.reset ? "relay-reset"
+        : body.forcedMode !== undefined ? "relay-forced-mode"
+        : body.mode !== undefined ? "relay-mode"
+        : "relay-domains";
       const detail = body.reset ? "reset → env 默认"
+        : body.forcedMode !== undefined ? `强制池 ${before?.forcedMode ?? "?"} → ${after.relay.forcedMode}`
         : body.mode !== undefined ? `${before?.mode ?? "?"} → ${after.relay.mode}`
-        : `名单 ${after.relay.domains.length} 条 / 排除 ${after.relay.excludes.length} 条`;
-      audit(body.reset ? "relay-reset" : body.mode !== undefined ? "relay-mode" : "relay-domains", { ip: session.ip, label: session.label, detail });
+        : `名单 中转 ${after.relay.domains.length} 条 / 排除 ${after.relay.excludes.length} 条 / 强制 ${(after.relay.forcedDomains || []).length} 条`;
+      audit(action, { ip: session.ip, label: session.label, detail });
       RELAY = after.relay;
     } else if (status !== 200) {
       let errorText = "";
       try { errorText = JSON.parse(text)?.error ?? String(text).slice(0, 120); } catch { errorText = String(text).slice(0, 120); }
-      audit(body.reset ? "relay-reset" : body.mode !== undefined ? "relay-mode" : "relay-domains", { ip: session.ip, label: session.label, result: "fail", detail: `HTTP ${status}: ${errorText}` });
+      const action = body.reset ? "relay-reset" : body.forcedMode !== undefined ? "relay-forced-mode" : body.mode !== undefined ? "relay-mode" : "relay-domains";
+      audit(action, { ip: session.ip, label: session.label, result: "fail", detail: `HTTP ${status}: ${errorText}` });
     }
     return send(status, headers, text);
   }
