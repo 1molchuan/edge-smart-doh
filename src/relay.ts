@@ -289,6 +289,7 @@ export function relayStatus(config: AppConfig): {
   excludes: string[];
   envDomains: string[];
   envExcludes: string[];
+  envMode: RelayMode;
   forcedMode: RelayForcedMode;
   forcedModeSource: "env" | "override";
   forcedDomains: string[];
@@ -312,6 +313,7 @@ export function relayStatus(config: AppConfig): {
     excludes: effective.excludeDomains,
     envDomains: config.relayDomains,
     envExcludes: config.relayExcludeDomains,
+    envMode: config.relayMode,
     forcedMode: effective.forcedMode,
     forcedModeSource: effective.overridden.includes("forcedMode") ? "override" : "env",
     forcedDomains: effective.forcedDomains,

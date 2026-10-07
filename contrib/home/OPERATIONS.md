@@ -9,7 +9,7 @@
 | 组件 | systemd 单元 | 端口 | 关键文件 |
 |---|---|---|---|
 | DoH 主服务 | `edge-smart-doh` | 127.0.0.1:8787（Caddy 可再加 8443） | `/opt/edge-smart-doh/node.mjs`、env `/etc/edge-smart-doh/env`、缓存 `/var/lib/edge-smart-doh/cache.bin` |
-| 控制台（监测+控制） | `edge-smart-doh-monitor` | 0.0.0.0:8788（仅私网来源放行） | `/opt/edge-smart-doh/monitor.mjs`、env `/etc/edge-smart-doh/monitor.env`（含 `CONSOLE_PASSWORD`、`ADMIN_TOKEN`，0600） |
+| 控制台（监控页 + 控制页） | `edge-smart-doh-monitor` | 0.0.0.0:8788（仅私网来源放行） | `/opt/edge-smart-doh/monitor.mjs`、env `/etc/edge-smart-doh/monitor.env`（含 `CONSOLE_PASSWORD`、`ADMIN_TOKEN`，0600） |
 | SNI 中转守护 | `edge-smart-doh-relay` | 第二内网 IP:443 | `/opt/edge-smart-doh/relay.mjs`、env `/etc/edge-smart-doh/relay.env` |
 | 第二 IP 持久化 | `edge-smart-doh-relay-ip` | — | oneshot，开机补 `ip addr add` |
 
@@ -31,7 +31,7 @@ curl -s http://127.0.0.1:8788/healthz
 **登录**（密码在 `/etc/edge-smart-doh/monitor.env`；Agent 约定带 `label`，审计里可区分人机）：
 
 ```bash
-BASE=http://127.0.0.1:8788
+BASE=http://127.0.0.1:8788   # 监控页 $BASE/ 公开只读；控制页 $BASE/console 需要密码
 PASS=$(sudo grep '^CONSOLE_PASSWORD=' /etc/edge-smart-doh/monitor.env | cut -d= -f2)
 curl -s -c /tmp/cj -H 'Content-Type: application/json' \
   -d "{\"password\":\"$PASS\",\"label\":\"ops-agent\"}" $BASE/api/login   # 204=成功
@@ -42,7 +42,8 @@ curl -s -c /tmp/cj -H 'Content-Type: application/json' \
 **读状态**：
 
 ```bash
-curl -s -b /tmp/cj $BASE/api/summary | jq '{健康:.doh, 路径:.stats.paths, relay:.stats.pools.relay}'
+# 监控数据（/api/summary）公开，不需要登录：
+curl -s $BASE/api/summary | jq '{健康:.doh, 路径:.stats.paths, relay:.stats.pools.relay}'
 curl -s -b /tmp/cj $BASE/api/relay | jq '.relay | {mode, modeSource, domains, excludes, forcedMode, forcedModeSource, forcedDomains, configVersion, appliedConfigVersion, healthy, lastReportAt}'
 ```
 

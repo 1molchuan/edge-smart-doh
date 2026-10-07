@@ -85,9 +85,9 @@ curl --noproxy '*' -fsS http://127.0.0.1:8788/healthz >/dev/null \
 
 LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 if curl --noproxy '*' -fsS http://127.0.0.1:8788/healthz 2>/dev/null | grep -q '"authRequired":true'; then
-  ok "控制台运行中：http://${LAN_IP:-<内网IP>}:8788  （密码登录；仅回环/私网来源可访问）"
+  ok "监控页 http://${LAN_IP:-<内网IP>}:8788 （公开只读）· 控制页 http://${LAN_IP:-<内网IP>}:8788/console （密码登录）"
 else
-  ok "控制台运行中：http://${LAN_IP:-<内网IP>}:8788  （未设密码=纯监测模式；控制功能需要 CONSOLE_PASSWORD）"
+  ok "监控页 http://${LAN_IP:-<内网IP>}:8788 （公开只读）· 控制页未启用（缺 CONSOLE_PASSWORD 或 ADMIN_TOKEN）"
 fi
 
 # 防火墙提示：SETUP_FIREWALL=1 部署过的机器上 8787 是放行的，8788 也要补一条
