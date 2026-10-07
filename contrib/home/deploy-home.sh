@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  edge-smart-doh 家庭/小机直连部署（8443 + acme.sh DNS-01 + DDNS）
+#  edge-smart-doh 家庭/小机直连部署（8443 + 证书 + DDNS）
+#  证书：先探测机器统一证书（如 /etc/ssl/wildcard 的通配符，SAN 覆盖 DoH 域名即命中）
+#        ——命中只引用、绝不代签代管（续期/权限/reload 归机器统一环节）；没有才
+#        acme.sh DNS-01 自签到 /etc/ssl/doh（root cron 自动续期）。
 #  位置：仓库 contrib/home/deploy-home.sh；上游信任模型见 contrib/home/README.md
 #  用法：sudo bash contrib/home/deploy-home.sh    （幂等，可反复执行）
 #  交互：仅在需要时——首次问 DoH 域名（存 /etc/edge-smart-doh/deploy.conf，重跑不再问）；
@@ -726,29 +729,51 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. 证书（acme.sh DNS-01，全程 root）
+# 6. 证书：先探测机器统一证书（如 /etc/ssl/wildcard 的通配符），命中则只引用不签发；
+#    没有才走 acme.sh DNS-01 自签到 /etc/ssl/doh（续期由 root cron 自动完成）
 # ---------------------------------------------------------------------------
 if [[ "$OPEN_PUBLIC" != "1" ]]; then
   log "OPEN_PUBLIC=0：跳过 6/7 步与 8443/DDNS（仅内网部署完成）"
 else
-  log "步骤 6/8：证书（acme.sh DNS-01，root 模式）"
+  log "步骤 6/8：证书（先探测机器统一证书，没有才 acme.sh DNS-01 签发）"
 
-  if [[ ! -x "$ACME" ]]; then
-    # root 装：续期/写证书/reload 全在 root cron，免 sudo
-    #（用户装 + sudo install-cert 会在 ~/.acme.sh 留 root 属主文件，60 天后用户 cron 续期写入失败）
-    if [[ -z "$ACME_EMAIL" ]]; then
-      read -rp "acme.sh 联系邮箱: " ACME_EMAIL
-      [[ -n "$ACME_EMAIL" ]] && save_conf ACME_EMAIL "$ACME_EMAIL"
+  # ---- 6a. 探测：/etc/ssl/<dir>/ 下成对 fullchain+privkey，SAN 覆盖 DOH_DOMAIN，取剩余
+  #      有效期最长的一份（机器同时留有旧单域证书时新证书赢）。/etc/ssl/doh 是本脚本自签
+  #      目录，刻意排除——它走下面的原流程幂等续装；系统目录（certs/private/newcerts）排除。
+  CERT_DIR=""
+  detect_unified_cert() {
+    local best=0 dir chain notafter ts
+    for dir in /etc/ssl/wildcard $(find /etc/ssl -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort); do
+      case "$dir" in /etc/ssl/certs|/etc/ssl/private|/etc/ssl/newcerts|/etc/ssl/doh) continue ;; esac
+      chain="$dir/fullchain.pem"
+      [[ -f "$chain" && -f "$dir/privkey.pem" ]] || continue
+      openssl x509 -checkhost "$DOH_DOMAIN" -noout -in "$chain" >/dev/null 2>&1 || continue
+      notafter="$(openssl x509 -noout -enddate -in "$chain" 2>/dev/null | cut -d= -f2)"
+      ts="$(date -u -d "$notafter" +%s 2>/dev/null)" || continue
+      if (( ts > best )); then best=$ts; CERT_DIR="$dir"; fi
+    done
+  }
+  detect_unified_cert
+
+  if [[ -n "$CERT_DIR" ]]; then
+    # 命中机器统一证书：签发/续期/权限/reload 全归机器统一环节（如 root cron 的 acme.sh --cron
+    # + --reloadcmd），本脚本只引用路径，绝不代签代管。过期/临期的处置也归它——这里只拦挡明错。
+    if ! openssl x509 -checkend 0 -noout -in "$CERT_DIR/fullchain.pem" >/dev/null 2>&1; then
+      die "机器统一证书 $CERT_DIR 已过期：续期归机器统一环节（如 root cron acme.sh --cron），修好它再重跑本脚本"
     fi
-    curl -s https://get.acme.sh | sh -s "email=$ACME_EMAIL" >/dev/null \
-      || die "acme.sh 安装器下载失败（网络）"
-    [[ -x "$ACME" ]] || die "acme.sh 安装失败"
-    ok "acme.sh 已装到 /root/.acme.sh（root cron 自动续期）"
+    openssl x509 -checkend 604800 -noout -in "$CERT_DIR/fullchain.pem" >/dev/null 2>&1 \
+      || warn "机器统一证书 7 天内到期：续期归机器统一环节（本脚本不代管）"
+    if id caddy >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1 \
+       && ! runuser -u caddy -- test -r "$CERT_DIR/privkey.pem" 2>/dev/null; then
+      warn "caddy 读不了 $CERT_DIR/privkey.pem：让统一环节的 reloadcmd 管权限（chgrp caddy + chmod 640），或手工修一次"
+    fi
+    ok "复用机器统一证书 $CERT_DIR（SAN 覆盖 $DOH_DOMAIN，到期 $(openssl x509 -noout -enddate -in "$CERT_DIR/fullchain.pem" | cut -d= -f2)）"
+    ok "跳过 acme.sh 签发：本脚本只引用，续期/权限/reload 由机器统一环节负责"
   fi
 
-  # token 优先级：配置区 > 已存文件 > 交互输入
+  # token 优先级：配置区 > 已存文件 > 交互输入（复用统一证书时只有 DDNS 需要它）
   NEED_TOKEN=0
-  [[ -f "/root/.acme.sh/${DOH_DOMAIN}_ecc/${DOH_DOMAIN}.conf" ]] || NEED_TOKEN=1
+  [[ -z "$CERT_DIR" && ! -f "/root/.acme.sh/${DOH_DOMAIN}_ecc/${DOH_DOMAIN}.conf" ]] && NEED_TOKEN=1
   [[ "$SETUP_DDNS" == "1" && ! -s "$CF_TOKEN_FILE" ]] && NEED_TOKEN=1
   if [[ "$NEED_TOKEN" == "1" && -z "$CF_TOKEN" && -s "$CF_TOKEN_FILE" ]]; then
     CF_TOKEN="$(cat "$CF_TOKEN_FILE")"
@@ -763,43 +788,52 @@ else
     ok "CF Token 已存 $CF_TOKEN_FILE (600)（acme.sh/DDNS 共用）"
   fi
 
-  "$ACME" --set-default-ca --server letsencrypt >/dev/null
-  export CF_Token="${CF_TOKEN:-$(cat "$CF_TOKEN_FILE" 2>/dev/null || true)}"
-  set +e
-  "$ACME" --issue --dns dns_cf -d "$DOH_DOMAIN" --ecc 2>&1 | tail -3
-  RC=${PIPESTATUS[0]}
-  set -e
-  # rc=2 = "Domains not changed"（已签发且未到续期），幂等重跑的正常路径
-  [[ $RC -eq 0 || $RC -eq 2 ]] || die "acme.sh 签发失败 (rc=$RC)：先查 token 是否含 Zone:Read"
-  [[ $RC -eq 2 ]] && ok "证书已存在且无需续期" || ok "证书签发成功"
+  # ---- 6b. 没有统一证书：acme.sh DNS-01 自签（原流程）
+  if [[ -z "$CERT_DIR" ]]; then
+    if [[ ! -x "$ACME" ]]; then
+      # root 装：续期/写证书/reload 全在 root cron，免 sudo
+      #（用户装 + sudo install-cert 会在 ~/.acme.sh 留 root 属主文件，60 天后用户 cron 续期写入失败）
+      if [[ -z "$ACME_EMAIL" ]]; then
+        read -rp "acme.sh 联系邮箱: " ACME_EMAIL
+        [[ -n "$ACME_EMAIL" ]] && save_conf ACME_EMAIL "$ACME_EMAIL"
+      fi
+      curl -s https://get.acme.sh | sh -s "email=$ACME_EMAIL" >/dev/null \
+        || die "acme.sh 安装器下载失败（网络）"
+      [[ -x "$ACME" ]] || die "acme.sh 安装失败"
+      ok "acme.sh 已装到 /root/.acme.sh（root cron 自动续期）"
+    fi
 
-  install -d -m 0750 -o root -g caddy /etc/ssl/doh
-  # reloadcmd 维护 caddy 可读权限（caddy.service 是 User=caddy，0600 root 私钥读不了）；
-  # 首次执行时 caddy 可能未启动，reload 失败无害——下一步会带新证书启动
-  "$ACME" --install-cert -d "$DOH_DOMAIN" --ecc \
-    --fullchain-file /etc/ssl/doh/fullchain.pem \
-    --key-file      /etc/ssl/doh/privkey.pem \
-    --reloadcmd 'chgrp caddy /etc/ssl/doh/privkey.pem; chmod 640 /etc/ssl/doh/privkey.pem; chmod 644 /etc/ssl/doh/fullchain.pem; systemctl reload caddy || true'
-  openssl x509 -checkend 2592000 -noout -in /etc/ssl/doh/fullchain.pem \
-    && ok "证书就位（30 天内有效；续期由 root cron 自动完成）" \
-    || die "证书文件异常"
+    "$ACME" --set-default-ca --server letsencrypt >/dev/null
+    export CF_Token="${CF_TOKEN:-$(cat "$CF_TOKEN_FILE" 2>/dev/null || true)}"
+    set +e
+    "$ACME" --issue --dns dns_cf -d "$DOH_DOMAIN" --ecc 2>&1 | tail -3
+    RC=${PIPESTATUS[0]}
+    set -e
+    # rc=2 = "Domains not changed"（已签发且未到续期），幂等重跑的正常路径
+    [[ $RC -eq 0 || $RC -eq 2 ]] || die "acme.sh 签发失败 (rc=$RC)：先查 token 是否含 Zone:Read"
+    [[ $RC -eq 2 ]] && ok "证书已存在且无需续期" || ok "证书签发成功"
+
+    install -d -m 0750 -o root -g caddy /etc/ssl/doh
+    # reloadcmd 维护 caddy 可读权限（caddy.service 是 User=caddy，0600 root 私钥读不了）；
+    # 首次执行时 caddy 可能未启动，reload 失败无害——下一步会带新证书启动
+    "$ACME" --install-cert -d "$DOH_DOMAIN" --ecc \
+      --fullchain-file /etc/ssl/doh/fullchain.pem \
+      --key-file      /etc/ssl/doh/privkey.pem \
+      --reloadcmd 'chgrp caddy /etc/ssl/doh/privkey.pem; chmod 640 /etc/ssl/doh/privkey.pem; chmod 644 /etc/ssl/doh/fullchain.pem; systemctl reload caddy || true'
+    CERT_DIR=/etc/ssl/doh
+  fi
+  openssl x509 -checkend 2592000 -noout -in "$CERT_DIR/fullchain.pem" 2>/dev/null \
+    && ok "证书就位（30 天内有效）" \
+    || warn "证书 $CERT_DIR 剩余有效期不足 30 天（已通过上面的检查，继续）"
 
   # -------------------------------------------------------------------------
   # 7. Caddy 反代 8443
   # -------------------------------------------------------------------------
   log "步骤 7/8：Caddy 反代 8443"
 
-  tee /etc/caddy/Caddyfile > /dev/null <<EOF
-{
-	https_port 8443
-	servers {
-		# 路由器只转 TCP：不通告 h3（想开 HTTP/3：路由器补转 UDP 8443 + 删本行 + 防火墙加 udp dport 8443）
-		protocols h1 h2
-	}
-}
-
+  CADDY_SITE_BLOCK="$(cat <<EOF
 ${DOH_DOMAIN}:8443 {
-	tls /etc/ssl/doh/fullchain.pem /etc/ssl/doh/privkey.pem
+	tls ${CERT_DIR}/fullchain.pem ${CERT_DIR}/privkey.pem
 
 	# /admin 永不对外（应用层另有 token 鉴权，这里降噪）
 	@admin path /admin/*
@@ -826,6 +860,54 @@ ${DOH_DOMAIN}:8443 {
 	}
 }
 EOF
+)"
+
+  if [[ "$CERT_DIR" == "/etc/ssl/doh" ]]; then
+    # 自签流程：Caddyfile 由本脚本全权管理（全局块 + 唯一站点），整写
+    tee "$CADDYFILE" > /dev/null <<EOF
+{
+	https_port 8443
+	servers {
+		# 路由器只转 TCP：不通告 h3（想开 HTTP/3：路由器补转 UDP 8443 + 删本行 + 防火墙加 udp dport 8443）
+		protocols h1 h2
+	}
+}
+
+${CADDY_SITE_BLOCK}
+EOF
+  else
+    # 复用机器统一证书：Caddyfile 归机器管（可能还有 vault 等别的站点），绝不整写——只动自己的站点块。
+    # 站点块定位用 awk 范围（${DOH_DOMAIN}:8443 { ... }），判定只看块内的 tls 行——
+    # 别的站点（vault 等）也指向同一份统一证书，全文件 grep 会被它们误命中。
+    CADDY_SITE_FILE="$(dirname "$CADDYFILE")/edge-smart-doh.caddy"
+    site_tls_line() {
+      awk -v site="${DOH_DOMAIN}:8443 {" '$0 == site {inblock=1; next} inblock && /^}/ {inblock=0} inblock && $1 == "tls"' "$CADDYFILE" 2>/dev/null
+    }
+    if grep -qF "${DOH_DOMAIN}:8443 {" "$CADDYFILE" 2>/dev/null; then
+      if site_tls_line | grep -qF "${CERT_DIR}/fullchain.pem"; then
+        ok "Caddyfile 站点 ${DOH_DOMAIN}:8443 已指向统一证书（$CERT_DIR），未改动"
+      elif site_tls_line | grep -qF "/etc/ssl/doh/fullchain.pem"; then
+        # 旧版脚本整写的 tls 行：外科手术切到统一证书
+        CADDY_BAK="$(backup_file "$CADDYFILE")" || die "备份 $CADDYFILE 失败"
+        sed -i "s|tls /etc/ssl/doh/fullchain.pem /etc/ssl/doh/privkey.pem|tls ${CERT_DIR}/fullchain.pem ${CERT_DIR}/privkey.pem|" "$CADDYFILE"
+        ok "站点 ${DOH_DOMAIN}:8443 的 tls 已从 /etc/ssl/doh 切到 $CERT_DIR（备份 $CADDY_BAK）"
+      else
+        warn "站点 ${DOH_DOMAIN}:8443 的 tls 行不是脚本管理的样式，未改动——请手工核对指向 ${CERT_DIR}"
+      fi
+    else
+      # 站点还不存在：写独立 site 文件 + import（全局选项块不能放 site 文件，需主文件已有 https_port 8443）
+      printf '%s\n' "$CADDY_SITE_BLOCK" > "$CADDY_SITE_FILE"
+      if ! grep -qE '^[[:space:]]*import[[:space:]]+edge-smart-doh\.caddy' "$CADDYFILE" 2>/dev/null; then
+        CADDY_BAK="$(backup_file "$CADDYFILE")" || die "备份 $CADDYFILE 失败"
+        printf '\nimport edge-smart-doh.caddy\n' >> "$CADDYFILE"
+        ok "站点写入 $CADDY_SITE_FILE 并在主 Caddyfile 追加 import（备份 $CADDY_BAK）"
+      else
+        ok "站点文件 $CADDY_SITE_FILE 已更新（import 已存在）"
+      fi
+      grep -q 'https_port 8443' "$CADDYFILE" \
+        || warn "主 Caddyfile 缺全局 https_port 8443（site 文件里放不了全局选项）：请手工加到最前面的全局块，否则 8443 不是 HTTPS"
+    fi
+  fi
 
   caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
     || die "Caddyfile 校验失败（未 reload）"

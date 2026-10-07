@@ -47,7 +47,7 @@ ECS 真正生效还差两个键，脚本会自动补齐（旧版 env 拷贝缺�
 2. 国内模式：给服务加代理。Node 自带的 `fetch` 不认 `HTTP_PROXY`，脚本装 `undici@6` 并用 `--import` 预加载 `EnvHttpProxyAgent`。**固定 6.x**：undici 8 需要 Node ≥ 22.19，在 Node 20 上一启动就崩；脚本在重启服务前会先试加载一次，不兼容就停下报错，不会让服务陷入重启循环。
 3. 国内模式：补齐国内域名配置——写入域名名单 `ECS_DOMAIN_LIST_URLS`（缺失/为空时）、国内直连上游 `CN_UPSTREAMS`（阿里/腾讯 DoH，主机名同步进代理 drop-in 的 `NO_PROXY`），探测家宽公网 IPv4 写入 `ECS_FALLBACK_SUBNET`（ECS 回退路径用，见上文）。
 4. 每 5 分钟从 cfhub 的公开接口（`/api/v1/pools`）同步各运营商的优选池到本机 DoH。
-5. （`OPEN_PUBLIC=1`）用 acme.sh 走 DNS 验证签证书，Caddy 在 8443 端口提供 HTTPS DoH，可选 DDNS（只维护这一个域名的 A 记录）。
+5. （`OPEN_PUBLIC=1`）证书与对外服务：**先探测机器统一证书**——`/etc/ssl/<dir>/` 下成对 fullchain+privkey 且 SAN 覆盖 DoH 域名的（如 `/etc/ssl/wildcard` 的通配符，多份命中取剩余有效期最长的），就只引用不签发（续期/权限/reload 归机器统一环节，如 root cron 的 `acme.sh --cron` + `--reloadcmd`），Caddy 也只动自己的站点块（已指向就跳过、旧 `/etc/ssl/doh` 的 tls 行就原位切换、没有站点才写 `edge-smart-doh.caddy` site 文件 + import），绝不负责整写别的站点。没有统一证书才走 acme.sh DNS-01 自签到 `/etc/ssl/doh`（root cron 自动续期），可选 DDNS（只维护这一个域名的 A 记录）。
 6. （`SETUP_FIREWALL=1`，默认关）用 nftables 收紧入站。**会整体替换 `/etc/nftables.conf`，入站默认丢弃**，只放行 SSH、mosh、DoH；NAS 或还跑着别的服务的机器上会把它们挡掉，确认后再开。替换前会备份原文件。
 
 脚本做不了、需要你自己做的：路由器把外网 8443/TCP 转发到这台机器；用手机流量从外网验证一次。
