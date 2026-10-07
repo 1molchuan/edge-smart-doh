@@ -52,7 +52,12 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 ENV_FILE=/etc/edge-smart-doh/env
 CF_TOKEN_FILE=/etc/edge-smart-doh/cf-token
 CONF_FILE=/etc/edge-smart-doh/deploy.conf
+CADDYFILE=/etc/caddy/Caddyfile
 ACME=/root/.acme.sh/acme.sh
+
+# 备份一律落在 git 仓库之外：env/relay.env 的副本含 ADMIN_TOKEN，绝不能被提交
+# （本仓库挂着 origin/fork 两个 GitHub remote）。目录 0700，含密文件 0600。
+BACKUP_DIR=/var/backups/edge-smart-doh
 
 log()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m  [ok] %s\033[0m\n' "$*"; }
@@ -71,6 +76,90 @@ set_env_value() {  # set_env_value KEY VALUE
   fi
 }
 env_has_value() { grep -qE "^$1=.+" "$ENV_FILE"; }
+
+# 备份到仓库外的 $BACKUP_DIR（0700）；含 ADMIN_TOKEN 的文件副本一律 0600。
+# 源文件不存在视为无需备份（返回空）；失败返回非 0。
+backup_file() {  # backup_file SRC → 打印备份路径
+  local src="$1" dest
+  [[ -e "$src" ]] || return 0
+  install -d -m 0700 "$BACKUP_DIR" || return 1
+  dest="$BACKUP_DIR/$(basename -- "$src").$STAMP"
+  cp -a -- "$src" "$dest" || return 1
+  case "$src" in
+    "$ENV_FILE"|/etc/edge-smart-doh/relay.env) chmod 600 "$dest" ;;
+  esac
+  printf '%s' "$dest"
+}
+
+# ---- 443 冲突收窄（步骤 3c-5 用）----
+# relay 只绑 ${RELAY_IP_CFG}:443，只有通配监听才与它冲突；Caddy 未写 bind 时就是通配。
+ports_443() { ss -ltn 2>/dev/null | awk '$4 ~ /:443$/ {print $4}' | sort -u; }
+wildcard_443() { ports_443 | grep -qE '^(\*|0\.0\.0\.0|\[::\]):443$'; }
+wait_443_narrow() {  # 旧通配 *:443 已释放且主 IP:443 已在听（≤20s）
+  local i
+  for i in $(seq 1 20); do
+    if ! wildcard_443 && ports_443 | grep -qE "^${LAN_IP_RE}:443$"; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+# 把 Caddyfile 里绑在 443 的站点收窄到主 IP：能自动处理就处理；处理不了/超时就还原并中止，
+# 绝不盲启 relay（先起 relay 必 EADDRINUSE）。处理完必须等旧通配真正释放再返回。
+relay_gate_443() {
+  if ! wildcard_443; then
+    ok "443 无通配监听，relay 可直接绑定 ${RELAY_IP_CFG}:443"
+    return 0
+  fi
+  local holders before after caddy_bak
+  holders="$(ss -ltnp 2>/dev/null | grep -E ':443 ' | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u | paste -sd, - || true)"
+  if ! ss -ltnp 2>/dev/null | grep -E ':443 ' | grep -q 'users:(("caddy"'; then
+    die "443 被非 Caddy 进程占用（${holders:-未知}）：relay 绑 ${RELAY_IP_CFG}:443 会 EADDRINUSE。
+      请先在占用者（nginx/apache/vaultwarden 等）上把 443 收窄到主 IP ${LAN_IP} 或改端口，再重跑。本次不启动 relay。"
+  fi
+  before="$(ports_443 | tr '\n' ' ')"
+  caddy_bak="$(backup_file "$CADDYFILE")" || die "备份 $CADDYFILE 失败"
+  # 每个顶层 :443 站点头之后插入 bind <主 IP>；块内已有 bind 的原样保留
+  after="$(awk -v ip="$LAN_IP" '
+    { line[NR] = $0 }
+    END {
+      n = NR; i = 1
+      while (i <= n) {
+        if (line[i] ~ /^[^ \t]/ && line[i] ~ /:443[^0-9]/ && line[i] ~ /\{[ \t]*$/) {
+          j = i + 1; hasbind = 0
+          while (j <= n && line[j] !~ /^[^ \t]/) {
+            if (line[j] ~ /^[ \t]*bind[ \t]/) hasbind = 1
+            j++
+          }
+          print line[i]
+          if (!hasbind) print "\tbind " ip
+          for (k = i + 1; k < j; k++) print line[k]
+          i = j
+        } else { print line[i]; i++ }
+      }
+    }' "$CADDYFILE")" || die "改写 $CADDYFILE 失败"
+  if [[ "$after" == "$(cat "$CADDYFILE")" ]]; then
+    die "443 通配由 Caddy 持有，但 $CADDYFILE 里找不到可收窄的 443 站点块（当前监听：${before}）。
+      请人工加 'bind ${LAN_IP}' 后重跑。本次不启动 relay。"
+  fi
+  printf '%s\n' "$after" > "$CADDYFILE"
+  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+    cp -a -- "$caddy_bak" "$CADDYFILE"
+    systemctl reload caddy 2>/dev/null || true
+    die "caddy validate 失败：已还原 $CADDYFILE（备份 $caddy_bak），未 reload。本次不启动 relay。"
+  fi
+  if ! systemctl reload caddy; then
+    cp -a -- "$caddy_bak" "$CADDYFILE"
+    systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true
+    die "caddy reload 失败：已还原 $CADDYFILE（备份 $caddy_bak）。本次不启动 relay。"
+  fi
+  if wait_443_narrow; then
+    ok "Caddy 443 已收窄到 ${LAN_IP}（原通配监听：${before}）"
+  else
+    cp -a -- "$caddy_bak" "$CADDYFILE"
+    systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true
+    die "443 未在 20s 内收窄（当前监听：$(ports_443 | tr '\n' ' ')）：已还原 $CADDYFILE 并回退 Caddy。本次不启动 relay。"
+  fi
+}
 
 # 出口公网 IPv4 探测：必须直连（--noproxy，走代理拿到的是代理出口）；国内源互为备份。
 # 拿到私网/CGNAT/回环段视为失败——代理 TUN 全局接管时会这样。
@@ -98,10 +187,12 @@ save_conf() {  # save_conf KEY VALUE
 if [[ -f "$CONF_FILE" ]]; then
   while IFS='=' read -r k v; do
     case "$k" in
-      DOH_DOMAIN|CF_ZONE|PROXY_UNIT|ACME_EMAIL)
+      # RELAY_IP_CFG 一并读回：3c 保存过，但配置区留空时不读回就会每次重问，
+      # 且步骤 8 的 relay 放行规则要靠它算出来
+      DOH_DOMAIN|CF_ZONE|PROXY_UNIT|ACME_EMAIL|RELAY_IP_CFG)
         [[ -n "$v" && -z "${!k}" ]] && printf -v "$k" '%s' "$v" ;;
     esac
-  done < <(grep -E '^(DOH_DOMAIN|CF_ZONE|PROXY_UNIT|ACME_EMAIL)=' "$CONF_FILE" || true)
+  done < <(grep -E '^(DOH_DOMAIN|CF_ZONE|PROXY_UNIT|ACME_EMAIL|RELAY_IP_CFG)=' "$CONF_FILE" || true)
 fi
 
 # ---------------------------------------------------------------------------
@@ -142,6 +233,7 @@ fi
 LAN_IP="${LAN_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
 [[ "$LAN_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "无法确定本机内网 IP（在配置区 LAN_IP 指定）"
 LAN_CIDR="${LAN_CIDR:-${LAN_IP%.*}.0/24}"
+LAN_IP_RE="$(printf '%s' "$LAN_IP" | sed 's/\./\\./g')"   # 443 收窄判定用的正则转义
 
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
@@ -149,8 +241,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 FIREWALL_8443=""
 [[ "$OPEN_PUBLIC" == "1" ]] && FIREWALL_8443=$'    # 8443：公网 DoH 入口（经路由器转发，主机上无法区分来源，全放）\n    tcp dport 8443 accept'
-FIREWALL_RELAY=""
-[[ "$RELAY_ENABLED" == "1" && -n "$RELAY_IP_CFG" ]] && FIREWALL_RELAY=$'    # 443 SNI 中转：仅本机第二 IP、仅内网来源\n    ip saddr '"$LAN_CIDR"' ip daddr '"$RELAY_IP_CFG"' tcp dport 443 accept'
+# 注：relay 的 443 放行规则在步骤 8 现算——RELAY_IP_CFG 往往到步骤 3c 才确定（交互/deploy.conf）
 
 log "edge-smart-doh 部署开始（日志：$LOG_FILE）OPEN_PUBLIC=$OPEN_PUBLIC  DOMAIN=$DOH_DOMAIN"
 
@@ -191,7 +282,10 @@ getent passwd edge-smart-doh >/dev/null 2>&1 || useradd --system --no-create-hom
 install -D -m 0644 "$PROJECT_DIR/dist/node.mjs" /opt/edge-smart-doh/node.mjs
 
 [[ -f "$ENV_FILE" ]] || install -D -m 0600 "$PROJECT_DIR/deploy/edge-smart-doh.env.example" "$ENV_FILE"
-cp -a "$ENV_FILE" "$ENV_FILE.bak-$STAMP"   # 下面会改 env，先备份（0600 权限一并保留）
+# 下面会改 env，先备份。备份落在仓库外的 $BACKUP_DIR（0700）——env 副本含 ADMIN_TOKEN，
+# 绝不能写进本仓库（仓库挂着 origin/fork 两个 GitHub remote）
+ENV_BAK="$(backup_file "$ENV_FILE")" || die "备份 $ENV_FILE 失败"
+ok "env 已备份 → ${ENV_BAK:-（无文件，跳过）}"
 
 # ---- 上游模式决策：国内环境必须解决"上游被墙/被污染"，否则被污染域名解析不到 ----
 DROPIN_PROXY=/etc/systemd/system/edge-smart-doh.service.d/proxy.conf
@@ -378,7 +472,7 @@ else
     [[ "$RELAY_IP_CFG" =~ ^(10\.|127\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]] \
       || die "RELAY_IP 必须是私网地址（服务端也会拒绝公网地址）"
 
-    # --- 3c-1 第二内网 IP：本次立即生效 + 按网络后端持久化 ---
+    # --- 3c-1 第二内网 IP：本次立即生效 + oneshot 单元持久化（不依赖网络后端）---
     RELAY_PREFIX="${LAN_CIDR##*/}"
     RELAY_DEV="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
     if ip -4 addr show 2>/dev/null | grep -q "inet ${RELAY_IP_CFG}/"; then
@@ -390,19 +484,50 @@ else
     else
       warn "找不到默认路由网卡，请手工：ip addr add ${RELAY_IP_CFG}/${RELAY_PREFIX} dev <网卡>"
     fi
+
+    # 只 warn「按网络后端手工持久化」的话，重启后第二 IP 会消失，relay 会 listen_error +
+    # Restart=always 无限重启。装一个常驻 oneshot 单元，每次开机幂等补齐地址；重试覆盖 DHCP 迟到。
+    if [[ -z "$RELAY_DEV" ]]; then
+      warn "无默认路由网卡，本次未安装 IP 持久化单元；请手工 ip addr add ${RELAY_IP_CFG}/${RELAY_PREFIX} dev <网卡> 并自行持久化"
+    else
+      tee /etc/systemd/system/edge-smart-doh-relay-ip.service > /dev/null <<EOF
+[Unit]
+Description=edge-smart-doh relay: add second LAN IP ${RELAY_IP_CFG}/${RELAY_PREFIX}
+Documentation=file:///opt/edge-smart-doh/relay-DESIGN.md
+After=network-online.target
+Wants=network-online.target
+Before=edge-smart-doh-relay.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 幂等：地址已在位直接成功；否则重试 6 次（每次 3s，覆盖 DHCP 迟到），最终仍失败则退出非 0
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6; do if ip -4 addr show dev ${RELAY_DEV} 2>/dev/null | grep -q "inet ${RELAY_IP_CFG}/"; then exit 0; fi; if ip addr add ${RELAY_IP_CFG}/${RELAY_PREFIX} dev ${RELAY_DEV} 2>/dev/null; then exit 0; fi; sleep 3; done; echo "failed to add ${RELAY_IP_CFG}/${RELAY_PREFIX} to ${RELAY_DEV}" >&2; exit 1'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      systemctl daemon-reload
+      systemctl enable --now edge-smart-doh-relay-ip.service \
+        || die "enable --now edge-smart-doh-relay-ip.service 失败（重启后第二 IP 会消失）"
+      systemctl is-active --quiet edge-smart-doh-relay-ip.service \
+        || die "IP 持久化单元未 active：journalctl -u edge-smart-doh-relay-ip.service"
+      ip -4 addr show dev "$RELAY_DEV" 2>/dev/null | grep -q "inet ${RELAY_IP_CFG}/" \
+        || die "IP 持久化单元已启用但 ${RELAY_IP_CFG} 仍不在 ${RELAY_DEV} 上"
+      ok "第二 IP 持久化：edge-smart-doh-relay-ip.service 已 enabled+active（重启后由它补齐）"
+    fi
+
+    # 网络后端只作参考：持久化已交给上面的 oneshot 单元，这里给出手工方式兜底
     if command -v nmcli >/dev/null 2>&1; then
       RELAY_CONN="$(nmcli -g NAME,DEVICE con show --active 2>/dev/null | awk -F: -v d="${RELAY_DEV:-x}" '$2==d{print $1; exit}')"
-      if [[ -n "$RELAY_CONN" ]]; then
-        nmcli con mod "$RELAY_CONN" +ipv4.addresses "${RELAY_IP_CFG}/${RELAY_PREFIX}" 2>/dev/null \
-          && ok "NetworkManager 已持久化（连接 ${RELAY_CONN}）" \
-          || warn "nmcli 持久化失败，请手工给连接 ${RELAY_CONN} 加 ${RELAY_IP_CFG}/${RELAY_PREFIX}"
-      fi
+      [[ -n "$RELAY_CONN" ]] \
+        && warn "网络后端 NetworkManager；可选手工方式：nmcli con mod \"$RELAY_CONN\" +ipv4.addresses ${RELAY_IP_CFG}/${RELAY_PREFIX}（oneshot 单元已负责持久化）"
     elif [[ -f /etc/network/interfaces ]] && grep -qE '^iface .+ inet ' /etc/network/interfaces; then
-      warn "ifupdown 持久化请手工：在对应 iface 段加一行 'up ip addr add ${RELAY_IP_CFG}/${RELAY_PREFIX} dev ${RELAY_DEV:-<网卡>}'"
+      warn "网络后端 ifupdown；可选手工方式：在对应 iface 段加 'up ip addr add ${RELAY_IP_CFG}/${RELAY_PREFIX} dev ${RELAY_DEV:-<网卡>}'（oneshot 单元已负责持久化）"
     elif systemctl is-active --quiet systemd-networkd 2>/dev/null; then
-      warn "networkd 持久化请手工：对应 .network 的 [Network] 加 'Address=${RELAY_IP_CFG}/${RELAY_PREFIX}'"
+      warn "网络后端 systemd-networkd；可选手工方式：对应 .network 的 [Network] 加 'Address=${RELAY_IP_CFG}/${RELAY_PREFIX}'（oneshot 单元已负责持久化）"
     else
-      warn "未识别网络后端，重启后请手工补：ip addr add ${RELAY_IP_CFG}/${RELAY_PREFIX} dev ${RELAY_DEV:-<网卡>}"
+      warn "未识别网络后端：持久化由 oneshot 单元负责；若该单元也装不上，请手工 ip addr add ${RELAY_IP_CFG}/${RELAY_PREFIX} dev ${RELAY_DEV:-<网卡>} 并自行持久化"
     fi
 
     # --- 3c-2 主服务 env：RELAY_*（RELAY_MODE 尊重已改过的值，其余随配置区刷新）---
@@ -434,6 +559,18 @@ else
     umask 022
     install -m 0644 "$PROJECT_DIR/contrib/home/relay/relay.service" /etc/systemd/system/edge-smart-doh-relay.service
     ok "relay.env 已生成（最小权限：只含监听/代理/名单/token）"
+
+    # --- 3c-3b relay 依赖第二 IP 单元：用 drop-in 追加 Wants=/After=，
+    # 不改仓库里的 relay.service（否则与 install/升级的幂等比较冲突）---
+    if [[ -f /etc/systemd/system/edge-smart-doh-relay-ip.service ]]; then
+      install -d -m 0755 /etc/systemd/system/edge-smart-doh-relay.service.d
+      tee /etc/systemd/system/edge-smart-doh-relay.service.d/10-wants-relay-ip.conf > /dev/null <<'EOF'
+[Unit]
+# 第二内网 IP 由 edge-smart-doh-relay-ip.service 提供（oneshot + RemainAfterExit）
+Wants=edge-smart-doh-relay-ip.service
+After=edge-smart-doh-relay-ip.service
+EOF
+    fi
 
     # --- 3c-4 前置条件：mihomo 的 DOMAIN 规则（无池回退按域名 CONNECT 时靠它远程解析防回环）---
     warn "请确认代理配置里有名单域名的 DOMAIN 规则（如 DOMAIN-SUFFIX,github.com,<代理组>），并执行
@@ -468,6 +605,9 @@ ok "edge-smart-doh 运行中；ADMIN_TOKEN 在 $TOKEN_FILE"
 
 # ---- 3c-5：启动 relay 守护进程并验收（主服务已就绪，健康上报才有接收方）----
 if [[ "$RELAY_ENABLED" == "1" && -n "$PROXY_ADDR" && -n "$RELAY_IP_CFG" && -f /etc/edge-smart-doh/relay.env ]]; then
+  # 先处理 443 冲突：Caddy 通配 *:443 会让 relay 绑 RELAY_IP:443 直接 EADDRINUSE。
+  # 收窄不了 / 收窄超时 → 还原 Caddyfile 并中止，绝不盲启（见 relay_gate_443）
+  relay_gate_443
   systemctl enable edge-smart-doh-relay >/dev/null 2>&1
   systemctl restart edge-smart-doh-relay
   RELAY_UP=0
@@ -699,14 +839,34 @@ fi
 # 8. 防火墙（整文件替换：最小入站规则 + DoH 放行；替换前自动备份）
 # ---------------------------------------------------------------------------
 if [[ "$SETUP_FIREWALL" == "1" ]]; then
-log "步骤 8/8：防火墙（8787 仅内网${FIREWALL_8443:+；8443 公网}）"
+# relay 的 443 放行规则：RELAY_IP_CFG 到步骤 3c 才确定（交互输入/deploy.conf），所以在这里现算
+FIREWALL_RELAY=""
+[[ "$RELAY_ENABLED" == "1" && -n "${RELAY_IP_CFG:-}" ]] && FIREWALL_RELAY=$'    # 443 SNI 中转：仅本机第二 IP、仅内网来源\n    ip saddr '"$LAN_CIDR"' ip daddr '"$RELAY_IP_CFG"' tcp dport 443 accept'
+NFT_RULE_KEY=""
+[[ -n "$FIREWALL_RELAY" ]] && NFT_RULE_KEY="ip daddr ${RELAY_IP_CFG} tcp dport 443 accept"
+log "步骤 8/8：防火墙（8787 仅内网${FIREWALL_8443:+；8443 公网}${FIREWALL_RELAY:+；relay 443}）"
 
-[[ -f /etc/nftables.conf ]] && cp -a /etc/nftables.conf "/etc/nftables.conf.pre-doh-$STAMP"
+# 本文件刻意没有 "flush ruleset"（为了不清掉 Docker 运行时生成的表），所以
+# `systemctl reload nftables`（= nft -f 整份文件）会在内核里把规则重复追加、越 reload 越多。
+# 本步骤一律不走 reload：写文件 → 语法校验 → 删掉本表的旧内容 → 整体载入；
+# 写前查一次内核、写后断言恰好 1 条，保证内核与文件严格一致（可重复执行）。
+NFT_BAK=""
+if [[ -f /etc/nftables.conf ]]; then
+  NFT_BAK="$(backup_file /etc/nftables.conf)" || die "备份 /etc/nftables.conf 失败"
+  ok "旧 /etc/nftables.conf 已备份 → $NFT_BAK"
+fi
+if [[ -n "$NFT_RULE_KEY" ]]; then
+  NFT_LIVE_BEFORE="$(nft list ruleset 2>/dev/null | grep -cF "$NFT_RULE_KEY" || true)"
+  [[ "${NFT_LIVE_BEFORE:-0}" != "0" ]] \
+    && warn "内核里 relay 放行规则已有 ${NFT_LIVE_BEFORE} 条（本文件无 flush，历次 reload 累积）——本次收敛为 1 条"
+fi
 
 tee /etc/nftables.conf > /dev/null <<EOF
 #!/usr/sbin/nft -f
 # 由 contrib/home/deploy-home.sh 生成：最小入站 + edge-smart-doh 放行
-# 注意：不要加 "flush ruleset"，否则会清掉 Docker 运行时生成的规则
+# 注意：不要加 "flush ruleset"，否则会清掉 Docker 运行时生成的规则；
+#       正因如此，`systemctl reload nftables` 会重复追加规则、越积越多——
+#       改规则请重跑本脚本（先删本表再整体载入，可重复执行）
 
 table inet home_firewall {
   chain input {
@@ -743,8 +903,14 @@ ${FIREWALL_RELAY}
 EOF
 
 nft -c -f /etc/nftables.conf >/dev/null 2>&1 || die "nft 语法校验失败（未做任何改动）"
-nft delete table inet home_firewall 2>/dev/null || true   # 重复 nft -f 会叠加规则，先删再载
+nft delete table inet home_firewall 2>/dev/null || true   # 文件没有 flush，重复 nft -f 会累积；先删本表再载
 nft -f /etc/nftables.conf
+if [[ -n "$NFT_RULE_KEY" ]]; then
+  NFT_LIVE_AFTER="$(nft list ruleset 2>/dev/null | grep -cF "$NFT_RULE_KEY" || true)"
+  [[ "${NFT_LIVE_AFTER:-0}" == "1" ]] \
+    || die "内核里 relay 放行规则为 ${NFT_LIVE_AFTER:-0} 条（期望恰好 1）：nft list ruleset | grep 'tcp dport 443'"
+  ok "内核里 relay 放行规则恰好 1 条（历次 reload 的累积已收敛）"
+fi
 systemctl enable nftables >/dev/null 2>&1 || true
 nft list table inet home_firewall >/dev/null \
   && ok "防火墙已应用（已建立的 SSH 走 established，不受影响；重启自动加载）"

@@ -217,12 +217,28 @@ WantedBy=multi-user.target
 
 7. relay：构建并安装 `/opt/edge-smart-doh/relay.mjs`，生成 relay.env（域名清单从
    `GITHUB_DOMAINS` 的通配形种子生成），装单元，`enable --now`；
-8. 第二 IP 持久化：探测网络后端（`nmcli -t con show` / `/etc/network/interfaces` /
-   systemd-networkd），按后端写对应配置；探测不出 → 打印手工命令（`ip addr add` + 持久化提示）
-   并继续；
+8. 第二 IP：本次 `ip addr add` 生效，并安装常驻 oneshot 单元
+   `edge-smart-doh-relay-ip.service`（`Type=oneshot` + `RemainAfterExit=yes`、
+   `After=/Wants=network-online.target`、`Before=edge-smart-doh-relay.service`，ExecStart 幂等 +
+   6×3s 重试覆盖 DHCP 迟到）`enable --now` 负责开机持久化——**不依赖网络后端**；探测不出默认路由
+   网卡时只打印手工命令，网络后端（nmcli/ifupdown/networkd）信息仅作参考。relay 单元用 drop-in
+   `edge-smart-doh-relay.service.d/10-wants-relay-ip.conf` 追加 `Wants=/After=`（不改仓库 relay.service，
+   保留 install/升级的幂等比较）；
+8b. 443 冲突：relay 只绑 `RELAY_IP:443`，而内核不允许“通配 + 具体地址”同端口共存，
+   若 `*:443` 已被通配占用（典型：Caddy 未写 `bind`），先起 relay 必 EADDRINUSE。deploy 检测到
+   通配占用者是本机 Caddy 时，给 Caddyfile 里绑 443 的站点加 `bind <主 IP>`、`caddy validate`
+   通过后 reload，并轮询（≤20s）到旧通配释放 + 主 IP:443 在听，才允许启 relay；reload 失败/
+   校验失败/超时 → 还原 Caddyfile 并中止（不留半完成态），占用者不是 Caddy → 明确提示并中止；
+8c. nftables 幂等：`/etc/nftables.conf` 刻意无 `flush ruleset`（保 Docker 的表），`systemctl
+   reload nftables` 会累积重复规则；deploy 写规则前查 `nft list ruleset`、写后断言内核里恰好 1 条，
+   且用“删本表 inet home_firewall 再整体载入”而非 reload；
 9. env 写入 `RELAY_MODE=auto`（首次种子；用户手动改 env 的值脚本要尊重，仿
    `ECS_FALLBACK_SUBNET_CFG` 的"配置区值优先"模式）；
 10. `SETUP_FIREWALL=1` 时：nftables 增加放行 `RELAY_IP` 443/TCP 入站，源限制 RFC1918。
+
+备份（改 env / nftables.conf / Caddyfile 前）一律落在**仓库外**的 `/var/backups/edge-smart-doh/`：
+目录 0700，含 `ADMIN_TOKEN` 的 env/relay.env 副本 0600——本仓库挂着 `origin`/`fork` 两个 GitHub
+remote，含密副本绝不能写进工作区。
 
 ### 5.3 mihomo 前置条件（脚本只检查+提示，不代改——mihomo 配置用户自管）
 

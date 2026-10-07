@@ -118,7 +118,12 @@ sudo systemctl start edge-smart-doh
 
 域名集合独立于档位：`RELAY_DOMAINS`（支持 `*.github.com` 通配）+ `RELAY_EXCLUDE_DOMAINS`（排除优先，默认排掉无 SNI 的 `ssh.github.com`）。HTTPS RR 会同步清洗（hint 指向中转 IP、删 ECH、ALPN 压 h2），AAAA 答空，TTL 压到 60。
 
-启用：`deploy-home.sh` 配置区设 `RELAY_ENABLED=1` 重跑（会问第二 IP 并持久化，自动装 `edge-smart-doh-relay.service`、生成最小权限的 `/etc/edge-smart-doh/relay.env`、种好 `RELAY_MODE=auto`）。两个前置认知：
+启用：`deploy-home.sh` 配置区设 `RELAY_ENABLED=1` 重跑。脚本会问第二 IP，装 `edge-smart-doh-relay-ip.service`（`Type=oneshot` + `RemainAfterExit`，每次开机幂等补齐地址，重试覆盖 DHCP 迟到；relay 单元用 drop-in `Wants=/After=` 它），再装 `edge-smart-doh-relay.service`、生成最小权限的 `/etc/edge-smart-doh/relay.env`、种好 `RELAY_MODE=auto`。启 relay 前还会自动处理两个部署坑：
+
+- **443 冲突**：relay 只绑 `RELAY_IP:443`，若本机已有通配 `*:443`（如 Caddy 未写 `bind`）就会 EADDRINUSE。脚本检测到通配占用者是本机 Caddy 时，给 Caddyfile 里绑 443 的站点加 `bind <主 IP>`、`caddy validate` 通过后 reload，并轮询到旧通配释放、主 IP:443 在听才启 relay（≤20s）；超时或占用者不是 Caddy → 还原 Caddyfile 并中止，不盲启。
+- **nftables 幂等**：`/etc/nftables.conf` 刻意不加 `flush ruleset`（怕清掉 Docker 的表），于是 `systemctl reload nftables` 会累积重复规则。脚本改规则时先查 `nft list ruleset`、写后断言内核里恰好 1 条，且用"删本表再整体载入"而不是 reload。
+
+两个前置认知：
 
 - **防回环靠"按实测池 IP 拨号"**：relay 拨号用 `/admin/pool` 给的池 IP，不经 DNS，从根上避免"解析到中转 IP→连到自己"。仅池空时按域名 CONNECT，此时依赖代理配置里的 `DOMAIN-SUFFIX,github.com,<代理组>` 规则远程解析——装完用 `curl -x <代理> -sI https://github.com` 验证一次。
 - **降级不变量**：relay 挂了/代理挂了 → 健康上报停止 → DNS 在 TTL 内回退直连路径，最坏情况 = 没装中转。`RELAY_IP` 只接受私网地址，服务端直接拒绝公网值。
@@ -127,8 +132,9 @@ sudo systemctl start edge-smart-doh
 
 ## 回滚
 
-- 环境变量：脚本每次改 env 前会备份成 `/etc/edge-smart-doh/env.bak-<时间>`，拷回去再 `systemctl restart edge-smart-doh`。
-- 防火墙：`/etc/nftables.conf.pre-doh-<时间>` 是替换前的备份，拷回去后 `nft delete table inet home_firewall && nft -f /etc/nftables.conf`。
+- 环境变量：脚本每次改 env 前会备份到仓库外的 `/var/backups/edge-smart-doh/env.<时间>`（目录 0700，含 `ADMIN_TOKEN` 的副本 0600），拷回去再 `systemctl restart edge-smart-doh`。
+- 防火墙：替换前备份到 `/var/backups/edge-smart-doh/nftables.conf.<时间>`，拷回去后 `nft delete table inet home_firewall && nft -f /etc/nftables.conf`。
+- Caddy（若因 443 收窄失败，脚本会自行还原）：备份同样在 `/var/backups/edge-smart-doh/Caddyfile.<时间>`。
 
 ## 已知限制
 
