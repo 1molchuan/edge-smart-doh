@@ -603,8 +603,9 @@ const PAGE = `<!doctype html>
   /* 第一屏 bento：状态大磁贴 + 三个 KPI + 链路磁贴 */
   .bento { display: grid; grid-template-columns: 1.35fr 1fr 1fr 1fr; gap: 12px; }
   .bento .status { grid-row: span 2; display: flex; flex-direction: column; }
-  @media (max-width: 980px) { .bento { grid-template-columns: 1fr 1fr; } .bento .status { grid-row: auto; grid-column: span 2; } .bento .linktile { grid-column: span 2; } }
-  @media (max-width: 560px) { .bento { grid-template-columns: 1fr; } .bento .status, .bento .linktile { grid-column: span 1; } }
+  .bento .linktile { grid-column: 2 / -1; }
+  @media (max-width: 980px) { .bento { grid-template-columns: 1fr 1fr; } .bento .status { grid-row: auto; grid-column: 1 / -1; } .bento .linktile { grid-column: 1 / -1; } }
+  @media (max-width: 560px) { .bento { grid-template-columns: 1fr; } .bento .status, .bento .linktile { grid-column: auto; } }
 
   .status { position: relative; overflow: hidden; }
   .status::after { content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .5; transition: opacity .3s; }
@@ -641,11 +642,11 @@ const PAGE = `<!doctype html>
 
   /* 链路磁贴 */
   .paths-list { display: flex; flex-direction: column; justify-content: space-evenly; min-height: 118px; }
-  .path { display: flex; align-items: center; gap: 9px; padding: 5px 0; font-size: 13.5px; }
+  .path { display: flex; align-items: center; gap: 9px; padding: 5px 0; font-size: 13.5px; min-width: 0; }
   .path + .path { border-top: 1px solid var(--line-2); }
   .pdot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; flex: none; }
   .pdot.ok { background: var(--ok); } .pdot.bad { background: var(--bad); }
-  .pl { color: #ccd5ea; white-space: nowrap; }
+  .pl { color: #ccd5ea; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .spark { margin-left: auto; flex: none; opacity: .95; }
   .pv { flex: none; min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; font-size: 14.5px; font-weight: 650; white-space: nowrap; }
   .pv.err { color: #fca5a5; font-size: 12px; font-weight: 400; }
