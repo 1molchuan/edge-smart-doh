@@ -73,15 +73,12 @@ describe("RELAY_* configuration", () => {
     expect(readConfig(env({})).relayForcedMode).toBe("off");
   });
 
-  it("LAN-only gate: on unless explicitly off, and a junk value still fails safe to on", () => {
-    const env = (extra: Record<string, string>) => ({ RELAY_IP: RELAY_IP, ...extra } as unknown as Env);
-    expect(readConfig(env({})).relayLanOnly).toBe(true);
-    expect(readConfig(env({ RELAY_LAN_ONLY: "true" })).relayLanOnly).toBe(true);
-    expect(readConfig(env({ RELAY_LAN_ONLY: "" })).relayLanOnly).toBe(true);
-    expect(readConfig(env({ RELAY_LAN_ONLY: "maybe" })).relayLanOnly).toBe(true);
-    expect(readConfig(env({ RELAY_LAN_ONLY: "false" })).relayLanOnly).toBe(false);
-    expect(readConfig(env({ RELAY_LAN_ONLY: "0" })).relayLanOnly).toBe(false);
-    expect(readConfig(env({ RELAY_LAN_ONLY: "OFF" })).relayLanOnly).toBe(false);
+  it("the LAN gate is a design constraint, not a switch: no such config field exists", () => {
+    // The relay's answer is a private address, so a client off the LAN can never use it. Guard
+    // against the switch creeping back in: even the old env name yields no field to flip.
+    const cfg = readConfig({ RELAY_IP: RELAY_IP, RELAY_MODE: "always", RELAY_DOMAINS: "*.github.com", RELAY_LAN_ONLY: "false" } as unknown as Env);
+    expect(cfg).not.toHaveProperty("relayLanOnly");
+    expect(cfg.relayMode).toBe("always");
   });
 });
 
@@ -153,14 +150,6 @@ describe("relayServes", () => {
     expect(relayServes("www.google.com", forcedCfg, true)).toBe(true);
     expect(relayServes("www.google.com", forcedCfg, false)).toBe(false);
     expect(relayServes("www.google.com", forcedCfg, undefined)).toBe(false);
-  });
-
-  it("RELAY_LAN_ONLY=false restores the ungated behavior for callers that front the LAN", () => {
-    healthyRelay();
-    const gateOff = config({ relayLanOnly: false, relayMode: "auto", relayIp: RELAY_IP, relayDomains: ["*.github.com"], relayForcedMode: "always", relayForcedDomains: ["*.google.com"] });
-    expect(relayServes("www.google.com", gateOff, false)).toBe(true);
-    expect(relayServes("www.google.com", gateOff, undefined)).toBe(true);
-    expect(relayServes("github.com", gateOff, false)).toBe(false); // still auto-gated: no samples
   });
 });
 
@@ -339,11 +328,15 @@ describe("relay answers over /dns-query", () => {
     expect(sharedWan.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: GITHUB_REAL }]);
   });
 
-  it("RELAY_LAN_ONLY=false serves the forced pool to any client (the escape hatch)", async () => {
+  it("no environment value reopens the gate for an off-LAN client (the old RELAY_LAN_ONLY name included)", async () => {
     healthyRelay();
-    const env = { RELAY_LAN_ONLY: "false", RELAY_MODE: "auto", RELAY_FORCED_MODE: "always", RELAY_FORCED_DOMAINS: "*.google.com" };
-    const wan = await ask("www.google.com", DnsType.A, new MemoryCache(), WAN, env);
-    expect(wan.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: RELAY_IP }]);
+    // Design constraint, not a setting: the relay answers a private address an off-LAN client cannot
+    // route to, so nothing in the environment makes it serve one.
+    const legacy = { RELAY_LAN_ONLY: "false", RELAY_MODE: "auto", RELAY_FORCED_MODE: "always", RELAY_FORCED_DOMAINS: "*.google.com" };
+    const wan = await ask("www.google.com", DnsType.A, new MemoryCache(), WAN, legacy);
+    expect(wan.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: GITHUB_REAL }]);
+    const lan = await ask("www.google.com", DnsType.A, new MemoryCache(), LAN, legacy);
+    expect(lan.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: RELAY_IP }]);
   });
 
   it("takes precedence over the github pool while healthy, and falls back when not", async () => {

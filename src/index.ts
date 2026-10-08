@@ -461,10 +461,9 @@ async function handleExplain(request: Request, env: Env, runtime: RequestRuntime
   return json({
     name,
     clientIp: setup.ip ?? null,
-    // Why the relay did or did not apply for this client: `lan` is the gate's input, `relayLanOnly`
-    // says whether the gate is armed. Both are informational; nothing else changes with them.
+    // Why the relay did or did not apply for this client: the LAN gate is unconditional by design
+    // (relay.ts / DESIGN.md §2.1.1), so this one boolean is the whole story. Informational only.
     lan: setup.lan,
-    relayLanOnly: setup.config.relayLanOnly,
     pool: { ipv4: setup.config.cfPreferredIpv4, ipv6: setup.config.cfPreferredIpv6, scope: setup.scope ?? "default" },
     results: results.map(({ packet: _packet, ...rest }) => rest),
     chromium: a && aaaa && https ? chromiumEchVerdict(a, aaaa, https) : null,

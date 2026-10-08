@@ -123,10 +123,11 @@ export const githubPool: Strategy = {
  * between the site-pool and GitHub-pool strategies: it takes the addresses decision for good
  * (github-pool then leaves the name alone).
  *
- * One gate wraps both pools, inside relayServes: the relay is for LAN clients only (RELAY_LAN_ONLY).
- * Its answer is a private address, so a client off the LAN must keep the ordinary answer instead of
- * pinning to something it cannot reach. `ctx.lan` carries the client's LAN-ness into both the cache
- * variant and the decision, so a remote client never reads the LAN client's pinned answer from cache.
+ * One gate wraps both pools, inside relayServes: the relay is for LAN clients only. Its answer is a
+ * private address, so a client off the LAN must keep the ordinary answer instead of pinning to
+ * something it cannot reach — a design constraint (the client has to be able to route to the relay),
+ * not a switch. `ctx.lan` carries the client's LAN-ness into both the cache variant and the
+ * decision, so a remote client never reads the LAN client's pinned answer from cache.
  */
 export const relay: Strategy = {
   name: "relay",

@@ -117,15 +117,6 @@ export interface AppConfig {
    */
   relayForcedMode: RelayForcedMode;
   relayForcedDomains: string[];
-  /**
-   * Whether the relay answers LAN clients only (RELAY_LAN_ONLY, default true). The relay IP is a
-   * private address: a client off the LAN that receives it can only time out, so when the client
-   * address is missing or outside RFC1918/ULA/loopback the relay stands down and the name keeps its
-   * ordinary answer (preferred pool, upstream) exactly as if the relay were off. Only a deployment
-   * that fronts the LAN — a cloud worker, where every client necessarily looks remote — should turn
-   * this off; the home deployment must keep it on.
-   */
-  relayLanOnly: boolean;
   /** Block lists for ?safe=1 (see safe.ts); empty disables the feature. */
   safeListUrls: string[];
   /** Domains (and their subdomains) ?safe=1 never blocks. */
@@ -144,15 +135,6 @@ function integer(value: string | undefined, fallback: number, minimum: number, m
 
 function enabled(value: string | undefined): boolean {
   return value?.toLowerCase() === "true";
-}
-
-/**
- * A boolean env key that is on unless it is explicitly turned off. Used where a missing, empty or
- * misspelled value must fail safe to the stricter behavior (RELAY_LAN_ONLY: fail closed, never hand
- * a LAN address to a stranger).
- */
-function enabledByDefault(value: string | undefined): boolean {
-  return !["false", "0", "no", "off"].includes((value ?? "").trim().toLowerCase());
 }
 
 // Secrets are not part of the generated Env type (they are set via `wrangler secret put`, not vars).
@@ -251,7 +233,6 @@ export function readConfig(env: Env): AppConfig {
     relayExcludeDomains: list(env.RELAY_EXCLUDE_DOMAINS).map((item) => item.toLowerCase()),
     relayForcedMode: relayForcedModeOf(env.RELAY_FORCED_MODE),
     relayForcedDomains: list(env.RELAY_FORCED_DOMAINS).map((item) => item.toLowerCase()),
-    relayLanOnly: enabledByDefault(env.RELAY_LAN_ONLY),
     safeListUrls: list(env.SAFE_LIST_URLS).filter((item) => item.startsWith("https://") || item.startsWith("http://127.0.0.1")),
     safeAllow: list(env.SAFE_ALLOW).map((item) => item.toLowerCase().replace(/^\*?\./, "").replace(/\.$/, "")),
     dynamicRuleHosts: list(env.DYNAMIC_RULE_HOSTS).map((item) => item.toLowerCase()),

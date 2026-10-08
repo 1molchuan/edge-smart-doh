@@ -25,12 +25,14 @@ import { parseIpv4, parseIpv6 } from "./dns/packet";
  * the change bumps the version (so cached answers re-key at once) and is persisted by the Node
  * server.
  *
- * The LAN gate (RELAY_LAN_ONLY, default on) is the outermost condition of every relay decision:
- * the pinned answer is a private address, so a client that is not on the LAN can only time out on
- * it. Both pools — forced included — are therefore served to LAN clients only; a client off the LAN
- * gets the ordinary answer (preferred pool, upstream), byte for byte what it would get with the
- * relay off. A client address that cannot be parsed counts as off-LAN, so an unknown source never
- * receives a LAN address.
+ * The LAN gate is the outermost condition of every relay decision, and it is a design constraint
+ * rather than a tunable: the pinned answer is the relay's private address, and that answer is only
+ * useful to a client that can route to it. Both pools — forced included — are therefore served to
+ * LAN clients only; a client off the LAN gets the ordinary answer (preferred pool, upstream), byte
+ * for byte what it would get with the relay off. A client address that cannot be parsed counts as
+ * off-LAN, so an unknown source never receives a LAN address. There is deliberately no environment
+ * switch: an off-LAN client cannot reach the relay at all, so "relay for the internet" is not a
+ * scenario this code supports.
  */
 
 /** Answer TTL for relay-pinned names: how fast a withdrawn relay stops being served. */
@@ -325,15 +327,19 @@ export function setRelayHealth(report: RelayHealthReport): void {
 /**
  * Whether the answer for `name` should point at the relay right now (either pool: LAN gate, mode,
  * health, auto gating). `clientLan` is the caller's finding about the client address and is
- * deliberately required: when the LAN gate is on (the default) only `true` passes, and an undefined
- * finding — the caller could not place the client — must not receive a LAN address either. Direct
- * callers that simply have no client (tests, internal tooling) state `true` themselves rather than
- * getting it by omission, so a forgotten argument fails closed instead of open.
+ * deliberately required: only `true` passes the gate, and an undefined finding — the caller could
+ * not place the client — must not receive a LAN address either. Direct callers that simply have no
+ * client (tests, internal tooling) state `true` themselves rather than getting it by omission, so a
+ * forgotten argument fails closed instead of open. The gate is unconditional by design (DESIGN.md
+ * §2.1.1): it is not a configuration option. The reason is the answer itself — a relayed reply
+ * carries RELAY_IP, a private address, so it can only help a client that can route to it; a client
+ * off the LAN times out on it (2026-10-08), and there is no "relay for the internet" case that a
+ * switch could enable.
  */
 export function relayServes(name: string, config: AppConfig, clientLan: boolean | undefined): boolean {
   const effective = effectiveRelayConfig(config);
   if (!effective.ip || !relayAlive()) return false;
-  if (config.relayLanOnly && clientLan !== true) return false; // unknown client = off-LAN = no relay
+  if (clientLan !== true) return false; // off-LAN, unknown or unparsable client = no relay
   if (domainMatches(name, effective.excludeDomains)) return false;
   // The forced pool answers unconditionally (within liveness): its hosts have no measured pool, so
   // auto could never judge them — see the interface comment on AppConfig.relayForcedDomains.
