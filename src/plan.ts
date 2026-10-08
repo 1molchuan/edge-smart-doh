@@ -24,6 +24,12 @@ export interface RequestContext {
   options: RequestOptions;
   /** Preferred-pool scope of the request (client prefix, operator), if any. */
   scope?: string;
+  /**
+   * Whether the client address is on the LAN, resolved once per query (index.ts). The relay pins a
+   * private address, so it stands down unless this is true. Always set (makePlan normalizes a
+   * missing input to false), so no strategy has to reason about "unknown".
+   */
+  lan: boolean;
   name: string;
   type: number;
 }
@@ -105,6 +111,8 @@ export interface PlanInput {
   rules: RuleSet;
   cache: Cache;
   notes?: string[];
+  /** Client LAN-ness for the relay gate; see RequestContext.lan. */
+  lan?: boolean;
 }
 
 export async function makePlan(strategies: Strategy[], input: PlanInput): Promise<{ plan: RoutePlan; ctx: PlanContext }> {
@@ -114,6 +122,9 @@ export async function makePlan(strategies: Strategy[], input: PlanInput): Promis
   let classify: () => Promise<boolean> = async () => false;
   const ctx: PlanContext = {
     ...input,
+    // A caller that did not resolve the client is treated as off-LAN: fail safe, never hand a
+    // private relay address to a client nobody could place.
+    lan: input.lan === true,
     name: question.name,
     type: question.type,
     steered: false,

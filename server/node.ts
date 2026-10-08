@@ -54,6 +54,9 @@ const DEFAULTS = {
   RELAY_EXCLUDE_DOMAINS: "",
   RELAY_FORCED_MODE: "off",
   RELAY_FORCED_DOMAINS: "",
+  // LAN-only gate for the relay: on unless explicitly turned off (readConfig uses enabledByDefault,
+  // so a missing or misspelled value also lands on the safe side).
+  RELAY_LAN_ONLY: "true",
   // Where the console's relay overrides (POST /admin/relay-config) persist across restarts; empty
   // disables persistence (overrides then live in memory only, which workers also get).
   RELAY_CONFIG_PATH: "",
@@ -288,6 +291,15 @@ function warnOnRelayConfig(): void {
       event: "relay_config_warning",
       message: `${name}=${mode} but RELAY_IP=${ip} is not a private address: the relay path is disabled`,
       hint: "the relay must only ever point at an address a stranger cannot reach; use a second private IP on the LAN interface",
+    }));
+  }
+  // The gate that keeps a remote client from being handed the private relay IP. Turning it off is
+  // legitimate only where every client necessarily looks remote; say so out loud.
+  if (["false", "0", "no", "off"].includes((process.env.RELAY_LAN_ONLY ?? "").trim().toLowerCase())) {
+    console.warn(JSON.stringify({
+      event: "relay_config_warning",
+      message: "RELAY_LAN_ONLY=false: the relay answers every client, LAN or not; a client off the LAN receives the private relay IP and times out on it",
+      hint: "leave RELAY_LAN_ONLY unset (it defaults to on); set it to false only when this deployment fronts the LAN, e.g. a cloud worker where every client looks remote",
     }));
   }
 }

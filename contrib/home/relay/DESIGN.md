@@ -56,6 +56,8 @@ RELAY_EXCLUDE_DOMAINS=ssh.github.com   # 排除优先于命中（两池共用）
 # 强制池（第二档名单，与主池分开）：只有 off | always 两档
 RELAY_FORCED_MODE=off
 RELAY_FORCED_DOMAINS=*.google.com,*.googleapis.com,*.gstatic.com
+# 来源闸门：中转只对内网来源生效；默认开，只有 false/0/no/off 才关
+RELAY_LAN_ONLY=true
 ```
 
 **强制池为什么没有 auto**：auto 的判定回路是"relay 每 180s 直连实测池 IP 握手 → 滑窗 + 滞回"，
@@ -64,10 +66,29 @@ RELAY_FORCED_DOMAINS=*.google.com,*.googleapis.com,*.gstatic.com
 就不是握手探测能测出的。所以第二池不测量：`always` 时名单即钉死（仍受 daemon 健康上报约束，
 停止上报 ≤60s 内整体回退直连，不变量不变）。两池共享 `RELAY_IP`、排除名单、daemon 与健康状态。
 
+#### 2.1.1 来源闸门（`RELAY_LAN_ONLY`，split-horizon）
+
+中转答出的是**私网地址**，所以“中转档位/名单”适用之前还有一层来源门：
+
+- 来源 IP 属于 RFC1918、RFC3927（169.254/16）、IPv6 ULA（fc00::/7）或回环（127/8、::1，
+  含 `::ffff:a.b.c.d` 写法）→ 是内网客户端，走上面的两池逻辑；
+- 其余（公网地址、无法解析的值、取不到地址）→ **完全不参与中转**：不 pin `RELAY_IP`，
+  `forcedMode`/`forcedDomains` 不参与，答案与“relay 关闭”逐字节一致（优选池/上游）。
+- `RELAY_LAN_ONLY` 默认 `true`，缺失/空/写错都按 `true`（fail-safe）；只有显式
+  `false`/`0`/`no`/`off` 才关。判定失败同样按“不在内网”。
+- 判定输入是连接层地址：Caddy 用 `header_up X-Real-IP {remote_host}` 以 TCP 对端覆盖该头，
+  Node 端在缺失时再回退 `socket.remoteAddress`；客户端自带的 `X-Real-IP`/`X-Forwarded-For`
+  一律被覆盖（详见 §9 风险）。
+- 缓存也分流：relay 的 cacheTag 只在内网请求上出现，内网 pin 不会污染外网客户端的缓存键。
+
+背景（2026-10-08）：控制台把 `forcedMode=always` + 22 条 Google 族域名全量钉到
+`192.168.3.250`，人不在家时所有客户端拿到内网 IP、全部超时。修复是给两池加同一道来源闸门，
+而不是给强制池特例。
+
 ### 2.2 src/config.ts
 
 - `AppConfig` 增加：`relayMode: "off" | "auto" | "always"`、`relayIp?: string`、
-  `relayDomains: string[]`、`relayExcludeDomains: string[]`。
+  `relayDomains: string[]`、`relayExcludeDomains: string[]`、`relayLanOnly: boolean`。
 - 解析仿现有风格（config.ts:147 一带）：
   `relayDomains: list(env.RELAY_DOMAINS).map(lower)`，`relayMode` 默认 `"off"`。
 - 校验：`relayMode !== "off"` 且 `relayIp` 非法/缺失 → 启动打一条 `relay_config_warning` 日志并
@@ -318,6 +339,9 @@ deploy 输出该片段 + 验证命令（`curl -x http://127.0.0.1:7890 -sI https
 
 - **vitest**（test/relay.test.ts，新）：
   - 匹配：通配命中/排除优先/裸域+子域/非名单不动；
+  - 来源闸门：私网/ULA/回环/映射地址判为内网，公网/非法/缺失判为外网；
+    `forcedMode=always` + `forcedDomains` 命中时外网来源仍不走 relay；
+    `RELAY_LAN_ONLY=false` 才恢复不分来源；/dns-query 端到端含缓存隔离（内网 pin 不泄漏给外网）；
   - 状态机：滞回进出阈值、healthy 撤除、无测量保持 direct、上报过期；
   - 策略：A pin + locked.addresses 短路 githubPool、HTTPS 三清（ech 删/hint 换/alpn 压）、
     cacheTag 在版本翻转后变化；
@@ -337,6 +361,7 @@ deploy 输出该片段 + 验证命令（`curl -x http://127.0.0.1:7890 -sI https
 | 开放中继被滥用 | 只绑第二私网 IP；config 校验拒绝公网 IP；nft 源限制；连接上限 |
 | 节点带宽被 GitHub 大 clone 吃掉 | always 档自觉选择；auto 档默认（直连好就不走）；文档写明代价 |
 | relay/mihomo 故障 | 设计不变量：撤覆写回直连，TTL 60s 收敛 |
+| 外网客户端被答内网 IP（2026-10-08 实录） | 来源闸门 `RELAY_LAN_ONLY`（默认开）：非私网来源完全不参与中转，答案同“没装中转”；客户端伪造 `X-Real-IP` 无效（Caddy 用 TCP 对端覆盖）；地址取不到按外网处理 |
 | SNI 解析缺陷误伤 | 无 SNI 即断不猜；peek 缓冲上限；M1 全量 git/curl 实测 |
 
 回滚（三层，任选）：`RELAY_MODE=off`（改 env + restart，最保守）→ `systemctl disable --now

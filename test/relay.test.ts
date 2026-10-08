@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { encodeDnsPacket, parseDnsPacket } from "../src/dns/packet";
 import { DnsType, type DnsPacket } from "../src/dns/types";
 import { describeHttpsParams } from "../src/dns/https-rr";
-import { readConfig } from "../src/config";
+import { readConfig, type AppConfig } from "../src/config";
 import { handleRequest } from "../src/index";
-import { relayCacheTag, relayServes, relayStatus, resetRelayState, sanitizeRelayOverride, setRelayHealth, setRelayOverride } from "../src/relay";
+import { isLanClientAddress, relayCacheTag, relayServes, relayStatus, resetRelayState, sanitizeRelayOverride, setRelayHealth, setRelayOverride } from "../src/relay";
 import { clearGithubPools, setGithubPools } from "../src/preferred";
 import { strategyCacheTags } from "../src/plan";
 import { PUBLIC_STRATEGIES } from "../src/strategies";
@@ -25,6 +25,18 @@ class MemoryCache {
 
 const RELAY_IP = "192.168.31.250";
 const GITHUB_REAL = "140.82.121.3";
+/** A LAN client address, the normal case behind the home Caddy (deploy/Caddyfile sets X-Real-IP). */
+const LAN = "192.168.31.10";
+/** An address off the LAN, as the DoH port sees any client coming in from the internet. */
+const WAN = "203.0.113.7";
+
+/**
+ * relayServes with the client stated: these tests are about the relay's own state machine and pools,
+ * so the client is on the LAN unless a test says otherwise. The LAN gate itself is covered below.
+ */
+function lanServes(name: string, cfg: AppConfig, clientLan = true): boolean {
+  return relayServes(name, cfg, clientLan);
+}
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -60,6 +72,37 @@ describe("RELAY_* configuration", () => {
     expect(readConfig(env({ RELAY_FORCED_MODE: "auto" })).relayForcedMode).toBe("off");
     expect(readConfig(env({})).relayForcedMode).toBe("off");
   });
+
+  it("LAN-only gate: on unless explicitly off, and a junk value still fails safe to on", () => {
+    const env = (extra: Record<string, string>) => ({ RELAY_IP: RELAY_IP, ...extra } as unknown as Env);
+    expect(readConfig(env({})).relayLanOnly).toBe(true);
+    expect(readConfig(env({ RELAY_LAN_ONLY: "true" })).relayLanOnly).toBe(true);
+    expect(readConfig(env({ RELAY_LAN_ONLY: "" })).relayLanOnly).toBe(true);
+    expect(readConfig(env({ RELAY_LAN_ONLY: "maybe" })).relayLanOnly).toBe(true);
+    expect(readConfig(env({ RELAY_LAN_ONLY: "false" })).relayLanOnly).toBe(false);
+    expect(readConfig(env({ RELAY_LAN_ONLY: "0" })).relayLanOnly).toBe(false);
+    expect(readConfig(env({ RELAY_LAN_ONLY: "OFF" })).relayLanOnly).toBe(false);
+  });
+});
+
+describe("LAN client classification", () => {
+  it("counts RFC1918, loopback, link-local and ULA addresses as on-LAN", () => {
+    for (const address of ["10.0.0.1", "10.255.255.254", "127.0.0.1", "172.16.0.1", "172.31.255.1", "192.168.3.10", "192.168.31.250", "169.254.1.1"]) {
+      expect(isLanClientAddress(address), address).toBe(true);
+    }
+    expect(isLanClientAddress("::1")).toBe(true);
+    expect(isLanClientAddress("[::1]")).toBe(true);
+    expect(isLanClientAddress("fd00::1")).toBe(true);
+    expect(isLanClientAddress("fcff::1")).toBe(true);
+    expect(isLanClientAddress("fe80::1")).toBe(true);
+    expect(isLanClientAddress("::ffff:192.168.3.10")).toBe(true);
+  });
+
+  it("counts public or unparsable addresses as off-LAN", () => {
+    for (const address of [undefined, "", "   ", "8.8.8.8", "203.0.113.7", "172.32.0.1", "172.15.0.1", "169.253.1.1", "not-an-ip", "192.168.3", "::2", "2001:4860:4860::8888", "64:ff9b::1"]) {
+      expect(isLanClientAddress(address as string | undefined), String(address)).toBe(false);
+    }
+  });
 });
 
 describe("relayServes", () => {
@@ -67,33 +110,57 @@ describe("relayServes", () => {
 
   it("matches wildcards over bare and subdomains; exclusions win; everything else untouched", () => {
     healthyRelay();
-    expect(relayServes("github.com", cfg)).toBe(true);
-    expect(relayServes("api.github.com", cfg)).toBe(true);
-    expect(relayServes("ssh.github.com", cfg)).toBe(false);
-    expect(relayServes("evilgithub.com", cfg)).toBe(false);
-    expect(relayServes("githubusercontent.com", cfg)).toBe(false);
-    expect(relayServes("example.com", cfg)).toBe(false);
+    expect(lanServes("github.com", cfg)).toBe(true);
+    expect(lanServes("api.github.com", cfg)).toBe(true);
+    expect(lanServes("ssh.github.com", cfg)).toBe(false);
+    expect(lanServes("evilgithub.com", cfg)).toBe(false);
+    expect(lanServes("githubusercontent.com", cfg)).toBe(false);
+    expect(lanServes("example.com", cfg)).toBe(false);
   });
 
   it("never serves before a healthy report, and stops when reports expire", () => {
-    expect(relayServes("github.com", cfg)).toBe(false);
+    expect(lanServes("github.com", cfg)).toBe(false);
     healthyRelay();
-    expect(relayServes("github.com", cfg)).toBe(true);
+    expect(lanServes("github.com", cfg)).toBe(true);
     vi.useFakeTimers();
     vi.setSystemTime(Date.now() + 121_000);
-    expect(relayServes("github.com", cfg)).toBe(false);
+    expect(lanServes("github.com", cfg)).toBe(false);
   });
 
   it("a report saying unhealthy stops serving immediately", () => {
     healthyRelay();
     setRelayHealth({ source: "test", ttlSeconds: 120, healthy: false });
-    expect(relayServes("github.com", cfg)).toBe(false);
+    expect(lanServes("github.com", cfg)).toBe(false);
   });
 
   it("off mode or a missing address never serves", () => {
     healthyRelay();
-    expect(relayServes("github.com", config({ relayMode: "off", relayIp: RELAY_IP, relayDomains: ["*.github.com"] }))).toBe(false);
-    expect(relayServes("github.com", config({ relayMode: "always", relayDomains: ["*.github.com"] }))).toBe(false);
+    expect(lanServes("github.com", config({ relayMode: "off", relayIp: RELAY_IP, relayDomains: ["*.github.com"] }))).toBe(false);
+    expect(lanServes("github.com", config({ relayMode: "always", relayDomains: ["*.github.com"] }))).toBe(false);
+  });
+
+  it("serves LAN clients only: an off-LAN or unknown client never gets the relay address", () => {
+    healthyRelay();
+    expect(relayServes("github.com", cfg, true)).toBe(true);
+    expect(relayServes("github.com", cfg, false)).toBe(false);
+    // Unknown (the caller could not resolve an address) is not on the LAN either: fail closed.
+    expect(relayServes("github.com", cfg, undefined)).toBe(false);
+  });
+
+  it("the gate also closes the forced pool, which ignores measurement but not the client's side", () => {
+    healthyRelay();
+    const forcedCfg = config({ relayMode: "auto", relayIp: RELAY_IP, relayDomains: ["*.github.com"], relayForcedMode: "always", relayForcedDomains: ["*.google.com"] });
+    expect(relayServes("www.google.com", forcedCfg, true)).toBe(true);
+    expect(relayServes("www.google.com", forcedCfg, false)).toBe(false);
+    expect(relayServes("www.google.com", forcedCfg, undefined)).toBe(false);
+  });
+
+  it("RELAY_LAN_ONLY=false restores the ungated behavior for callers that front the LAN", () => {
+    healthyRelay();
+    const gateOff = config({ relayLanOnly: false, relayMode: "auto", relayIp: RELAY_IP, relayDomains: ["*.github.com"], relayForcedMode: "always", relayForcedDomains: ["*.google.com"] });
+    expect(relayServes("www.google.com", gateOff, false)).toBe(true);
+    expect(relayServes("www.google.com", gateOff, undefined)).toBe(true);
+    expect(relayServes("github.com", gateOff, false)).toBe(false); // still auto-gated: no samples
   });
 });
 
@@ -103,21 +170,21 @@ describe("forced pool (RELAY_FORCED_*)", () => {
   it("serves forced names with no measurement and the main pool still in auto", () => {
     healthyRelay();
     // The Google-family scenario exactly: auto has no samples for these hosts, forced answers anyway.
-    expect(relayServes("www.google.com", forcedCfg)).toBe(true);
-    expect(relayServes("google.com", forcedCfg)).toBe(true);
-    expect(relayServes("youtu.be", forcedCfg)).toBe(false);
+    expect(lanServes("www.google.com", forcedCfg)).toBe(true);
+    expect(lanServes("google.com", forcedCfg)).toBe(true);
+    expect(lanServes("youtu.be", forcedCfg)).toBe(false);
     // Main pool stays measurement-gated: an unmeasured github host is not served.
-    expect(relayServes("github.com", forcedCfg)).toBe(false);
+    expect(lanServes("github.com", forcedCfg)).toBe(false);
   });
 
   it("forced off, exclusions, liveness and a missing address all withdraw the forced answers", () => {
     healthyRelay();
-    expect(relayServes("www.google.com", config({ ...forcedCfg, relayForcedMode: "off" }))).toBe(false);
-    expect(relayServes("www.google.com", config({ ...forcedCfg, relayExcludeDomains: ["www.google.com"] }))).toBe(false);
+    expect(lanServes("www.google.com", config({ ...forcedCfg, relayForcedMode: "off" }))).toBe(false);
+    expect(lanServes("www.google.com", config({ ...forcedCfg, relayExcludeDomains: ["www.google.com"] }))).toBe(false);
     setRelayHealth({ source: "test", ttlSeconds: 120, healthy: false });
-    expect(relayServes("www.google.com", forcedCfg)).toBe(false);
+    expect(lanServes("www.google.com", forcedCfg)).toBe(false);
     healthyRelay();
-    expect(relayServes("www.google.com", config({ ...forcedCfg, relayIp: undefined }))).toBe(false);
+    expect(lanServes("www.google.com", config({ ...forcedCfg, relayIp: undefined }))).toBe(false);
   });
 
   it("forced names ride the same answers as the main pool (pin, TTL, HTTPS scrub, cache tag)", async () => {
@@ -157,7 +224,7 @@ describe("forced pool (RELAY_FORCED_*)", () => {
         method: "POST",
         headers: { Accept: "application/dns-message", "Content-Type": "application/dns-message" },
         body: Uint8Array.from(body).buffer,
-      }), env, { waitUntil: () => undefined }, { clientIp: () => undefined, probe: () => ({}) });
+      }), env, { waitUntil: () => undefined }, { clientIp: () => LAN, probe: () => ({}) });
       return parseDnsPacket(new Uint8Array(await res.arrayBuffer()));
     };
     const a = await ask("www.google.com", DnsType.A);
@@ -173,7 +240,7 @@ describe("forced pool (RELAY_FORCED_*)", () => {
 });
 
 describe("relay answers over /dns-query", () => {
-  function stubUpstream(cache = new MemoryCache()): Env {
+  function stubUpstream(cache = new MemoryCache(), extra: Record<string, string> = {}): Env {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.includes("ips-v4")) return new Response("104.16.0.0/13\n");
@@ -205,17 +272,18 @@ describe("relay answers over /dns-query", () => {
       RELAY_DOMAINS: "*.github.com",
       RELAY_EXCLUDE_DOMAINS: "ssh.github.com",
       ADMIN_TOKEN: "t",
+      ...extra,
     } as unknown as Env;
   }
 
-  async function ask(name: string, type: number, cache = new MemoryCache()): Promise<DnsPacket> {
-    const env = stubUpstream(cache);
+  async function ask(name: string, type: number, cache = new MemoryCache(), clientIp: string | undefined = LAN, extra: Record<string, string> = {}): Promise<DnsPacket> {
+    const env = stubUpstream(cache, extra);
     const body = encodeDnsPacket({ header: { id: 0x1234, flags: 0x0100, qdcount: 1, ancount: 0, nscount: 0, arcount: 0 }, questions: [{ name, type, class: 1 }], answers: [], authorities: [], additionals: [] });
     const res = await handleRequest(new Request("https://doh.example/dns-query", {
       method: "POST",
       headers: { Accept: "application/dns-message", "Content-Type": "application/dns-message" },
       body: Uint8Array.from(body).buffer,
-    }), env, { waitUntil: () => undefined }, { clientIp: () => undefined, probe: () => ({}) });
+    }), env, { waitUntil: () => undefined }, { clientIp: () => clientIp, probe: () => ({}) });
     return parseDnsPacket(new Uint8Array(await res.arrayBuffer()));
   }
 
@@ -246,6 +314,38 @@ describe("relay answers over /dns-query", () => {
     expect(ssh.answers[0]!.ttl).toBe(3600);
   });
 
+  it("an off-LAN client keeps the ordinary answer — forced pool, pin and TTL included", async () => {
+    healthyRelay();
+    // Exactly the 2026-10-08 report: forcedMode=always + *.google.com pinned 192.168.3.250, which a
+    // client outside the LAN can only time out on. The client's side now decides, not the domain list.
+    const forced = { RELAY_MODE: "auto", RELAY_FORCED_MODE: "always", RELAY_FORCED_DOMAINS: "*.google.com" };
+    const lan = await ask("www.google.com", DnsType.A, new MemoryCache(), LAN, forced);
+    expect(lan.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: RELAY_IP }]);
+    const wan = await ask("www.google.com", DnsType.A, new MemoryCache(), WAN, forced);
+    expect(wan.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: GITHUB_REAL }]);
+    expect(wan.answers[0]!.ttl).toBe(3600);
+    // The main pool is closed the same way.
+    const wanGithub = await ask("github.com", DnsType.A, new MemoryCache(), WAN);
+    expect(wanGithub.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: GITHUB_REAL }]);
+    // An address the server cannot parse is not on the LAN either (the fully unknown case — the
+    // runtime returning no address at all — is covered by the relayServes test above).
+    const unknown = await ask("github.com", DnsType.A, new MemoryCache(), "not-an-ip");
+    expect(unknown.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: GITHUB_REAL }]);
+    // Cache isolation: the LAN client's pinned answer must not leak to the off-LAN client.
+    const shared = new MemoryCache();
+    const sharedLan = await ask("github.com", DnsType.A, shared, LAN);
+    expect(sharedLan.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: RELAY_IP }]);
+    const sharedWan = await ask("github.com", DnsType.A, shared, WAN);
+    expect(sharedWan.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: GITHUB_REAL }]);
+  });
+
+  it("RELAY_LAN_ONLY=false serves the forced pool to any client (the escape hatch)", async () => {
+    healthyRelay();
+    const env = { RELAY_LAN_ONLY: "false", RELAY_MODE: "auto", RELAY_FORCED_MODE: "always", RELAY_FORCED_DOMAINS: "*.google.com" };
+    const wan = await ask("www.google.com", DnsType.A, new MemoryCache(), WAN, env);
+    expect(wan.answers.filter((r) => r.type === DnsType.A).map((r) => r.rdata)).toEqual([{ kind: "a", address: RELAY_IP }]);
+  });
+
   it("takes precedence over the github pool while healthy, and falls back when not", async () => {
     setGithubPools("prober", { "github.com": [GITHUB_REAL] }, 600);
     healthyRelay();
@@ -259,11 +359,13 @@ describe("relay answers over /dns-query", () => {
   it("with the mode off the relay adds no cache variant; healthy always-mode answers carry one", () => {
     healthyRelay();
     const options = parseRequestOptions(new URL("https://doh.example/dns-query"), config());
-    const offCtx = { config: config({ githubDomains: ["github.com"] }), options, name: "github.com", type: DnsType.A };
+    const offCtx = { config: config({ githubDomains: ["github.com"] }), options, lan: true, name: "github.com", type: DnsType.A };
     expect(strategyCacheTags(PUBLIC_STRATEGIES, offCtx)).toBe("");
-    const onCtx = { config: config({ relayMode: "always" as const, relayIp: RELAY_IP, relayDomains: ["*.github.com"], githubDomains: ["github.com"] }), options, name: "github.com", type: DnsType.A };
+    const onCtx = { config: config({ relayMode: "always" as const, relayIp: RELAY_IP, relayDomains: ["*.github.com"], githubDomains: ["github.com"] }), options, lan: true, name: "github.com", type: DnsType.A };
     expect(strategyCacheTags(PUBLIC_STRATEGIES, onCtx)).toMatch(/^\|relay=v\d+$/);
     expect(strategyCacheTags(PUBLIC_STRATEGIES, { ...onCtx, name: "example.com" })).toBe("");
+    // An off-LAN client keys the ordinary answer, not the relay's pinned one (the pin is a LAN IP).
+    expect(strategyCacheTags(PUBLIC_STRATEGIES, { ...onCtx, lan: false })).toBe("");
   });
 });
 
@@ -279,21 +381,21 @@ describe("auto-mode hysteresis", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-10-05T12:00:00Z"));
     reportAt(0, {});
-    expect(relayServes("github.com", autoCfg)).toBe(false);
+    expect(lanServes("github.com", autoCfg)).toBe(false);
     // 60% success is not bad enough to hand over.
     reportAt(1, { "github.com": { ok: true, rttMs: 120 } });
     reportAt(2, { "github.com": { ok: true, rttMs: 120 } });
     reportAt(3, { "github.com": { ok: false } });
     reportAt(4, { "github.com": { ok: false } });
-    expect(relayServes("github.com", autoCfg)).toBe(false);
+    expect(lanServes("github.com", autoCfg)).toBe(false);
     // Now everything fails within the 15-minute enter window: 4/4 bad.
     reportAt(5, { "github.com": { ok: false } });
     reportAt(6, { "github.com": { ok: false } });
-    expect(relayServes("github.com", autoCfg)).toBe(true);
-    expect(relayServes("api.github.com", autoCfg)).toBe(false); // unmeasured host stays on the direct path
+    expect(lanServes("github.com", autoCfg)).toBe(true);
+    expect(lanServes("api.github.com", autoCfg)).toBe(false); // unmeasured host stays on the direct path
     // Recovery: good samples until the 30-minute exit window is >80% good.
     for (let i = 0; i < 12; i++) reportAt(3, { "github.com": { ok: true, rttMs: 90 } });
-    expect(relayServes("github.com", autoCfg)).toBe(false);
+    expect(lanServes("github.com", autoCfg)).toBe(false);
   });
 
   it("bumps the cache tag on every decision change", () => {
@@ -313,9 +415,9 @@ describe("auto-mode hysteresis", () => {
     vi.setSystemTime(new Date("2026-10-05T12:00:00Z"));
     reportAt(0, {});
     for (let i = 0; i < 4; i++) reportAt(1, { "github.com": { ok: false }, "api.github.com": { ok: false } });
-    expect(relayServes("github.com", autoCfg)).toBe(true);
+    expect(lanServes("github.com", autoCfg)).toBe(true);
     reportAt(1, {}, false);
-    expect(relayServes("github.com", autoCfg)).toBe(false);
+    expect(lanServes("github.com", autoCfg)).toBe(false);
     expect(relayStatus(autoCfg).hosts.every((host) => !host.relayed)).toBe(true);
   });
 
@@ -336,16 +438,16 @@ describe("runtime relay override (console control plane)", () => {
 
   it("turns the relay on over an env value of off, and reset returns to the env", () => {
     healthyRelay();
-    expect(relayServes("github.com", envOff)).toBe(false);
+    expect(lanServes("github.com", envOff)).toBe(false);
     const before = relayCacheTag();
     expect(setRelayOverride({ mode: "always" }, envOff)).toBe(true);
     expect(relayCacheTag()).not.toBe(before);
-    expect(relayServes("github.com", envOff)).toBe(true);
+    expect(lanServes("github.com", envOff)).toBe(true);
     const status = relayStatus(envOff);
     expect(status).toMatchObject({ mode: "always", modeSource: "override", overridden: ["mode"], domains: ["*.github.com"] });
     expect(setRelayOverride({ mode: "always" }, envOff)).toBe(false); // same value: no bump
     expect(setRelayOverride(null, envOff)).toBe(true);
-    expect(relayServes("github.com", envOff)).toBe(false);
+    expect(lanServes("github.com", envOff)).toBe(false);
     expect(relayStatus(envOff)).toMatchObject({ mode: "off", modeSource: "env", overridden: [] });
   });
 
@@ -353,27 +455,27 @@ describe("runtime relay override (console control plane)", () => {
     const base = config({ relayMode: "always", relayIp: RELAY_IP, relayDomains: ["*.github.com"] });
     healthyRelay();
     setRelayOverride({ domains: ["*.example.com"], excludeDomains: ["bad.example.com"] }, base);
-    expect(relayServes("www.example.com", base)).toBe(true);
-    expect(relayServes("bad.example.com", base)).toBe(false);
-    expect(relayServes("github.com", base)).toBe(false);
+    expect(lanServes("www.example.com", base)).toBe(true);
+    expect(lanServes("bad.example.com", base)).toBe(false);
+    expect(lanServes("github.com", base)).toBe(false);
     setRelayOverride(null, base);
-    expect(relayServes("www.example.com", base)).toBe(false);
-    expect(relayServes("github.com", base)).toBe(true);
+    expect(lanServes("www.example.com", base)).toBe(false);
+    expect(lanServes("github.com", base)).toBe(true);
   });
 
   it("forced overrides: mode and domains, version bump, reset back to the env", () => {
     const base = config({ relayMode: "off", relayIp: RELAY_IP, relayDomains: ["*.github.com"], relayForcedMode: "off", relayForcedDomains: [] });
     healthyRelay();
-    expect(relayServes("www.google.com", base)).toBe(false);
+    expect(lanServes("www.google.com", base)).toBe(false);
     const before = relayCacheTag();
     expect(setRelayOverride({ forcedMode: "always", forcedDomains: ["*.google.com"] }, base)).toBe(true);
     expect(relayCacheTag()).not.toBe(before);
-    expect(relayServes("www.google.com", base)).toBe(true);
+    expect(lanServes("www.google.com", base)).toBe(true);
     const status = relayStatus(base);
     expect(status).toMatchObject({ forcedMode: "always", forcedModeSource: "override", overridden: expect.arrayContaining(["forcedMode", "forcedDomains"]), forcedDomains: ["*.google.com"] });
     expect(setRelayOverride({ forcedMode: "always", forcedDomains: ["*.google.com"] }, base)).toBe(false); // same values: no bump
     expect(setRelayOverride(null, base)).toBe(true);
-    expect(relayServes("www.google.com", base)).toBe(false);
+    expect(lanServes("www.google.com", base)).toBe(false);
     expect(relayStatus(base)).toMatchObject({ forcedMode: "off", forcedModeSource: "env", overridden: [] });
   });
 
@@ -384,10 +486,10 @@ describe("runtime relay override (console control plane)", () => {
     const patch = sanitizeRelayOverride({ forcedMode: "auto", forcedDomains: ["*.google.com", "not a domain!"] });
     expect(patch).toEqual({ forcedDomains: ["*.google.com"] });
     setRelayOverride(patch, base);
-    expect(relayServes("www.google.com", base)).toBe(false); // forcedMode "auto" was dropped → env off
+    expect(lanServes("www.google.com", base)).toBe(false); // forcedMode "auto" was dropped → env off
     const patch2 = sanitizeRelayOverride({ forcedMode: "always", forcedDomains: ["*.google.com"] });
     setRelayOverride(patch2, base);
-    expect(relayServes("www.google.com", base)).toBe(true);
+    expect(lanServes("www.google.com", base)).toBe(true);
   });
 });
 
@@ -429,22 +531,22 @@ describe("relay admin endpoints", () => {
 
     healthyRelay();
     const cfg = () => readConfig(env);
-    expect(relayServes("github.com", cfg())).toBe(true); // env: always + *.github.com
+    expect(lanServes("github.com", cfg())).toBe(true); // env: always + *.github.com
     const applied = await post({ mode: "off", domains: ["*.example.com"] });
     expect(applied.status).toBe(200);
     expect(((await applied.json()) as { relay: { mode: string; domains: string[]; modeSource: string } }).relay)
       .toMatchObject({ mode: "off", domains: ["*.example.com"], modeSource: "override" });
-    expect(relayServes("github.com", cfg())).toBe(false); // override mode off wins over env always
-    expect(relayServes("www.example.com", cfg())).toBe(false);
+    expect(lanServes("github.com", cfg())).toBe(false); // override mode off wins over env always
+    expect(lanServes("www.example.com", cfg())).toBe(false);
 
     await post({ mode: "always" });
-    expect(relayServes("www.example.com", cfg())).toBe(true);
-    expect(relayServes("github.com", cfg())).toBe(false);
+    expect(lanServes("www.example.com", cfg())).toBe(true);
+    expect(lanServes("github.com", cfg())).toBe(false);
 
     const reset = await post({ reset: true });
     expect(((await reset.json()) as { relay: { mode: string; modeSource: string; domains: string[] } }).relay)
       .toMatchObject({ mode: "always", modeSource: "env", domains: ["*.github.com"] });
-    expect(relayServes("github.com", cfg())).toBe(true);
+    expect(lanServes("github.com", cfg())).toBe(true);
   });
 
   it("POST /admin/relay-health answers with the effective domain lists for the daemon to sync", async () => {
@@ -481,11 +583,11 @@ describe("relay admin endpoints", () => {
     // Valid: forced on, and a forced name is served over an env of forced off.
     healthyRelay();
     const cfg = () => readConfig(env);
-    expect(relayServes("www.google.com", cfg())).toBe(false);
+    expect(lanServes("www.google.com", cfg())).toBe(false);
     const applied = await post({ forcedMode: "always", forcedDomains: ["*.google.com"] });
     expect(applied.status).toBe(200);
     expect(((await applied.json()) as { relay: { forcedMode: string; forcedModeSource: string } }).relay).toMatchObject({ forcedMode: "always", forcedModeSource: "override" });
-    expect(relayServes("www.google.com", cfg())).toBe(true);
+    expect(lanServes("www.google.com", cfg())).toBe(true);
     // The daemon side channel carries the forced list alongside the main lists.
     const health = (await (await call("/admin/relay-health", { method: "POST", headers: { Authorization: "Bearer t", "Content-Type": "application/json" }, body: JSON.stringify({ source: "relay@192.168.31.250", ttl: 120, healthy: true }) })).json()) as { relay: { forcedDomains: string[]; forcedMode: string } };
     expect(health.relay).toMatchObject({ forcedMode: "always", forcedDomains: ["*.google.com"] });

@@ -14,7 +14,7 @@ import { parseRequestOptions, type RequestOptions } from "./request-options";
 import { clearMetaEch, githubPoolFor, githubPoolStatus, githubReports, ispPoolStatus, learnedPoolStatus, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolFor, sitePoolStatus, siteReports } from "./preferred";
 import { loadCloudflareRanges, validatedEchConfig } from "./rewrite";
 import { describePlan, makePlan, sortStrategies, strategyCacheTags, type RoutePlan } from "./plan";
-import { parseRelayDomainPattern, relayOverrideSnapshot, relayStatus, setRelayHealth, setRelayOverride } from "./relay";
+import { isLanClientAddress, parseRelayDomainPattern, relayOverrideSnapshot, relayStatus, setRelayHealth, setRelayOverride } from "./relay";
 import { renderPlan } from "./render";
 import { PUBLIC_STRATEGIES } from "./strategies";
 import { queryUpstreams, upstreamLabel } from "./upstream";
@@ -141,6 +141,12 @@ interface DnsSetup {
   options: RequestOptions;
   cache: Cache;
   ip?: string;
+  /**
+   * Whether the client address is on the LAN (relay gate, see relay.ts): resolved once here so every
+   * later decision — cache variant included — sees the same answer. False for a missing or
+   * unparsable address, which is the safe side.
+   */
+  lan: boolean;
   /** The address ECS is built from: the client's, ECS_FALLBACK_SUBNET for a client outside every operator, or none (non-routable client). */
   ecsIp?: string;
   scope?: string;
@@ -190,7 +196,7 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
     cfPreferredIpv6: preferred.ipv6,
   };
   const rules = await loadRules(config, cache);
-  return { config, options, cache, ip, ecsIp, scope: preferred.scope, rules };
+  return { config, options, cache, ip, lan: isLanClientAddress(ip), ecsIp, scope: preferred.scope, rules };
 }
 
 /** ECS decision and cache key for one query. */
@@ -212,7 +218,7 @@ function planQuery(query: DnsPacket, setup: DnsSetup): { upstreamQuery: DnsPacke
   const useEcs = !useCn && ecs ? shouldUseEcs(query, config, override) : false;
   const upstreamQuery = useEcs && ecs ? addEcs(query, ecs) : removeEcs(query);
   const question = query.questions[0]!;
-  const variant = options.cacheVariant + strategyCacheTags(STRATEGIES, { config, options, scope: setup.scope, name: question.name, type: question.type });
+  const variant = options.cacheVariant + strategyCacheTags(STRATEGIES, { config, options, scope: setup.scope, lan: setup.lan, name: question.name, type: question.type });
   const ecsIdentity = useEcs && ecs ? ecs.identity : undefined;
   return { upstreamQuery, useEcs, useCn, ecsIdentity, identity: normalizedCacheIdentity(query, useCn ? "cn" : ecsIdentity ?? "none", variant) };
 }
@@ -279,7 +285,7 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   const cached = await readCache(cache, identity, config);
 
   const resolveAndStore = async (): Promise<{ wire: Uint8Array; upstream: string; plan: RoutePlan }> => {
-    const resolved = await resolveFresh(query, upstreamQuery, useEcs, useCn, rules, options, config, cache);
+    const resolved = await resolveFresh(query, upstreamQuery, useEcs, useCn, rules, options, config, cache, setup.lan);
     ctx.waitUntil(writeCache(cache, identity, resolved.wire, config).catch((error: unknown) => {
       if (config.debug) console.warn(JSON.stringify({ event: "cache_write_error", message: errorMessage(error) }));
     }));
@@ -361,6 +367,7 @@ function domesticView(answer: DnsPacket): boolean {
   options: RequestOptions,
   config: AppConfig,
   cache: Cache,
+  lan: boolean,
   notes?: string[],
 ): Promise<{ wire: Uint8Array; upstream: string; plan: RoutePlan }> {
   const upstreamWire = encodeDnsPacket(upstreamQuery);
@@ -382,7 +389,7 @@ function domesticView(answer: DnsPacket): boolean {
   }
   const ruled = applyResponseRules(rules, query, originalResponse);
   if (ruled !== originalResponse) notes?.push("response rules changed the answer");
-  const { plan, ctx } = await makePlan(STRATEGIES, { config, options, query, rules, cache, notes });
+  const { plan, ctx } = await makePlan(STRATEGIES, { config, options, query, rules, cache, lan, notes });
   const transformed = renderPlan(plan, ctx, config, originalResponse, ruled);
   const responseWire = transformed === originalResponse ? result.packet : encodeDnsPacket(transformed);
   return { wire: patchTransactionId(responseWire, query.header.id), upstream: result.upstream, plan };
@@ -426,7 +433,7 @@ async function handleExplain(request: Request, env: Env, runtime: RequestRuntime
     let routePlan: Record<string, unknown> | undefined;
     let error: string | undefined;
     try {
-      const resolved = await resolveFresh(query, plan.upstreamQuery, plan.useEcs, plan.useCn, setup.rules, setup.options, setup.config, setup.cache, notes);
+      const resolved = await resolveFresh(query, plan.upstreamQuery, plan.useEcs, plan.useCn, setup.rules, setup.options, setup.config, setup.cache, setup.lan, notes);
       fresh = parseDnsPacket(resolved.wire);
       routePlan = describePlan(resolved.plan);
     } catch (caught) {
@@ -454,6 +461,10 @@ async function handleExplain(request: Request, env: Env, runtime: RequestRuntime
   return json({
     name,
     clientIp: setup.ip ?? null,
+    // Why the relay did or did not apply for this client: `lan` is the gate's input, `relayLanOnly`
+    // says whether the gate is armed. Both are informational; nothing else changes with them.
+    lan: setup.lan,
+    relayLanOnly: setup.config.relayLanOnly,
     pool: { ipv4: setup.config.cfPreferredIpv4, ipv6: setup.config.cfPreferredIpv6, scope: setup.scope ?? "default" },
     results: results.map(({ packet: _packet, ...rest }) => rest),
     chromium: a && aaaa && https ? chromiumEchVerdict(a, aaaa, https) : null,

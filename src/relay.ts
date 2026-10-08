@@ -1,5 +1,6 @@
 import type { AppConfig, RelayForcedMode, RelayMode } from "./config";
 import { domainMatches } from "./dns/ecs";
+import { parseIpv4, parseIpv6 } from "./dns/packet";
 
 /**
  * State behind the "relay" strategy: whether the local SNI relay (contrib/home/relay) is alive and,
@@ -23,6 +24,13 @@ import { domainMatches } from "./dns/ecs";
  * /admin/relay-config): mode and the domain lists of both pools can be changed without a restart,
  * the change bumps the version (so cached answers re-key at once) and is persisted by the Node
  * server.
+ *
+ * The LAN gate (RELAY_LAN_ONLY, default on) is the outermost condition of every relay decision:
+ * the pinned answer is a private address, so a client that is not on the LAN can only time out on
+ * it. Both pools — forced included — are therefore served to LAN clients only; a client off the LAN
+ * gets the ordinary answer (preferred pool, upstream), byte for byte what it would get with the
+ * relay off. A client address that cannot be parsed counts as off-LAN, so an unknown source never
+ * receives a LAN address.
  */
 
 /** Answer TTL for relay-pinned names: how fast a withdrawn relay stops being served. */
@@ -68,6 +76,49 @@ export interface EffectiveRelayConfig {
   forcedDomains: string[];
   /** Fields the console override owns; empty = the env values are in effect. */
   overridden: string[];
+}
+
+/**
+ * Whether the address of the client behind the request is on the LAN: RFC1918 and RFC3927 IPv4,
+ * their IPv4-mapped IPv6 spelling, IPv6 loopback, ULA (fc00::/7) and link-local (fe80::/10).
+ * Anything else — a public address, a malformed value, or no address at all — is not on the LAN,
+ * which is the safe answer: a client we cannot place must not be handed the relay's private IP.
+ * The value comes from the connection (Caddy rewrites X-Real-IP from {remote_host}, see
+ * deploy/Caddyfile), never from a header the client itself can set.
+ */
+export function isLanClientAddress(address: string | undefined): boolean {
+  const value = (address ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+  if (!value) return false;
+  // Proxies spell an IPv4 client behind an IPv6 listener as ::ffff:a.b.c.d; parseIpv6 rejects the
+  // dotted form, so unwrap it first. (The all-hex spelling ::ffff:c0a8:0105 is not unwrapped.)
+  const mapped = value.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  const candidate = mapped ? mapped[1]! : value;
+  if (!candidate.includes(":")) {
+    let bytes: Uint8Array;
+    try {
+      bytes = parseIpv4(candidate);
+    } catch {
+      return false;
+    }
+    const [a, b] = [bytes[0]!, bytes[1]!];
+    return (
+      a === 10 ||
+      a === 127 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 169 && b === 254)
+    );
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = parseIpv6(candidate);
+  } catch {
+    return false;
+  }
+  if (bytes.every((byte, index) => (index === 15 ? byte === 1 : byte === 0))) return true; // ::1
+  if ((bytes[0]! & 0xfe) === 0xfc) return true; // fc00::/7 (ULA)
+  if (bytes[0] === 0xfe && (bytes[1]! & 0xc0) === 0x80) return true; // fe80::/10
+  return false;
 }
 
 export function effectiveRelayConfig(config: AppConfig): EffectiveRelayConfig {
@@ -271,10 +322,18 @@ export function setRelayHealth(report: RelayHealthReport): void {
   if (changed) state.version += 1;
 }
 
-/** Whether the answer for `name` should point at the relay right now (either pool: mode, health, auto gating). */
-export function relayServes(name: string, config: AppConfig): boolean {
+/**
+ * Whether the answer for `name` should point at the relay right now (either pool: LAN gate, mode,
+ * health, auto gating). `clientLan` is the caller's finding about the client address and is
+ * deliberately required: when the LAN gate is on (the default) only `true` passes, and an undefined
+ * finding — the caller could not place the client — must not receive a LAN address either. Direct
+ * callers that simply have no client (tests, internal tooling) state `true` themselves rather than
+ * getting it by omission, so a forgotten argument fails closed instead of open.
+ */
+export function relayServes(name: string, config: AppConfig, clientLan: boolean | undefined): boolean {
   const effective = effectiveRelayConfig(config);
   if (!effective.ip || !relayAlive()) return false;
+  if (config.relayLanOnly && clientLan !== true) return false; // unknown client = off-LAN = no relay
   if (domainMatches(name, effective.excludeDomains)) return false;
   // The forced pool answers unconditionally (within liveness): its hosts have no measured pool, so
   // auto could never judge them — see the interface comment on AppConfig.relayForcedDomains.

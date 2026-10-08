@@ -131,6 +131,10 @@ sudo systemctl start edge-smart-doh
 
 域名集合独立于档位：`RELAY_DOMAINS` + `RELAY_FORCED_DOMAINS`（支持 `*.github.com` 通配）+ `RELAY_EXCLUDE_DOMAINS`（两池共用，排除优先，默认排掉无 SNI 的 `ssh.github.com`）。HTTPS RR 会同步清洗（hint 指向中转 IP、删 ECH、ALPN 压 h2），AAAA 答空，TTL 压到 60。
 
+**来源闸门（`RELAY_LAN_ONLY`，默认开）**：中转答出的是私网地址，**只对内网来源的客户端生效**。来源 IP 属于 RFC1918 / RFC3927（169.254）/ ULA（fc00::/7）/ 回环 才走上面的两池逻辑；否则该请求**完全按"没装中转"处理**——不 pin、`forcedMode`/`forcedDomains` 一律不参与，客户端拿正常答案（优选池/上游）。这正是 2026-10-08 那次外网打不开的修因：强制池把 `192.168.3.250` 答给了所有客户端，人不在家就只能超时。判定用连接层的地址（Caddy `header_up X-Real-IP {remote_host}`，客户端自带的同名头会被覆盖），解析不出来的地址按"不在内网"处理（fail-safe）。值缺失/写错都按开处理；只有 `false`/`0`/`no`/`off` 才关。**只有"每个客户端看起来都在远端"的部署（如把 LAN 挡在后面的云 worker）才该关掉它。**
+
+来源两侧的答案在缓存里也是分开的：内网请求的缓存键带 relay 变体，外网请求的键不带，所以内网的 pin 不会被外网客户端命中。
+
 启用：`deploy-home.sh` 配置区设 `RELAY_ENABLED=1` 重跑。脚本会问第二 IP，装 `edge-smart-doh-relay-ip.service`（`Type=oneshot` + `RemainAfterExit`，每次开机幂等补齐地址，重试覆盖 DHCP 迟到；relay 单元用 drop-in `Wants=/After=` 它），再装 `edge-smart-doh-relay.service`、生成最小权限的 `/etc/edge-smart-doh/relay.env`、种好 `RELAY_MODE=auto`。启 relay 前还会自动处理两个部署坑：
 
 - **443 冲突**：relay 只绑 `RELAY_IP:443`，若本机已有通配 `*:443`（如 Caddy 未写 `bind`）就会 EADDRINUSE。脚本检测到通配占用者是本机 Caddy 时，给 Caddyfile 里绑 443 的站点加 `bind <主 IP>`、`caddy validate` 通过后 reload，并轮询到旧通配释放、主 IP:443 在听才启 relay（≤20s）；超时或占用者不是 Caddy → 还原 Caddyfile 并中止，不盲启。

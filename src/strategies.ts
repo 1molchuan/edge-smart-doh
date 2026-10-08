@@ -122,13 +122,18 @@ export const githubPool: Strategy = {
  * the relay stops reporting healthy, so the worst case is the un-relayed answer of yesterday. Sits
  * between the site-pool and GitHub-pool strategies: it takes the addresses decision for good
  * (github-pool then leaves the name alone).
+ *
+ * One gate wraps both pools, inside relayServes: the relay is for LAN clients only (RELAY_LAN_ONLY).
+ * Its answer is a private address, so a client off the LAN must keep the ordinary answer instead of
+ * pinning to something it cannot reach. `ctx.lan` carries the client's LAN-ness into both the cache
+ * variant and the decision, so a remote client never reads the LAN client's pinned answer from cache.
  */
 export const relay: Strategy = {
   name: "relay",
   order: 45,
-  cacheTag: (ctx: RequestContext) => (relayServes(ctx.name, ctx.config) ? relayCacheTag() : undefined),
+  cacheTag: (ctx: RequestContext) => (relayServes(ctx.name, ctx.config, ctx.lan) ? relayCacheTag() : undefined),
   async apply(ctx: PlanContext, plan) {
-    if (!relayServes(ctx.name, ctx.config)) return;
+    if (!relayServes(ctx.name, ctx.config, ctx.lan)) return;
     const { ip, mode, forcedMode } = effectiveRelayConfig(ctx.config);
     const via = forcedMode === "always" ? "forced" : mode;
     if (ctx.type === DnsType.A || ctx.type === DnsType.AAAA) {
