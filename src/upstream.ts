@@ -2,6 +2,7 @@ import { parseDnsPacket } from "./dns/packet";
 import { DnsType, type DnsPacket } from "./dns/types";
 import type { AppConfig } from "./config";
 import { parseUpstreamEntry, type UpstreamPath } from "./upstream-entry";
+import { recordUpstream, type UpstreamRole } from "./metrics";
 
 export interface UpstreamResult {
   packet: Uint8Array;
@@ -95,7 +96,7 @@ export interface UpstreamOptions {
 }
 
 /** Hostname for diagnostics; a malformed URL must not turn a failure path into a throw. */
-function upstreamLabel(upstream: string): string {
+export function upstreamLabel(upstream: string): string {
   try {
     return new URL(upstream).hostname;
   } catch {
@@ -147,6 +148,7 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
   const upstreams = cn ? config.cnUpstreams : options.ecs ? config.ecsUpstreams : config.upstreams;
   const hedgeMs = !cn && options.ecs ? config.ecsUpstreamHedgeMs : config.upstreamHedgeMs;
   if (upstreams.length === 0) return Promise.reject(new Error("No upstreams configured"));
+  const role: UpstreamRole = cn ? "cn" : options.ecs ? "ecs" : "default";
 
   return new Promise<UpstreamResult>((resolve, reject) => {
     const errors: string[] = [];
@@ -202,6 +204,7 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
       const { path, paths } = picked;
       const upstream = path.url;
       const label = path === paths[0] ? upstreamLabel(upstream) : `${upstreamLabel(paths[0]!.url)} via ${upstreamLabel(upstream)}`;
+      const attemptStart = Date.now();
       const controller = new AbortController();
       controllers.push(controller);
       pending += 1;
@@ -220,6 +223,10 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
         .then(({ packet, parsed }) => {
           if (settled) return;
           recordOutcome(path, true);
+          // Only attempts whose answer is still live count for metrics: one aborted because another
+          // upstream answered first never reaches here (finish() sets settled before aborting), and
+          // an unacceptable-but-valid answer did resolve, so it counts as the resolver's success.
+          recordUpstream({ label: upstreamLabel(upstream), role, latencyMs: Date.now() - attemptStart, ok: true });
           const result = { packet, upstream, label };
           if (!options.acceptable || options.acceptable(parsed, index)) return finish(result);
           errors.push(`${label}: answer not acceptable`);
@@ -234,6 +241,7 @@ export function queryUpstreams(query: Uint8Array, config: AppConfig, options: Up
           // (finish() sets settled before aborting), so every entry below is a real failure.
           const reason: unknown = controller.signal.reason;
           const detail = typeof reason === "string" && reason.length > 0 ? reason : error instanceof Error ? error.message : String(error);
+          recordUpstream({ label: upstreamLabel(upstream), role, latencyMs: Date.now() - attemptStart, ok: false, error: detail });
           errors.push(`${label}: ${detail}`);
           settle();
         });

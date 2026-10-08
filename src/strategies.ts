@@ -3,8 +3,9 @@ import { DnsType } from "./dns/types";
 import { alpnFor, h3CacheTag } from "./h3";
 import type { PlanContext, RequestContext, Strategy } from "./plan";
 import { githubPoolFor, metaEchCacheTag, metaEchOverride, sitePoolCacheTag, sitePoolFor } from "./preferred";
+import { effectiveRelayConfig, RELAY_PIN_TTL, relayCacheTag, relayServes } from "./relay";
 import type { RequestOptions } from "./request-options";
-import { resolveEchConfig, validatedEchConfig } from "./rewrite";
+import { relayHttpsCleanup, resolveEchConfig, validatedEchConfig } from "./rewrite";
 
 /** A site pool (see sitePoolFor) stands in for the server's default pool only; an explicit ?ip4= or ?cf= choice wins. */
 export function sitePool(name: string, options: RequestOptions): string[] {
@@ -111,6 +112,45 @@ export const githubPool: Strategy = {
   },
 };
 
+/**
+ * The home SNI relay (contrib/home/relay, see its DESIGN.md): the name is answered with the LAN
+ * address of a local relay that forwards the TCP flow through the egress proxy by SNI, TLS staying
+ * end to end. Two pools share this one strategy: the main list (RELAY_DOMAINS, the GitHub family)
+ * serves under "always" or, in "auto", only hosts whose measured direct path went bad (relay.ts),
+ * while the forced list (RELAY_FORCED_DOMAINS, the Google family) answers unconditionally in
+ * "always" — its hosts have no measured pool for auto to judge them by. Both step aside the moment
+ * the relay stops reporting healthy, so the worst case is the un-relayed answer of yesterday. Sits
+ * between the site-pool and GitHub-pool strategies: it takes the addresses decision for good
+ * (github-pool then leaves the name alone).
+ *
+ * One gate wraps both pools, inside relayServes: the relay is for LAN clients only. Its answer is a
+ * private address, so a client off the LAN must keep the ordinary answer instead of pinning to
+ * something it cannot reach — a design constraint (the client has to be able to route to the relay),
+ * not a switch. `ctx.lan` carries the client's LAN-ness into both the cache variant and the
+ * decision, so a remote client never reads the LAN client's pinned answer from cache.
+ */
+export const relay: Strategy = {
+  name: "relay",
+  order: 45,
+  cacheTag: (ctx: RequestContext) => (relayServes(ctx.name, ctx.config, ctx.lan) ? relayCacheTag() : undefined),
+  async apply(ctx: PlanContext, plan) {
+    if (!relayServes(ctx.name, ctx.config, ctx.lan)) return;
+    const { ip, mode, forcedMode } = effectiveRelayConfig(ctx.config);
+    const via = forcedMode === "always" ? "forced" : mode;
+    if (ctx.type === DnsType.A || ctx.type === DnsType.AAAA) {
+      plan.pin = [ip!];
+      plan.pinTtl = RELAY_PIN_TTL;
+      plan.locked.addresses = true;
+      plan.strategy = "relay";
+      ctx.notes?.push(`relay: answer pinned to ${ip}, IPv6 dropped (pool ${via})`);
+    } else if (ctx.type === DnsType.HTTPS) {
+      plan.locked.ech = true;
+      plan.strategy = "relay";
+      plan.post.push({ apply: (packet) => relayHttpsCleanup(packet, [ip!]), note: `relay: HTTPS hints → ${ip}, ECH removed, ALPN → h2` });
+    }
+  },
+};
+
 /** Meta's own ECH key (learned by a prober, or the configured seed). */
 export const metaEch: Strategy = {
   name: "meta-ech",
@@ -162,4 +202,4 @@ export const cloudflareEch: Strategy = {
   },
 };
 
-export const PUBLIC_STRATEGIES: Strategy[] = [untouched, preferredIp, xMultiCdn, sitePools, githubPool, metaEch, cloudflareEch];
+export const PUBLIC_STRATEGIES: Strategy[] = [untouched, preferredIp, xMultiCdn, sitePools, relay, githubPool, metaEch, cloudflareEch];

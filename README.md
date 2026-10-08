@@ -129,6 +129,8 @@ cfhub 是一个众包测速站：志愿者在自己的线路上运行探针 `cfp
 | `/admin/h3` | POST `{source, ttl, verdicts: {主机: true\|false}}`，需 `ADMIN_TOKEN` |
 | `/admin/health` | Meta ECH 的状态上报，需 `ADMIN_TOKEN` |
 | `/admin/selfcheck` | 自检结果上报，需 `ADMIN_TOKEN` |
+| `/admin/stats` | GET：运行指标（查询计数、缓存命中、回源延迟分位数、各上游成败、策略分布、回源路径分类、Top 域名、最近查询、池状态），需 `ADMIN_TOKEN`。家庭部署的局域网控制台（`contrib/home/monitor`）以它为数据源 |
+| `/admin/relay`、`/admin/relay-config` | GET 中转状态（两池档位/健康/每主机判定/名单/configVersion）；POST `{mode?, domains?, excludeDomains?, forcedMode?, forcedDomains?, expectedVersion?, reset?}` 运行时覆盖（持久化，需 `ADMIN_TOKEN`）。家庭部署的控制台以此控制中转 |
 
 没有设置 `ADMIN_TOKEN` 时，所有 `/admin/*` 都返回 404。令牌用常数时间比较。
 
@@ -205,6 +207,7 @@ Caddy 配置见 `deploy/Caddyfile`：直连时用 TCP 对端地址覆盖 `X-Real
 | `CN_UPSTREAMS` | 空 | 域名分流模块：国内域名（`ECS_DOMAINS` + `CN_DOMAINS` + 名单）改走这些**直连的国内解析器**（如 `https://dns.alidns.com/dns-query,https://doh.pub/dns-query`），不带 ECS——国内解析器看到的查询源 IP 就是客户端运营商，比 ECS 更准；其余域名照旧走 `UPSTREAMS`。空 = 关闭，国内域名走 ECS 路径。国内判定优先于 `ECS_MODE` 与 per-domain 的 ECS 规则；关闭只能清空 `CN_UPSTREAMS`。给服务配了出境代理时，这些解析器的主机名必须在 `NO_PROXY` 里（否则被代理接管，`server/node.ts` 会告警） |
 | `CN_DOMAINS` | 空 | 在 `ECS_DOMAINS` 和名单之外自加的国内域名后缀（带前导点才是后缀语义，如 `.mycompany.example`；不带点只匹配该域名本身） |
 | `RESOLVER_VIEW_DOMAINS` | 空 | 按"来问的解析器在哪"分配服务器、不看 ECS 的国内网站，如 `.cnki.net`：只采用 `ECS_UPSTREAMS` 第一项的应答，必要时超出它的限速。第一项必须是从境内发起递归的解析器：在香港实测，DNSPod 从境内出口查，阿里 DNS 从香港出口查，知网会把后者当成境外，给国际版（登录和国内版不通）。不在名单里的国内域名有一道通用检查：应答里的地址都不在国内运营商网段（需 `ISP_TABLE_URL`）时，先等其他 ECS 上游的应答，没有更好的再用它 |
+>>>>>>> origin/main
 | `CF_REWRITE_ENABLED` | false | 有池子时会自动开启，一般不用设 |
 | `CF_PREFERRED_DOMAIN` | 空 | 优选域名，解析出的地址合并为第 5 层池子 |
 | `CF_PREFERRED_IPV4` / `CF_PREFERRED_IPV6` | 空 | 静态优选地址 |

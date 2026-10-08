@@ -47,7 +47,7 @@ ECS 真正生效还差两个键，脚本会自动补齐（旧版 env 拷贝缺�
 2. 国内模式：给服务加代理。Node 自带的 `fetch` 不认 `HTTP_PROXY`，脚本装 `undici@6` 并用 `--import` 预加载 `EnvHttpProxyAgent`。**固定 6.x**：undici 8 需要 Node ≥ 22.19，在 Node 20 上一启动就崩；脚本在重启服务前会先试加载一次，不兼容就停下报错，不会让服务陷入重启循环。
 3. 国内模式：补齐国内域名配置——写入域名名单 `ECS_DOMAIN_LIST_URLS`（缺失/为空时）、国内直连上游 `CN_UPSTREAMS`（阿里/腾讯 DoH，主机名同步进代理 drop-in 的 `NO_PROXY`），探测家宽公网 IPv4 写入 `ECS_FALLBACK_SUBNET`（ECS 回退路径用，见上文）。
 4. 每 5 分钟从 cfhub 的公开接口（`/api/v1/pools`）同步各运营商的优选池到本机 DoH。
-5. （`OPEN_PUBLIC=1`）用 acme.sh 走 DNS 验证签证书，Caddy 在 8443 端口提供 HTTPS DoH，可选 DDNS（只维护这一个域名的 A 记录）。
+5. （`OPEN_PUBLIC=1`）证书与对外服务：**先探测机器统一证书**——`/etc/ssl/<dir>/` 下成对 fullchain+privkey 且 SAN 覆盖 DoH 域名的（如 `/etc/ssl/wildcard` 的通配符，多份命中取剩余有效期最长的），就只引用不签发（续期/权限/reload 归机器统一环节，如 root cron 的 `acme.sh --cron` + `--reloadcmd`），Caddy 也只动自己的站点块（已指向就跳过、旧 `/etc/ssl/doh` 的 tls 行就原位切换、没有站点才写 `edge-smart-doh.caddy` site 文件 + import），绝不负责整写别的站点。没有统一证书才走 acme.sh DNS-01 自签到 `/etc/ssl/doh`（root cron 自动续期），可选 DDNS（只维护这一个域名的 A 记录）。
 6. （`SETUP_FIREWALL=1`，默认关）用 nftables 收紧入站。**会整体替换 `/etc/nftables.conf`，入站默认丢弃**，只放行 SSH、mosh、DoH；NAS 或还跑着别的服务的机器上会把它们挡掉，确认后再开。替换前会备份原文件。
 
 脚本做不了、需要你自己做的：路由器把外网 8443/TCP 转发到这台机器；用手机流量从外网验证一次。
@@ -80,10 +80,78 @@ sudo mv /var/lib/edge-smart-doh/cache.bin /var/lib/edge-smart-doh/cache.bin.poll
 sudo systemctl start edge-smart-doh
 ```
 
+## 局域网控制台（:8788，监测 + 控制）
+
+`deploy-home.sh` 会顺带装控制台（也可单独装/升级：`sudo bash contrib/home/install-monitor.sh`）。控制台是**两个页面**：
+
+- **监控页 `http://<内网IP>:8788/`**：公开只读，**不需要密码**——健康判定、查询统计、路径分布、图表、诊断，谁在局域网里都能看；
+- **控制页 `http://<内网IP>:8788/console`**：**需要密码**——SNI 中转双池控制（档位、名单）、操作记录（审计）。
+
+图表由 **ECharts**（Apache-2.0）渲染，库文件在 `contrib/home/monitor/vendor/` 里随安装复制到本机、由控制台自己提供——**不依赖公网 CDN**；vendor 缺失时图表面板提示加载失败，表格不受影响。界面有**明暗两套主题**（默认跟随系统偏好，命令栏按钮手动切换并记忆在浏览器里）。
+
+**访问控制**：`install-monitor.sh` 首次运行生成 `CONSOLE_PASSWORD`（`openssl rand -hex 10`）写进 `/etc/edge-smart-doh/monitor.env`（0600 root）并只打印一次；密码只把守**控制页**（会话 cookie 仅存控制台进程内存，2 小时无活跃或 24 小时过期，进程重启全部失效；同 IP 连错 5 次冷却 60 秒）。没设密码时监控页照常、控制页显示启用指引——向后兼容。轮换密码见 `OPERATIONS.md` §8。
+
+页面按"打开的人想问什么"排序（v2 视觉：bento 磁贴布局 + 置顶命令栏，观察区蓝色数据语言、控制区琥珀甲板语言）：
+
+1. **命令栏（置顶）**：品牌与页面导航（监控 / 控制）、状态胶囊（绿/黄/红随健康判定）、主题切换、会话徽标、实时时钟；
+2. **首屏 bento（监控页）**：状态大磁贴（绿"运行正常" / 黄"统计不可用、失败率偏高、中转离线" / 红"服务不可达、解析异常"，异常原因直接写在磁贴里，辉光随状态着色，内嵌近 1 小时查询活动迷你柱条）+ 总查询 / 缓存命中率（带甜甜圈环）/ 回源 P50 三个 KPI + 解析链路磁贴（国内直连 / GitHub 池 / 境外代理，当前延迟 + 火花线，中转接管标注"中转"）；
+3. **解析路径分布**：单条分段占比条 + 图例（SNI 中转 / ECH 注入 / 优选池 / 国内直连 / 直连 + 缓存应答，次数·占比·平均延迟；"最近查询"表也带路径徽章）；
+4. **图表**：查询量（近 2 小时每分钟堆叠柱状）与链路延迟趋势（每 10 秒真实 DoH 探测）并排，回源延迟分位 / 解析策略（技术视图）/ 上游解析器三列；
+5. **控制甲板**（控制页，登录后可见；琥珀色语言，**每池一张卡片**）：「主池」卡（GitHub 族 · off/auto/always 三档选择器 + 中转名单编辑）、「强制池」卡（Google 族等无实测池域名 · 仅 off/always + 强制名单编辑，常开时显示带宽代价警示）、「共用设置」卡（两池共用的排除名单 + 保存/恢复 env 默认 + 同步状态行 `configVersion` vs relay 回执 + diff 预览与二次确认）；编辑器均有行内校验；
+6. **诊断区（默认折叠）**：高频域名、最近查询、优选池与规则状态（池子剩余 TTL 少于 30 分钟会标黄）。
+
+控制操作的通道：浏览器 → 控制台 `/api/relay-config`（会话鉴权）→ 主服务 `POST /admin/relay-config`（Bearer ADMIN_TOKEN）→ 运行时覆盖 + 持久化到 `/var/lib/edge-smart-doh/relay-config.json`（重启保留）→ 缓存版本立即换键生效 → relay 守护进程 ≤30 秒从健康上报响应热同步名单。**运维 Agent / 脚本走同一套 HTTP 接口**（登录→读→改→验证→回滚的 curl 全流程、语义表、故障预案见 `contrib/home/OPERATIONS.md`）。设计文档：`contrib/home/monitor/PRD-console.md`。
+
+- **服务状态**：DoH 可达性、探测延迟、运行时长、内存；
+- **查询统计**：总量、每分钟曲线（近 2 小时）、缓存命中率、回源延迟分位数（P50/P90/P99）、失败数、回源路径分布；
+- **上游解析器**：默认/ECS/国内直连三组各自的成败、平均与峰值延迟、最近一次错误；
+- **解析策略**：回源时 direct / preferred-ip / github-pool 等的分布（技术视图）；
+- **主动探测**：对几个域名（默认淘宝/GitHub/Google，`MONITOR_PROBE_NAMES` 可改）定期发真实 DoH 查询，看国内直连、GitHub 池、代理出境三条链路是否各自正常（链路名称默认按域名特征推导，`MONITOR_PROBE_LABELS` 可整体覆盖）；
+- **Top 域名 / 最近查询**、**优选池与名单状态**（cfhub 运营商池、GitHub 池、国内域名名单、?safe=1 名单、Meta ECH）。
+
+数据来自主服务的 `GET /admin/stats`（`ADMIN_TOKEN` 鉴权）和控制台自己的探测；统计存在内存里，主服务重启后从零开始。
+
+**只在局域网访问**是两层防线：控制台按 TCP 对端地址过滤（只放行回环与私网网段，可 `MONITOR_ALLOW` 覆盖，绝不信任 `X-Forwarded-For` 一类可伪造头）；`SETUP_FIREWALL=1` 时 nftables 只对内网网段放行 8788。`ADMIN_TOKEN` 与 `CONSOLE_PASSWORD` 只存在于控制台进程内存/本机 env，页面不带任何凭据（浏览器只见会话 cookie）。
+
+## SNI 中转（可选）
+
+直连 GitHub 的 SNI 级抖动（时好时坏）是数据面问题，DNS 答案再准也治不了。中转是给系统补的数据面杠杆：把网卡的**第二个内网 IP**（如 192.168.1.250）答给名单域名，本机 relay 进程在该 IP 的 443 上读 TLS ClientHello 的 SNI，把 TCP 流经代理（HTTP CONNECT）转给真实目标——**TLS 端到端，relay 绝不终结**，客户端看到的证书仍是真 GitHub 的。设计与完整方案见 `contrib/home/relay/DESIGN.md`。
+
+中转分两个池，共享 `RELAY_IP`、排除名单、relay 守护与健康状态：
+
+**主池（GitHub 族）**，三档 `RELAY_MODE`（env 为默认值，控制台可运行时切换）：
+
+| 档 | 语义 |
+|---|---|
+| `off` | 关闭（默认，代码路径不激活） |
+| `auto` | 按主机健康门控：relay 每 3 分钟直连实测池 IP 握手，某主机 15 分钟内成功率 <50% 切中转，30 分钟内 >80% 切回直连 |
+| `always` | 名单内域名无条件走中转 |
+
+**强制池（Google 族这类没有实测池的域名）**，只有两档 `RELAY_FORCED_MODE`：`off`（默认）/ `always`（`RELAY_FORCED_DOMAINS` 内无条件走中转）。它没有 auto——auto 的判定样本只能来自实测池（GitHub/site 池），Google 族域名永远无样本、永远不切；而且这类域名"握手能通但质量差"，本来就测不出。`always` 仍受健康上报约束：relay 守护停止上报 ≤60 秒整体回退直连。
+
+域名集合独立于档位：`RELAY_DOMAINS` + `RELAY_FORCED_DOMAINS`（支持 `*.github.com` 通配）+ `RELAY_EXCLUDE_DOMAINS`（两池共用，排除优先，默认排掉无 SNI 的 `ssh.github.com`）。HTTPS RR 会同步清洗（hint 指向中转 IP、删 ECH、ALPN 压 h2），AAAA 答空，TTL 压到 60。
+
+**来源闸门（无条件，设计约束，不是配置项）**：中转答出的是私网地址，而外网客户端根本路由不到这个内网地址，所以 relay **只对内网来源的客户端生效**——这是设计前提，没有开关。来源 IP 属于 RFC1918 / RFC3927（169.254）/ ULA（fc00::/7）/ 回环 才走上面的两池逻辑；否则该请求**完全按"没装中转"处理**——不 pin、`forcedMode`/`forcedDomains` 一律不参与，客户端拿正常答案（优选池/上游）。这正是 2026-10-08 那次外网打不开的修因：强制池把 `192.168.3.250` 答给了所有客户端，人不在家就只能超时。判定用连接层的地址（Caddy `header_up X-Real-IP {remote_host}`，客户端自带的同名头会被覆盖），解析不出来的地址按"不在内网"处理（fail-safe）。
+
+来源两侧的答案在缓存里也是分开的：内网请求的缓存键带 relay 变体，外网请求的键不带，所以内网的 pin 不会被外网客户端命中。
+
+启用：`deploy-home.sh` 配置区设 `RELAY_ENABLED=1` 重跑。脚本会问第二 IP，装 `edge-smart-doh-relay-ip.service`（`Type=oneshot` + `RemainAfterExit`，每次开机幂等补齐地址，重试覆盖 DHCP 迟到；relay 单元用 drop-in `Wants=/After=` 它），再装 `edge-smart-doh-relay.service`、生成最小权限的 `/etc/edge-smart-doh/relay.env`、种好 `RELAY_MODE=auto`。启 relay 前还会自动处理两个部署坑：
+
+- **443 冲突**：relay 只绑 `RELAY_IP:443`，若本机已有通配 `*:443`（如 Caddy 未写 `bind`）就会 EADDRINUSE。脚本检测到通配占用者是本机 Caddy 时，给 Caddyfile 里绑 443 的站点加 `bind <主 IP>`、`caddy validate` 通过后 reload，并轮询到旧通配释放、主 IP:443 在听才启 relay（≤20s）；超时或占用者不是 Caddy → 还原 Caddyfile 并中止，不盲启。
+- **nftables 幂等**：`/etc/nftables.conf` 刻意不加 `flush ruleset`（怕清掉 Docker 的表），于是 `systemctl reload nftables` 会累积重复规则。脚本改规则时先查 `nft list ruleset`、写后断言内核里恰好 1 条，且用"删本表再整体载入"而不是 reload。
+
+两个前置认知：
+
+- **防回环靠"按实测池 IP 拨号"**：relay 拨号用 `/admin/pool` 给的池 IP，不经 DNS，从根上避免"解析到中转 IP→连到自己"。仅池空时按域名 CONNECT，此时依赖代理配置里的 `DOMAIN-SUFFIX,github.com,<代理组>` 一类规则远程解析——装完用 `curl -x <代理> -sI https://github.com` 验证一次。强制池域名（Google 族）没有实测池，**全部**依赖这条路径：加名单前先确认代理里已有对应 `DOMAIN-SUFFIX` 规则。
+- **降级不变量**：relay 挂了/代理挂了 → 健康上报停止 → DNS 在 TTL 内回退直连路径（两池一起），最坏情况 = 没装中转。`RELAY_IP` 只接受私网地址，服务端直接拒绝公网值。
+
+控制台会显示中转状态（两池档位、健康、每主机直连成功率与是否走中转），并且**两池的档位与三份名单都能在控制台上直接改**（运行时覆盖，立即生效、重启保留，relay 进程 ≤30 秒热同步名单，无需改 env 重启）；中转档开着但守护进程没上报时首页给黄牌。代价要想清楚：走中转的流量吃代理节点的带宽。回滚：控制台切回 `off`（或 `systemctl disable --now edge-smart-doh-relay`），60 秒内收敛。
+
 ## 回滚
 
-- 环境变量：脚本每次改 env 前会备份成 `/etc/edge-smart-doh/env.bak-<时间>`，拷回去再 `systemctl restart edge-smart-doh`。
-- 防火墙：`/etc/nftables.conf.pre-doh-<时间>` 是替换前的备份，拷回去后 `nft delete table inet home_firewall && nft -f /etc/nftables.conf`。
+- 环境变量：脚本每次改 env 前会备份到仓库外的 `/var/backups/edge-smart-doh/env.<时间>`（目录 0700，含 `ADMIN_TOKEN` 的副本 0600），拷回去再 `systemctl restart edge-smart-doh`。
+- 防火墙：替换前备份到 `/var/backups/edge-smart-doh/nftables.conf.<时间>`，拷回去后 `nft delete table inet home_firewall && nft -f /etc/nftables.conf`。
+- Caddy（若因 443 收窄失败，脚本会自行还原）：备份同样在 `/var/backups/edge-smart-doh/Caddyfile.<时间>`。
 
 ## 已知限制
 

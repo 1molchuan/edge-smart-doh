@@ -2,6 +2,9 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname } from "node:path";
 import { handleRequest, type RequestRuntime, type WaitUntilContext } from "../src/index";
+import { parseIpv4 } from "../src/dns/packet";
+import { readConfig } from "../src/config";
+import { sanitizeRelayOverride, setRelayOverride, setRelayPersistence } from "../src/relay";
 
 const DEFAULTS = {
   UPSTREAMS: "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://unfiltered.adguard-dns.com/dns-query",
@@ -45,6 +48,15 @@ const DEFAULTS = {
   META_DOMAINS: ".facebook.com,.facebook.net,.fbcdn.net,.fbsbx.com,.instagram.com,.cdninstagram.com,.threads.net,.whatsapp.com,.whatsapp.net,.messenger.com",
   X_DOMAINS: "x.com,.x.com,twitter.com,.twitter.com,twimg.com,.twimg.com,t.co",
   GITHUB_DOMAINS: "",
+  RELAY_MODE: "off",
+  RELAY_IP: "",
+  RELAY_DOMAINS: "",
+  RELAY_EXCLUDE_DOMAINS: "",
+  RELAY_FORCED_MODE: "off",
+  RELAY_FORCED_DOMAINS: "",
+  // Where the console's relay overrides (POST /admin/relay-config) persist across restarts; empty
+  // disables persistence (overrides then live in memory only, which workers also get).
+  RELAY_CONFIG_PATH: "",
   SAFE_LIST_URLS: "",
   SAFE_ALLOW: "",
   DYNAMIC_RULE_HOSTS: "paste.rs,raw.githubusercontent.com,gist.githubusercontent.com",
@@ -247,6 +259,42 @@ function warnOnMixedUpstreamTrust(): void {
 }
 
 /**
+ * RELAY_MODE / RELAY_FORCED_MODE without a usable private RELAY_IP degrades to off inside
+ * readConfig; naming that here keeps a typo from silently disabling the relay (the failure would
+ * look like "GitHub is flaky again", not like a configuration problem).
+ */
+function warnOnRelayConfig(): void {
+  const ip = (process.env.RELAY_IP ?? "").trim();
+  const modes = [
+    ["RELAY_MODE", (process.env.RELAY_MODE ?? "").toLowerCase()].filter(([, mode]) => mode === "auto" || mode === "always"),
+    ["RELAY_FORCED_MODE", (process.env.RELAY_FORCED_MODE ?? "").toLowerCase()].filter(([, mode]) => mode === "always"),
+  ].flat();
+  if (modes.length === 0) return;
+  if (!ip) {
+    for (const [name, mode] of modes) console.warn(JSON.stringify({ event: "relay_config_warning", message: `${name}=${mode} but RELAY_IP is empty: the relay path is disabled` }));
+    return;
+  }
+  const bytes = (() => {
+    try {
+      return parseIpv4(ip);
+    } catch {
+      return undefined;
+    }
+  })();
+  const [a, b] = bytes ? [bytes[0]!, bytes[1]!] : [undefined, undefined];
+  const priv = a === 10 || a === 127 || (a === 172 && b! >= 16 && b! <= 31) || (a === 192 && b === 168);
+  if (!priv) {
+    for (const [name, mode] of modes) console.warn(JSON.stringify({
+      event: "relay_config_warning",
+      message: `${name}=${mode} but RELAY_IP=${ip} is not a private address: the relay path is disabled`,
+      hint: "the relay must only ever point at an address a stranger cannot reach; use a second private IP on the LAN interface",
+    }));
+  }
+  // The LAN gate itself (relay.ts) is unconditional by design - an off-LAN client cannot reach the
+  // relay's private address - so there is no switch to warn about here.
+}
+
+/**
  * CN_UPSTREAMS are the opposite of the trust list: they are dialed directly, so a proxy env var
  * reaching them is exactly wrong — the query leaves through the proxy, the resolver sees the
  * proxy's exit instead of the client's operator, and a domestic resolver is suddenly the slow
@@ -350,6 +398,38 @@ async function sendResponse(response: Response, target: ServerResponse): Promise
   target.end(Buffer.from(await response.arrayBuffer()));
 }
 
+/**
+ * Relay overrides from the console (POST /admin/relay-config) persist next to the cache dump in a
+ * small JSON file, so a restart keeps what the operator last set. A missing or corrupt file simply
+ * means the env values apply; every write is atomic (tmp + rename) like the cache dump.
+ */
+const relayConfigPath = process.env.RELAY_CONFIG_PATH || "";
+
+function loadRelayOverrideFile(): void {
+  if (!relayConfigPath) return;
+  try {
+    const patch = sanitizeRelayOverride(JSON.parse(readFileSync(relayConfigPath, "utf8")));
+    if (patch) {
+      setRelayOverride(patch, readConfig(env));
+      console.log(JSON.stringify({ event: "relay_override_loaded", fields: Object.keys(patch) }));
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(JSON.stringify({ event: "relay_override_load_error", message: String(error) }));
+    }
+  }
+  setRelayPersistence((value) => {
+    try {
+      mkdirSync(dirname(relayConfigPath), { recursive: true });
+      const tmp = `${relayConfigPath}.tmp`;
+      writeFileSync(tmp, JSON.stringify(value ?? null), { mode: 0o600 });
+      renameSync(tmp, relayConfigPath);
+    } catch (error) {
+      console.warn(JSON.stringify({ event: "relay_override_save_error", message: String(error) }));
+    }
+  });
+}
+
 const server = createServer(async (incoming, outgoing) => {
   try {
     const url = requestUrl(incoming);
@@ -381,6 +461,8 @@ const port = numberFromEnvironment("PORT", 8787, 1, 65535);
 loadPersistedCache();
 warnOnMixedUpstreamTrust();
 warnOnCnUpstreamProxy();
+warnOnRelayConfig();
+loadRelayOverrideFile();
 server.listen(port, host, () => console.log(JSON.stringify({ event: "listening", host, port })));
 
 // Periodic snapshot bounds the loss on an unclean exit (OOM kill, power loss).

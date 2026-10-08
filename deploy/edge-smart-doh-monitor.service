@@ -1,0 +1,26 @@
+[Unit]
+Description=Edge Smart DoH LAN Console (monitor + control on :8788, private ranges only)
+After=network-online.target edge-smart-doh.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=edge-smart-doh
+Group=edge-smart-doh
+EnvironmentFile=/etc/edge-smart-doh/monitor.env
+ExecStart=/usr/bin/node /opt/edge-smart-doh/monitor.mjs
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=120M
+
+[Install]
+WantedBy=multi-user.target

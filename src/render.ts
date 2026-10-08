@@ -24,7 +24,7 @@ export function renderPlan(plan: RoutePlan, ctx: PlanContext, config: AppConfig,
     }
   }
   if (plan.xPool) packet = rewriteXAddresses(packet, query, config);
-  if (plan.pin) packet = pinAddresses(packet, query, plan.pin);
+  if (plan.pin) packet = pinAddresses(packet, query, plan.pin, plan.pinTtl);
 
   const beforeConfiguredEch = packet;
   packet = injectEch(packet, config);
