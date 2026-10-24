@@ -51,7 +51,7 @@ describe("preferred pool", () => {
     expect([...pool.ipv4].sort()).toEqual(["1.1.1.1", "2.2.2.2", "3.3.3.3"]);
   });
 
-  it("rotates A answers on every serve while keeping other records in place", () => {
+  it("rotates A answers per client: one client keeps a stable order, clients spread, unattributed serves still rotate", () => {
     const packet: DnsPacket = {
       header: { id: 1, flags: 0x8180, qdcount: 1, ancount: 4, nscount: 0, arcount: 0 },
       questions: [{ name: "www.example", type: DnsType.A, class: 1 }],
@@ -64,15 +64,35 @@ describe("preferred pool", () => {
       authorities: [], additionals: [],
     };
     const wire = encodeDnsPacket(packet);
-    const firsts = new Set<string>();
-    for (let i = 0; i < 3; i += 1) {
-      const served = parseDnsPacket(rotateAddressRecords(wire));
+    const firstOf = (client?: string) => {
+      const served = parseDnsPacket(rotateAddressRecords(wire, client));
       expect(served.answers[0]?.type).toBe(DnsType.CNAME);
       const addresses = served.answers.filter((r) => r.rdata.kind === "a").map((r) => (r.rdata as { address: string }).address);
       expect([...addresses].sort()).toEqual(["1.1.1.1", "2.2.2.2", "3.3.3.3"]);
-      firsts.add(addresses[0]!);
-    }
+      return addresses[0]!;
+    };
+    // The same client resolves the same name twice (cache hit path included): identical answer,
+    // same first address — its order moves only when the pool's membership changes.
+    expect(firstOf("58.247.1/24")).toBe(firstOf("58.247.1/24"));
+    // Different clients land on different rotation offsets (over many prefixes, all addresses appear).
+    const firsts = new Set<string>();
+    for (let i = 0; i < 24; i += 1) firsts.add(firstOf(`10.${i}.0/24`));
     expect(firsts.size).toBe(3);
+    // No client identity (internal callers, tests): the counter keeps rotating on every serve.
+    const counterFirsts = new Set<string>();
+    for (let i = 0; i < 3; i += 1) counterFirsts.add(firstOf());
+    expect(counterFirsts.size).toBe(3);
+  });
+
+  it("serves a refreshed pool in a canonical order, so a reshuffled report moves nobody's first address", async () => {
+    const cache = new MemoryCache() as unknown as Cache;
+    setLearnedPool(["5.5.5.5", "4.4.4.4", "6.6.6.6"], [], 3600, "cfhub", "isp:chinanet");
+    const first = (await preferredPool({}, [], true, config(), cache, undefined, "isp:chinanet")).ipv4;
+    expect(first).toEqual(["4.4.4.4", "5.5.5.5", "6.6.6.6"]);
+    // Same addresses, different order in the report: the served answer is byte-for-byte the same.
+    setLearnedPool(["6.6.6.6", "5.5.5.5", "4.4.4.4"], [], 3600, "cfhub", "isp:chinanet");
+    const again = (await preferredPool({}, [], true, config(), cache, undefined, "isp:chinanet")).ipv4;
+    expect(again).toEqual(first);
   });
 
   it("prefers a learned pool for default requests until it expires, never for explicit ?cf=", async () => {
@@ -114,7 +134,7 @@ describe("preferred pool", () => {
     expect((await pool("isp:chinanet")).ipv4[0]).toBe("7.7.7.1");
     // When the hub's pool lapses, the probers' pool serves again.
     vi.setSystemTime(1_000_000 + 1_801_000);
-    expect((await pool(undefined)).ipv4[0]).toBe("5.5.5.5");
+    expect([...(await pool(undefined)).ipv4].sort()).toEqual(["5.5.5.10", "5.5.5.5", "5.5.5.6", "5.5.5.7", "5.5.5.8", "5.5.5.9"]);
   });
 });
 

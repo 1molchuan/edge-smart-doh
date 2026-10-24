@@ -143,8 +143,8 @@ export function rewriteCloudflareAddresses(packet: DnsPacket, ranges: Cloudflare
   // A name's Cloudflare addresses are replaced by the whole pool, once, where the first of them
   // stood. Upstream answers carry two A records, and swapping them one for one served every client
   // the pool's first two IPs only (2026-09-28: linux.do and chatgpt.com got the same two); the whole
-  // pool, rotated at serve time (rotateAddressRecords), spreads clients over it and leaves each
-  // browser more addresses to fall back on.
+  // pool, rotated per client at serve time (rotateAddressRecords), spreads clients over it and leaves
+  // each browser more addresses to fall back on.
   const expanded = new Set<string>();
   for (const record of packet.answers) {
     if (record.rdata.kind === "a" && config.cfPreferredIpv4.length > 0 && inAnyCidr(record.rdata.address, ranges.ipv4)) {

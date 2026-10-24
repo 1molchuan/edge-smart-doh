@@ -8,6 +8,7 @@ import { DnsType, type DnsPacket } from "./dns/types";
 import { chromiumEchVerdict, describeAnswers, dnsTypeName, selfCheckStatus, setSelfCheck } from "./explain";
 import { h3Status, setH3Verdicts } from "./h3";
 import { isIspName, ispScopeOf, ispTableReady, loadIspTable, onOperatorNetwork } from "./isp";
+import { recordQuery, statsSnapshot } from "./metrics";
 import { applyResponseRules, ecsOverride, loadRules, shouldBlock, type RuleSet } from "./rules";
 import { parseRequestOptions, type RequestOptions } from "./request-options";
 import { clearMetaEch, githubPoolStatus, githubReports, ispPoolStatus, learnedPoolStatus, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolStatus, siteReports } from "./preferred";
@@ -15,7 +16,7 @@ import { loadCloudflareRanges, validatedEchConfig } from "./rewrite";
 import { describePlan, makePlan, sortStrategies, strategyCacheTags, type RoutePlan } from "./plan";
 import { renderPlan } from "./render";
 import { PUBLIC_STRATEGIES } from "./strategies";
-import { queryUpstreams } from "./upstream";
+import { queryUpstreams, upstreamLabel } from "./upstream";
 import { safeBlocked, safeBlockedResponse, safeStatus } from "./safe";
 import { chineseSiteStatus, isDomesticSite } from "./cn-domains";
 
@@ -23,10 +24,10 @@ const DNS_CONTENT_TYPE = "application/dns-message";
 const STRATEGIES = sortStrategies(PUBLIC_STRATEGIES);
 
 /** `query`, when given, is the client's wire query: its question spelling is restored in the answer. */
-function dnsResponse(packet: Uint8Array, query?: Uint8Array, status = 200): Response {
+function dnsResponse(packet: Uint8Array, query?: Uint8Array, status = 200, client?: string): Response {
   let body = packet;
   try {
-    body = rotateAddressRecords(packet);
+    body = rotateAddressRecords(body, client);
   } catch {
     // A packet we cannot re-encode (unknown RDATA with compression) is served as-is.
   }
@@ -141,6 +142,12 @@ interface DnsSetup {
   ip?: string;
   /** The address ECS is built from: the client's, ECS_FALLBACK_SUBNET for a client outside every operator, or none (non-routable client). */
   ecsIp?: string;
+  /**
+   * The client's network prefix (/24 IPv4, /48 IPv6): the stickiness key for address rotation
+   * (rotateAddressRecords). A client keeps one stable first address per pool even as its address
+   * inside the prefix changes (CGNAT reassignment); only a pool membership change moves it.
+   */
+  clientScope?: string;
   scope?: string;
   rules: RuleSet;
 }
@@ -162,6 +169,7 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
   // The operator matters for the server default pool and for the ECS fallback.
   const ispScope = options.cfDomainIsDefault === true || config.ecsFallbackSubnet ? await ispScopeOf(ip, config, cache) : undefined;
   const ecsIp = ecsSourceIp(ip, config.ecsFallbackSubnet, ispTableReady() && ispScope === undefined);
+  const clientScope = clientScopeKey(ip);
   try {
     preferred = await preferredPool(
       { ipv4: options.preferredIpv4, ipv6: options.preferredIpv6 },
@@ -169,7 +177,7 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
       options.cfDomainIsDefault === true,
       config,
       cache,
-      clientScopeKey(ip),
+      clientScope,
       options.cfDomainIsDefault === true ? ispScope : undefined,
     );
   } catch (error) {
@@ -188,7 +196,7 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
     cfPreferredIpv6: preferred.ipv6,
   };
   const rules = await loadRules(config, cache);
-  return { config, options, cache, ip, ecsIp, scope: preferred.scope, rules };
+  return { config, options, cache, ip, ecsIp, clientScope, scope: preferred.scope, rules };
 }
 
 /** ECS decision and cache key for one query. */
@@ -246,6 +254,9 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   const opts = query.additionals.filter((record) => record.type === DnsType.OPT);
   if (opts.length === 1 && ((opts[0]!.ttl >>> 16) & 0xff) !== 0) return dnsResponse(makeBadvers(query), wire);
   const client = readClientEcs(query);
+  // Set once prepareDns has resolved the client prefix; the early FORMERR/blocked replies below
+  // carry no address sets, so leaving it unset there is harmless.
+  let rotationSeed: string | undefined;
   // Every answer, cached or not, leaves with an OPT record made for this query (dns/edns.ts).
   const reply = (packet: Uint8Array): Response => {
     let body = packet;
@@ -254,22 +265,30 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
     } catch {
       // A packet we cannot re-encode is served as-is.
     }
-    return dnsResponse(body, wire);
+    return dnsResponse(body, wire, 200, rotationSeed);
   };
   if (opts.length > 1 || client === null) return reply(rcodeResponse(query, 1));
 
   const setup = await prepareDns(request, env, runtime);
   if (setup instanceof Response) return setup;
+  rotationSeed = setup.clientScope;
   const { config, options, cache, rules } = setup;
-  if (shouldBlock(rules, query)) return reply(rcodeResponse(query, 3));
+  const question = query.questions[0]!;
+  const sample = () => ({ name: question.name, type: dnsTypeName(question.type), latencyMs: Date.now() - started });
+  if (shouldBlock(rules, query)) {
+    recordQuery({ ...sample(), outcome: "blocked" });
+    return reply(rcodeResponse(query, 3));
+  }
   // Blocked before the cache: every other answer is the same with or without ?safe=1, so they share it.
-  if (options.safe && safeBlocked(query.questions[0]!.name, config)) return reply(encodeDnsPacket(safeBlockedResponse(query)));
+  if (options.safe && safeBlocked(question.name, config)) {
+    recordQuery({ ...sample(), outcome: "blocked" });
+    return reply(encodeDnsPacket(safeBlockedResponse(query)));
+  }
 
   const { upstreamQuery, useEcs, useCn, identity } = planQuery(query, setup);
-  const question = query.questions[0]!;
   const cached = await readCache(cache, identity, config);
 
-  const resolveAndStore = async (): Promise<{ wire: Uint8Array; upstream: string }> => {
+  const resolveAndStore = async (): Promise<{ wire: Uint8Array; upstream: string; plan: RoutePlan }> => {
     const resolved = await resolveFresh(query, upstreamQuery, useEcs, useCn, rules, options, config, cache);
     ctx.waitUntil(writeCache(cache, identity, resolved.wire, config).catch((error: unknown) => {
       if (config.debug) console.warn(JSON.stringify({ event: "cache_write_error", message: errorMessage(error) }));
@@ -284,24 +303,41 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
         if (config.debug) console.warn(JSON.stringify({ event: "prefetch_error", message: errorMessage(error) }));
       }));
     }
-    logQuery(config, query, cached.state === "fresh" ? "hit" : cached.state === "refresh" ? "prefetch" : "stale", undefined, Date.now() - started);
+    const outcome = cached.state === "fresh" ? "hit" : cached.state === "refresh" ? "prefetch" : "stale";
+    recordQuery({ ...sample(), outcome });
+    logQuery(config, query, outcome, undefined, Date.now() - started);
     return reply(cached.packet);
   }
 
   try {
-    const { wire: clientWire, upstream } = await resolveAndStore();
-    logQuery(config, query, "miss", upstream, Date.now() - started);
-    return reply(clientWire);
+    const resolved = await resolveAndStore();
+    recordQuery({ ...sample(), outcome: "miss", upstream: upstreamLabel(resolved.upstream), strategy: resolved.plan.strategy, path: pathCategory(resolved.plan, useCn) });
+    logQuery(config, query, "miss", resolved.upstream, Date.now() - started);
+    return reply(resolved.wire);
   } catch (error) {
     console.error(JSON.stringify({ event: "upstream_failure", message: errorMessage(error) }));
     if (cached) {
       // RFC 8767: an expired answer beats SERVFAIL when every upstream is unreachable.
+      recordQuery({ ...sample(), outcome: "stale", error: errorMessage(error) });
       logQuery(config, query, "stale", undefined, Date.now() - started);
       return reply(cached.packet);
     }
+    recordQuery({ ...sample(), outcome: "error", error: errorMessage(error), servfail: true });
     logQuery(config, query, "miss", undefined, Date.now() - started);
     return reply(makeServfail(wire));
   }
+}
+
+/**
+ * The path rollup for /admin/stats (see metrics.ts QueryPath). Judged on the rendered plan, so
+ * "preferred-ip" only counts when the rewrite actually changed the answer (render.ts renames the
+ * strategy then) and ECH counts even when a pool strategy had claimed the label first.
+ */
+function pathCategory(plan: RoutePlan, useCn: boolean): "ech" | "pool" | "cn" | "direct" {
+  if (plan.ech) return "ech";
+  if (useCn) return "cn";
+  if (plan.pin || plan.xPool || plan.strategy === "preferred-ip") return "pool";
+  return "direct";
 }
 
 /**
@@ -325,8 +361,7 @@ function domesticView(answer: DnsPacket): boolean {
 /**
  * Asks upstream, then lets the strategies decide how the name is reached (plan.ts) and applies that
  * plan to the answer (render.ts). `notes`, when given, collects one line per decision for /explain.
- */
-async function resolveFresh(
+ */async function resolveFresh(
   query: DnsPacket,
   upstreamQuery: DnsPacket,
   useEcs: boolean,
@@ -469,6 +504,7 @@ export async function handleRequest(request: Request, env: Env, ctx: WaitUntilCo
   if (url.pathname === "/admin/health") return handleAdminHealth(request, env);
   if (url.pathname === "/admin/selfcheck") return handleAdminSelfCheck(request, env);
   if (url.pathname === "/admin/h3") return handleAdminH3(request, env);
+  if (url.pathname === "/admin/stats") return handleAdminStats(request, env);
   if (url.pathname === "/explain") return handleExplain(request, env, runtime);
   if (url.pathname !== "/dns-query") return new Response("Not found", { status: 404 });
   return handleDns(request, env, ctx, runtime);
@@ -503,6 +539,23 @@ async function preferredAuth(request: Request, env: Env): Promise<"admin" | "hub
 
 function adminState(): Record<string, unknown> {
   return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, selfcheck: selfCheckStatus(), h3: h3Status() };
+}
+
+/**
+ * Live operational metrics for the LAN monitor (contrib/home/monitor): query counters, cache mix,
+ * upstream latency and the pool state. Same bearer token as the other admin endpoints; the recent
+ * list carries query names, so it must never be exposed without one.
+ */
+async function handleAdminStats(request: Request, env: Env): Promise<Response> {
+  const denied = await adminAuth(request, env);
+  if (denied) return denied;
+  if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET" } });
+  return json({
+    ok: true,
+    ...statsSnapshot(),
+    pools: adminState(),
+    ...(typeof process !== "undefined" && typeof process.memoryUsage === "function" ? { memory: { rssBytes: process.memoryUsage().rss } } : {}),
+  });
 }
 
 /**

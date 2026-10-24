@@ -47,7 +47,7 @@ ECS 真正生效还差两个键，脚本会自动补齐（旧版 env 拷贝缺�
 2. 国内模式：给服务加代理。Node 自带的 `fetch` 不认 `HTTP_PROXY`，脚本装 `undici@6` 并用 `--import` 预加载 `EnvHttpProxyAgent`。**固定 6.x**：undici 8 需要 Node ≥ 22.19，在 Node 20 上一启动就崩；脚本在重启服务前会先试加载一次，不兼容就停下报错，不会让服务陷入重启循环。
 3. 国内模式：补齐国内域名配置——写入域名名单 `ECS_DOMAIN_LIST_URLS`（缺失/为空时）、国内直连上游 `CN_UPSTREAMS`（阿里/腾讯 DoH，主机名同步进代理 drop-in 的 `NO_PROXY`），探测家宽公网 IPv4 写入 `ECS_FALLBACK_SUBNET`（ECS 回退路径用，见上文）。
 4. 每 5 分钟从 cfhub 的公开接口（`/api/v1/pools`）同步各运营商的优选池到本机 DoH。
-5. （`OPEN_PUBLIC=1`）用 acme.sh 走 DNS 验证签证书，Caddy 在 8443 端口提供 HTTPS DoH，可选 DDNS（只维护这一个域名的 A 记录）。
+5. （`OPEN_PUBLIC=1`）证书与对外服务：**先探测机器统一证书**——`/etc/ssl/<dir>/` 下成对 fullchain+privkey 且 SAN 覆盖 DoH 域名的（如 `/etc/ssl/wildcard` 的通配符，多份命中取剩余有效期最长的），就只引用不签发（续期/权限/reload 归机器统一环节，如 root cron 的 `acme.sh --cron` + `--reloadcmd`），Caddy 也只动自己的站点块（已指向就跳过、旧 `/etc/ssl/doh` 的 tls 行就原位切换、没有站点才写 `edge-smart-doh.caddy` site 文件 + import），绝不负责整写别的站点。没有统一证书才走 acme.sh DNS-01 自签到 `/etc/ssl/doh`（root cron 自动续期），可选 DDNS（只维护这一个域名的 A 记录）。
 6. （`SETUP_FIREWALL=1`，默认关）用 nftables 收紧入站。**会整体替换 `/etc/nftables.conf`，入站默认丢弃**，只放行 SSH、mosh、DoH；NAS 或还跑着别的服务的机器上会把它们挡掉，确认后再开。替换前会备份原文件。
 
 脚本做不了、需要你自己做的：路由器把外网 8443/TCP 转发到这台机器；用手机流量从外网验证一次。
@@ -80,10 +80,37 @@ sudo mv /var/lib/edge-smart-doh/cache.bin /var/lib/edge-smart-doh/cache.bin.poll
 sudo systemctl start edge-smart-doh
 ```
 
+## 局域网监控站（:8788）
+
+`deploy-home.sh` 会顺带装监控站（也可单独装/升级：`sudo bash contrib/home/install-monitor.sh`）。**监控页 `http://<内网IP>:8788/`** 是公开只读的，不需要密码——健康判定、查询统计、路径分布、图表、诊断，谁在局域网里都能看。（历史上的 SNI 中转控制页已随 relay 功能一起移除。）
+
+图表由 **ECharts**（Apache-2.0）渲染，库文件在 `contrib/home/monitor/vendor/` 里随安装复制到本机、由监控站自己提供——**不依赖公网 CDN**；vendor 缺失时图表面板提示加载失败，表格不受影响。界面有**明暗两套主题**（默认跟随系统偏好，命令栏按钮手动切换并记忆在浏览器里）。
+
+页面按"打开的人想问什么"排序（bento 磁贴布局 + 置顶命令栏）：
+
+1. **命令栏（置顶）**：品牌、状态胶囊（绿/黄/红随健康判定）、主题切换、实时时钟；
+2. **首屏 bento**：状态大磁贴（绿"运行正常" / 黄"统计不可用、失败率偏高" / 红"服务不可达、解析异常"，异常原因直接写在磁贴里，辉光随状态着色，内嵌近 1 小时查询活动迷你柱条）+ 总查询 / 缓存命中率（带甜甜圈环）/ 回源 P50 三个 KPI + 解析链路磁贴（国内直连 / GitHub 池 / 境外代理，当前延迟 + 火花线）；
+3. **解析路径分布**：单条分段占比条 + 图例（ECH 注入 / 优选池 / 国内直连 / 直连 + 缓存应答，次数·占比·平均延迟；"最近查询"表也带路径徽章）；
+4. **图表**：查询量（近 2 小时每分钟堆叠柱状）与链路延迟趋势（每 10 秒真实 DoH 探测）并排，回源延迟分位 / 解析策略（技术视图）/ 上游解析器三列；
+5. **诊断区（默认折叠）**：高频域名、最近查询、优选池与规则状态（池子剩余 TTL 少于 30 分钟会标黄）。
+
+监控站能看到：
+
+- **服务状态**：DoH 可达性、探测延迟、运行时长、内存；
+- **查询统计**：总量、每分钟曲线（近 2 小时）、缓存命中率、回源延迟分位数（P50/P90/P99）、失败数、回源路径分布；
+- **上游解析器**：默认/ECS/国内直连三组各自的成败、平均与峰值延迟、最近一次错误；
+- **解析策略**：回源时 direct / preferred-ip / github-pool 等的分布（技术视图）；
+- **主动探测**：对几个域名（默认淘宝/GitHub/Google，`MONITOR_PROBE_NAMES` 可改）定期发真实 DoH 查询，看国内直连、GitHub 池、代理出境三条链路是否各自正常（链路名称默认按域名特征推导，`MONITOR_PROBE_LABELS` 可整体覆盖）；
+- **Top 域名 / 最近查询**、**优选池与名单状态**（cfhub 运营商池、GitHub 池、国内域名名单、?safe=1 名单、Meta ECH）。
+
+数据来自主服务的 `GET /admin/stats`（`ADMIN_TOKEN` 鉴权）和监控站自己的探测；统计存在内存里，主服务重启后从零开始。
+
+**只在局域网访问**是两层防线：监控站按 TCP 对端地址过滤（只放行回环与私网网段，可 `MONITOR_ALLOW` 覆盖，绝不信任 `X-Forwarded-For` 一类可伪造头）；`SETUP_FIREWALL=1` 时 nftables 只对内网网段放行 8788。`ADMIN_TOKEN` 只存在于监控站进程内存/本机 env，页面不带任何凭据。
+
 ## 回滚
 
-- 环境变量：脚本每次改 env 前会备份成 `/etc/edge-smart-doh/env.bak-<时间>`，拷回去再 `systemctl restart edge-smart-doh`。
-- 防火墙：`/etc/nftables.conf.pre-doh-<时间>` 是替换前的备份，拷回去后 `nft delete table inet home_firewall && nft -f /etc/nftables.conf`。
+- 环境变量：脚本每次改 env 前会备份到仓库外的 `/var/backups/edge-smart-doh/env.<时间>`（目录 0700，含 `ADMIN_TOKEN` 的副本 0600），拷回去再 `systemctl restart edge-smart-doh`。
+- 防火墙：替换前备份到 `/var/backups/edge-smart-doh/nftables.conf.<时间>`，拷回去后 `nft delete table inet home_firewall && nft -f /etc/nftables.conf`。
 
 ## 已知限制
 

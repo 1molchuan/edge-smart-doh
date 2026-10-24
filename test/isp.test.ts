@@ -109,7 +109,7 @@ describe("pool layering: client prefix → operator → nationwide", () => {
     setLearnedPool(["1.1.1.1"], ["2606:4700::1"], 600, "aliyun");
     setLearnedPool(["3.3.3.3"], ["2606:4700::3"], 600, "hub", "isp:chinanet");
     const telecom = await preferredPool({}, [], true, config(), cache, "58.247.1/24", "isp:chinanet");
-    expect(telecom).toEqual({ ipv4: ["3.3.3.3", "1.1.1.1"], ipv6: ["2606:4700::3", "2606:4700::1"], scope: "isp:chinanet" });
+    expect(telecom).toEqual({ ipv4: ["1.1.1.1", "3.3.3.3"], ipv6: ["2606:4700::1", "2606:4700::3"], scope: "isp:chinanet" });
     const other = await preferredPool({}, [], true, config(), cache, "8.8.8/24", "isp:cmcc");
     expect(other).toEqual({ ipv4: ["1.1.1.1"], ipv6: ["2606:4700::1"], scope: undefined });
   });
@@ -131,14 +131,14 @@ describe("pool layering: client prefix → operator → nationwide", () => {
     expect(telecom.ipv4).toEqual(["3.3.3.3", "3.3.4.4"]);
     setLearnedPool(["3.3.3.3"], [], 600, "hub", "isp:chinanet");
     const thin = await preferredPool({}, [], true, config(), cache, undefined, "isp:chinanet");
-    expect(thin.ipv4).toEqual(["3.3.3.3", "1.0.1.1", "1.0.2.1", "1.0.3.1", "1.0.4.1", "1.0.5.1"]);
+    expect(thin.ipv4).toEqual(["1.0.1.1", "1.0.2.1", "1.0.3.1", "1.0.4.1", "1.0.5.1", "3.3.3.3"]);
   });
 
   it("fills each address family on its own, so an IPv4-only operator pool keeps the nationwide IPv6", async () => {
     setLearnedPool(["1.1.1.1"], ["2606:4700::1"], 600, "aliyun");
     setLearnedPool(["3.3.3.3"], [], 600, "hub", "isp:chinanet");
     const telecom = await preferredPool({}, [], true, config(), cache, undefined, "isp:chinanet");
-    expect(telecom).toEqual({ ipv4: ["3.3.3.3", "1.1.1.1"], ipv6: ["2606:4700::1"], scope: "isp:chinanet" });
+    expect(telecom).toEqual({ ipv4: ["1.1.1.1", "3.3.3.3"], ipv6: ["2606:4700::1"], scope: "isp:chinanet" });
   });
 
   it("puts a client's own prefix pool ahead of its operator pool", async () => {

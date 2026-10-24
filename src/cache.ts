@@ -46,22 +46,37 @@ export function normalizedCacheIdentity(query: DnsPacket, ecsIdentity: string, v
 
 let rotation = 0;
 
+/** FNV-1a: a stable 32-bit string hash. Only the distribution matters, not cryptographic strength. */
+function hashSeed(seed: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
 /**
  * Rotate the starting point of the A/AAAA answer set so clients that always dial the first
- * address (or hit a dead one and give up) spread across the pool. Applied on every serve,
- * including cache hits, so the cached byte order does not pin the whole TTL to one address.
- * Records of other types keep their position; CNAME chains stay ahead of the addresses.
+ * address (or hit a dead one and give up) spread across the pool. The offset is a hash of the
+ * client's prefix, not a global counter: one client keeps a stable order for the same pool, so
+ * its first address moves only when the pool's membership changes — a counter handed the same
+ * client a different edge IP on every resolve, and with CF's ~300s TTL that read as the client
+ * hopping edges every few minutes. Without a client identity (internal callers, tests) the
+ * counter still spreads untraceable callers. Applied on every serve, including cache hits, so
+ * the cached byte order does not pin the whole TTL to one address. Records of other types keep
+ * their position; CNAME chains stay ahead of the addresses.
  */
-export function rotateAddressRecords(packet: Uint8Array): Uint8Array {
+export function rotateAddressRecords(packet: Uint8Array, client?: string): Uint8Array {
   const parsed = parseDnsPacket(packet);
   const addresses = parsed.answers.filter((record) => record.type === DnsType.A || record.type === DnsType.AAAA);
   if (addresses.length < 2) return packet;
-  rotation = (rotation + 1) >>> 0;
+  const stable = client !== undefined && client.length > 0 ? hashSeed(client) : ((rotation = (rotation + 1) >>> 0));
   const perType = new Map<number, DnsPacket["answers"]>();
   for (const record of addresses) perType.set(record.type, [...(perType.get(record.type) ?? []), record]);
   const rotated = new Map<number, DnsPacket["answers"]>();
   for (const [type, records] of perType) {
-    const offset = rotation % records.length;
+    const offset = stable % records.length;
     rotated.set(type, [...records.slice(offset), ...records.slice(0, offset)]);
   }
   const cursor = new Map<number, number>();

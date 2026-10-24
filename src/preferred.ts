@@ -408,8 +408,9 @@ async function mergedDomainPool(domains: string[], config: AppConfig, cache: Cac
  * a narrower pool with only IPv4 does not hide the wider pool's IPv6 and a single address is never
  * served alone. `scope` names the narrower pools that contributed, so
  * callers can keep their answers out of the shared cache entry.
- * Answer ordering is rotated at serve time (see rotateAddressRecords), not here, so cached
- * responses spread clients across the pool too.
+ * Served ordering is canonical (sorted) and the rotation start is per client (see
+ * rotateAddressRecords): a client's first address changes only when the pool's membership does,
+ * so a hub refresh that reshuffles its list leaves every client where it was.
  */
 export async function preferredPool(
   explicit: { ipv4?: string[]; ipv6?: string[] },
@@ -449,7 +450,10 @@ export async function preferredPool(
         if (layer.scope) used.add(layer.scope);
         if (out.length >= MIN_SERVED_POOL) break;
       }
-      return out.length > 0 ? out : undefined;
+      // Served in a canonical order (sorted), never the report's: a pool refresh that merely
+      // reshuffles the same addresses must not move any client's first address — rotation is per
+      // client (see rotateAddressRecords), so membership is the only thing allowed to change it.
+      return out.length > 0 ? out.sort() : undefined;
     };
     const v4 = explicit.ipv4 ? undefined : fill("ipv4");
     const v6 = explicit.ipv6 || config.cfDropAaaa ? undefined : fill("ipv6");
@@ -457,8 +461,8 @@ export async function preferredPool(
     if (v6) ipv6 = v6;
   } else if (domains.length > 0 && (!explicit.ipv4 || !explicit.ipv6)) {
     const resolved = await mergedDomainPool(domains, config, cache);
-    if (!explicit.ipv4) ipv4 = resolved.ipv4;
-    if (!explicit.ipv6) ipv6 = resolved.ipv6;
+    if (!explicit.ipv4) ipv4 = [...resolved.ipv4].sort();
+    if (!explicit.ipv6) ipv6 = [...resolved.ipv6].sort();
   }
   if (config.cfDropAaaa) ipv6 = [];
   return { ipv4, ipv6, scope: used.size > 0 ? [...used].join(",") : undefined };

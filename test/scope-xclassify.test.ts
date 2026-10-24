@@ -140,7 +140,7 @@ describe("client-scoped learned pools", () => {
     setLearnedPool(["1.1.1.1"], [], 600, "aliyun");
     setLearnedPool(["2.2.2.2"], [], 600, "home", "58.247.22/24");
     const home = await preferredPool({}, [], true, config(), cache, "58.247.22/24");
-    expect(home.ipv4).toEqual(["2.2.2.2", "1.1.1.1"]); // topped up from the nationwide pool
+    expect(home.ipv4).toEqual(["1.1.1.1", "2.2.2.2"]); // topped up from the nationwide pool, canonical order
     expect(home.scope).toBe("58.247.22/24");
     const other = await preferredPool({}, [], true, config(), cache, "23.94.182/24");
     expect(other.ipv4).toEqual(["1.1.1.1"]);

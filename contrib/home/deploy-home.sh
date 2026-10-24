@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  edge-smart-doh 家庭/小机直连部署（8443 + acme.sh DNS-01 + DDNS）
+#  edge-smart-doh 家庭/小机直连部署（8443 + 证书 + DDNS）
+#  证书：先探测机器统一证书（如 /etc/ssl/wildcard 的通配符，SAN 覆盖 DoH 域名即命中）
+#        ——命中只引用、绝不代签代管（续期/权限/reload 归机器统一环节）；没有才
+#        acme.sh DNS-01 自签到 /etc/ssl/doh（root cron 自动续期）。
 #  位置：仓库 contrib/home/deploy-home.sh；上游信任模型见 contrib/home/README.md
 #  用法：sudo bash contrib/home/deploy-home.sh    （幂等，可反复执行）
 #  交互：仅在需要时——首次问 DoH 域名（存 /etc/edge-smart-doh/deploy.conf，重跑不再问）；
@@ -47,7 +50,12 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 ENV_FILE=/etc/edge-smart-doh/env
 CF_TOKEN_FILE=/etc/edge-smart-doh/cf-token
 CONF_FILE=/etc/edge-smart-doh/deploy.conf
+CADDYFILE=/etc/caddy/Caddyfile
 ACME=/root/.acme.sh/acme.sh
+
+# 备份一律落在 git 仓库之外：env/relay.env 的副本含 ADMIN_TOKEN，绝不能被提交
+# （本仓库挂着 origin/fork 两个 GitHub remote）。目录 0700，含密文件 0600。
+BACKUP_DIR=/var/backups/edge-smart-doh
 
 log()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m  [ok] %s\033[0m\n' "$*"; }
@@ -66,6 +74,20 @@ set_env_value() {  # set_env_value KEY VALUE
   fi
 }
 env_has_value() { grep -qE "^$1=.+" "$ENV_FILE"; }
+
+# 备份到仓库外的 $BACKUP_DIR（0700）；含 ADMIN_TOKEN 的文件副本一律 0600。
+# 源文件不存在视为无需备份（返回空）；失败返回非 0。
+backup_file() {  # backup_file SRC → 打印备份路径
+  local src="$1" dest
+  [[ -e "$src" ]] || return 0
+  install -d -m 0700 "$BACKUP_DIR" || return 1
+  dest="$BACKUP_DIR/$(basename -- "$src").$STAMP"
+  cp -a -- "$src" "$dest" || return 1
+  case "$src" in
+    "$ENV_FILE"|/etc/edge-smart-doh/relay.env) chmod 600 "$dest" ;;
+  esac
+  printf '%s' "$dest"
+}
 
 # 出口公网 IPv4 探测：必须直连（--noproxy，走代理拿到的是代理出口）；国内源互为备份。
 # 拿到私网/CGNAT/回环段视为失败——代理 TUN 全局接管时会这样。
@@ -153,13 +175,19 @@ log "edge-smart-doh 部署开始（日志：$LOG_FILE）OPEN_PUBLIC=$OPEN_PUBLIC
 log "步骤 1/8：依赖（nodejs/npm/jq/curl + caddy←backports）"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y nodejs npm openssl curl jq dnsutils
+# nodejs/npm 按需安装：NodeSource 等第三方源的 nodejs 自带 npm 且与 Debian 的 npm 包互斥，
+# 机器上已有 node/npm（比如装过 NodeSource 24）时再请求 Debian 的 npm 会让 apt 在
+# "换回 Debian nodejs"上解析失败（2026-10-23 实录）。命令在就跳过，缺哪个补哪个。
+NODE_PKGS=()
+command -v node >/dev/null 2>&1 || NODE_PKGS+=(nodejs)
+command -v npm  >/dev/null 2>&1 || NODE_PKGS+=(npm)
+apt-get install -y openssl curl jq dnsutils ${NODE_PKGS[@]+"${NODE_PKGS[@]}"}
 if [[ "$OPEN_PUBLIC" == "1" ]]; then
   # main 源的 caddy 是 2.6.2，缺 client_ip matcher（≥2.7 才有），必须 backports 的 2.11.x
   apt-get install -y -t trixie-backports caddy || die "caddy(backports) 安装失败：检查 trixie-backports 源"
   ok "caddy $(caddy version 2>/dev/null | awk '{print $1}')"
 fi
-ok "node $(node --version)"
+ok "node $(node --version)（npm $(npm --version 2>/dev/null || echo '?')）"
 
 # ---------------------------------------------------------------------------
 # 2. 构建
@@ -184,7 +212,10 @@ getent passwd edge-smart-doh >/dev/null 2>&1 || useradd --system --no-create-hom
 install -D -m 0644 "$PROJECT_DIR/dist/node.mjs" /opt/edge-smart-doh/node.mjs
 
 [[ -f "$ENV_FILE" ]] || install -D -m 0600 "$PROJECT_DIR/deploy/edge-smart-doh.env.example" "$ENV_FILE"
-cp -a "$ENV_FILE" "$ENV_FILE.bak-$STAMP"   # 下面会改 env，先备份（0600 权限一并保留）
+# 下面会改 env，先备份。备份落在仓库外的 $BACKUP_DIR（0700）——env 副本含 ADMIN_TOKEN，
+# 绝不能写进本仓库（仓库挂着 origin/fork 两个 GitHub remote）
+ENV_BAK="$(backup_file "$ENV_FILE")" || die "备份 $ENV_FILE 失败"
+ok "env 已备份 → ${ENV_BAK:-（无文件，跳过）}"
 
 # ---- 上游模式决策：国内环境必须解决"上游被墙/被污染"，否则被污染域名解析不到 ----
 DROPIN_PROXY=/etc/systemd/system/edge-smart-doh.service.d/proxy.conf
@@ -353,6 +384,31 @@ else
   rm -f "$DROPIN_PROXY"
 fi
 
+# ---- 3c：SNI 中转已随本仓库移除（与 DoH 无关）：拆除历史安装 ----
+# 旧版部署过的机器在这里统一拆除，不留孤儿守护对着已不存在的 /admin/relay-* 空转；
+# 必须放在服务 restart 之前：RELAY_* env 键要随这次重启一起消失。
+if [[ -f /etc/systemd/system/edge-smart-doh-relay.service || -f /etc/edge-smart-doh/relay.env || -f /opt/edge-smart-doh/relay.mjs ]]; then
+  log "步骤 3c：检测到旧的 SNI 中转安装，开始拆除（功能已移除）"
+  RELAY_OLD_IP="$(sed -n 's/^RELAY_LISTEN_IP=//p' /etc/edge-smart-doh/relay.env 2>/dev/null | head -1)"
+  RELAY_ENV_BAK="$(backup_file /etc/edge-smart-doh/relay.env)" || true
+  [[ -n "$RELAY_ENV_BAK" ]] && ok "relay.env 已备份 → $RELAY_ENV_BAK"
+  systemctl disable --now edge-smart-doh-relay.service edge-smart-doh-relay-ip.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/edge-smart-doh-relay.service \
+        /etc/systemd/system/edge-smart-doh-relay-ip.service \
+        /etc/edge-smart-doh/relay.env \
+        /opt/edge-smart-doh/relay.mjs /opt/edge-smart-doh/relay-DESIGN.md \
+        /var/lib/edge-smart-doh/relay-config.json
+  rm -rf /etc/systemd/system/edge-smart-doh-relay.service.d
+  sed -i -E '/^(RELAY_MODE|RELAY_IP|RELAY_DOMAINS|RELAY_EXCLUDE_DOMAINS|RELAY_FORCED_MODE|RELAY_FORCED_DOMAINS|RELAY_CONFIG_PATH)=/d' "$ENV_FILE"
+  sed -i '/^RELAY_IP_CFG=/d' "$CONF_FILE" 2>/dev/null || true
+  ok "relay 守护、env 键与持久化文件已清除（主服务重启后名单域名立即回到直连/池答案）"
+  if [[ -n "$RELAY_OLD_IP" ]] && ip -4 addr show 2>/dev/null | grep -q "inet ${RELAY_OLD_IP}/"; then
+    warn "第二内网 IP ${RELAY_OLD_IP} 仍在网卡上（本次不动它）：其持久化单元已拆除，重启后自然消失；若确认无其他用途，可手工 ip addr del 移除"
+  fi
+else
+  log "步骤 3c：SNI 中转（无历史安装，跳过）"
+fi
+
 systemctl daemon-reload
 systemctl enable edge-smart-doh >/dev/null 2>&1
 # 重跑场景：服务已在运行时 enable 不会重启——env/代理 drop-in 的改动必须 restart 才生效
@@ -376,6 +432,13 @@ for _ in $(seq 1 15); do curl -fsS http://127.0.0.1:8787/health >/dev/null 2>&1 
 curl -fsS http://127.0.0.1:8787/health >/dev/null \
   || die "服务 15 秒内未就绪：journalctl -u edge-smart-doh -n 30（若见 --import 报错=undici/Node 版本问题）"
 ok "edge-smart-doh 运行中；ADMIN_TOKEN 在 $TOKEN_FILE"
+
+# ---- 局域网监测站（http://LAN_IP:8788；应用层只放行私网来源，详见 contrib/home/monitor/）----
+if [[ -f "$PROJECT_DIR/contrib/home/install-monitor.sh" ]]; then
+  bash "$PROJECT_DIR/contrib/home/install-monitor.sh" || warn "监测站安装失败（不影响主服务，可稍后单独重跑 install-monitor.sh）"
+else
+  warn "缺少 contrib/home/install-monitor.sh，跳过监测站安装"
+fi
 
 # ---------------------------------------------------------------------------
 # 4. cfhub → 本机 同步（纯出站）
@@ -469,29 +532,51 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. 证书（acme.sh DNS-01，全程 root）
+# 6. 证书：先探测机器统一证书（如 /etc/ssl/wildcard 的通配符），命中则只引用不签发；
+#    没有才走 acme.sh DNS-01 自签到 /etc/ssl/doh（续期由 root cron 自动完成）
 # ---------------------------------------------------------------------------
 if [[ "$OPEN_PUBLIC" != "1" ]]; then
   log "OPEN_PUBLIC=0：跳过 6/7 步与 8443/DDNS（仅内网部署完成）"
 else
-  log "步骤 6/8：证书（acme.sh DNS-01，root 模式）"
+  log "步骤 6/8：证书（先探测机器统一证书，没有才 acme.sh DNS-01 签发）"
 
-  if [[ ! -x "$ACME" ]]; then
-    # root 装：续期/写证书/reload 全在 root cron，免 sudo
-    #（用户装 + sudo install-cert 会在 ~/.acme.sh 留 root 属主文件，60 天后用户 cron 续期写入失败）
-    if [[ -z "$ACME_EMAIL" ]]; then
-      read -rp "acme.sh 联系邮箱: " ACME_EMAIL
-      [[ -n "$ACME_EMAIL" ]] && save_conf ACME_EMAIL "$ACME_EMAIL"
+  # ---- 6a. 探测：/etc/ssl/<dir>/ 下成对 fullchain+privkey，SAN 覆盖 DOH_DOMAIN，取剩余
+  #      有效期最长的一份（机器同时留有旧单域证书时新证书赢）。/etc/ssl/doh 是本脚本自签
+  #      目录，刻意排除——它走下面的原流程幂等续装；系统目录（certs/private/newcerts）排除。
+  CERT_DIR=""
+  detect_unified_cert() {
+    local best=0 dir chain notafter ts
+    for dir in /etc/ssl/wildcard $(find /etc/ssl -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort); do
+      case "$dir" in /etc/ssl/certs|/etc/ssl/private|/etc/ssl/newcerts|/etc/ssl/doh) continue ;; esac
+      chain="$dir/fullchain.pem"
+      [[ -f "$chain" && -f "$dir/privkey.pem" ]] || continue
+      openssl x509 -checkhost "$DOH_DOMAIN" -noout -in "$chain" >/dev/null 2>&1 || continue
+      notafter="$(openssl x509 -noout -enddate -in "$chain" 2>/dev/null | cut -d= -f2)"
+      ts="$(date -u -d "$notafter" +%s 2>/dev/null)" || continue
+      if (( ts > best )); then best=$ts; CERT_DIR="$dir"; fi
+    done
+  }
+  detect_unified_cert
+
+  if [[ -n "$CERT_DIR" ]]; then
+    # 命中机器统一证书：签发/续期/权限/reload 全归机器统一环节（如 root cron 的 acme.sh --cron
+    # + --reloadcmd），本脚本只引用路径，绝不代签代管。过期/临期的处置也归它——这里只拦挡明错。
+    if ! openssl x509 -checkend 0 -noout -in "$CERT_DIR/fullchain.pem" >/dev/null 2>&1; then
+      die "机器统一证书 $CERT_DIR 已过期：续期归机器统一环节（如 root cron acme.sh --cron），修好它再重跑本脚本"
     fi
-    curl -s https://get.acme.sh | sh -s "email=$ACME_EMAIL" >/dev/null \
-      || die "acme.sh 安装器下载失败（网络）"
-    [[ -x "$ACME" ]] || die "acme.sh 安装失败"
-    ok "acme.sh 已装到 /root/.acme.sh（root cron 自动续期）"
+    openssl x509 -checkend 604800 -noout -in "$CERT_DIR/fullchain.pem" >/dev/null 2>&1 \
+      || warn "机器统一证书 7 天内到期：续期归机器统一环节（本脚本不代管）"
+    if id caddy >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1 \
+       && ! runuser -u caddy -- test -r "$CERT_DIR/privkey.pem" 2>/dev/null; then
+      warn "caddy 读不了 $CERT_DIR/privkey.pem：让统一环节的 reloadcmd 管权限（chgrp caddy + chmod 640），或手工修一次"
+    fi
+    ok "复用机器统一证书 $CERT_DIR（SAN 覆盖 $DOH_DOMAIN，到期 $(openssl x509 -noout -enddate -in "$CERT_DIR/fullchain.pem" | cut -d= -f2)）"
+    ok "跳过 acme.sh 签发：本脚本只引用，续期/权限/reload 由机器统一环节负责"
   fi
 
-  # token 优先级：配置区 > 已存文件 > 交互输入
+  # token 优先级：配置区 > 已存文件 > 交互输入（复用统一证书时只有 DDNS 需要它）
   NEED_TOKEN=0
-  [[ -f "/root/.acme.sh/${DOH_DOMAIN}_ecc/${DOH_DOMAIN}.conf" ]] || NEED_TOKEN=1
+  [[ -z "$CERT_DIR" && ! -f "/root/.acme.sh/${DOH_DOMAIN}_ecc/${DOH_DOMAIN}.conf" ]] && NEED_TOKEN=1
   [[ "$SETUP_DDNS" == "1" && ! -s "$CF_TOKEN_FILE" ]] && NEED_TOKEN=1
   if [[ "$NEED_TOKEN" == "1" && -z "$CF_TOKEN" && -s "$CF_TOKEN_FILE" ]]; then
     CF_TOKEN="$(cat "$CF_TOKEN_FILE")"
@@ -506,43 +591,52 @@ else
     ok "CF Token 已存 $CF_TOKEN_FILE (600)（acme.sh/DDNS 共用）"
   fi
 
-  "$ACME" --set-default-ca --server letsencrypt >/dev/null
-  export CF_Token="${CF_TOKEN:-$(cat "$CF_TOKEN_FILE" 2>/dev/null || true)}"
-  set +e
-  "$ACME" --issue --dns dns_cf -d "$DOH_DOMAIN" --ecc 2>&1 | tail -3
-  RC=${PIPESTATUS[0]}
-  set -e
-  # rc=2 = "Domains not changed"（已签发且未到续期），幂等重跑的正常路径
-  [[ $RC -eq 0 || $RC -eq 2 ]] || die "acme.sh 签发失败 (rc=$RC)：先查 token 是否含 Zone:Read"
-  [[ $RC -eq 2 ]] && ok "证书已存在且无需续期" || ok "证书签发成功"
+  # ---- 6b. 没有统一证书：acme.sh DNS-01 自签（原流程）
+  if [[ -z "$CERT_DIR" ]]; then
+    if [[ ! -x "$ACME" ]]; then
+      # root 装：续期/写证书/reload 全在 root cron，免 sudo
+      #（用户装 + sudo install-cert 会在 ~/.acme.sh 留 root 属主文件，60 天后用户 cron 续期写入失败）
+      if [[ -z "$ACME_EMAIL" ]]; then
+        read -rp "acme.sh 联系邮箱: " ACME_EMAIL
+        [[ -n "$ACME_EMAIL" ]] && save_conf ACME_EMAIL "$ACME_EMAIL"
+      fi
+      curl -s https://get.acme.sh | sh -s "email=$ACME_EMAIL" >/dev/null \
+        || die "acme.sh 安装器下载失败（网络）"
+      [[ -x "$ACME" ]] || die "acme.sh 安装失败"
+      ok "acme.sh 已装到 /root/.acme.sh（root cron 自动续期）"
+    fi
 
-  install -d -m 0750 -o root -g caddy /etc/ssl/doh
-  # reloadcmd 维护 caddy 可读权限（caddy.service 是 User=caddy，0600 root 私钥读不了）；
-  # 首次执行时 caddy 可能未启动，reload 失败无害——下一步会带新证书启动
-  "$ACME" --install-cert -d "$DOH_DOMAIN" --ecc \
-    --fullchain-file /etc/ssl/doh/fullchain.pem \
-    --key-file      /etc/ssl/doh/privkey.pem \
-    --reloadcmd 'chgrp caddy /etc/ssl/doh/privkey.pem; chmod 640 /etc/ssl/doh/privkey.pem; chmod 644 /etc/ssl/doh/fullchain.pem; systemctl reload caddy || true'
-  openssl x509 -checkend 2592000 -noout -in /etc/ssl/doh/fullchain.pem \
-    && ok "证书就位（30 天内有效；续期由 root cron 自动完成）" \
-    || die "证书文件异常"
+    "$ACME" --set-default-ca --server letsencrypt >/dev/null
+    export CF_Token="${CF_TOKEN:-$(cat "$CF_TOKEN_FILE" 2>/dev/null || true)}"
+    set +e
+    "$ACME" --issue --dns dns_cf -d "$DOH_DOMAIN" --ecc 2>&1 | tail -3
+    RC=${PIPESTATUS[0]}
+    set -e
+    # rc=2 = "Domains not changed"（已签发且未到续期），幂等重跑的正常路径
+    [[ $RC -eq 0 || $RC -eq 2 ]] || die "acme.sh 签发失败 (rc=$RC)：先查 token 是否含 Zone:Read"
+    [[ $RC -eq 2 ]] && ok "证书已存在且无需续期" || ok "证书签发成功"
+
+    install -d -m 0750 -o root -g caddy /etc/ssl/doh
+    # reloadcmd 维护 caddy 可读权限（caddy.service 是 User=caddy，0600 root 私钥读不了）；
+    # 首次执行时 caddy 可能未启动，reload 失败无害——下一步会带新证书启动
+    "$ACME" --install-cert -d "$DOH_DOMAIN" --ecc \
+      --fullchain-file /etc/ssl/doh/fullchain.pem \
+      --key-file      /etc/ssl/doh/privkey.pem \
+      --reloadcmd 'chgrp caddy /etc/ssl/doh/privkey.pem; chmod 640 /etc/ssl/doh/privkey.pem; chmod 644 /etc/ssl/doh/fullchain.pem; systemctl reload caddy || true'
+    CERT_DIR=/etc/ssl/doh
+  fi
+  openssl x509 -checkend 2592000 -noout -in "$CERT_DIR/fullchain.pem" 2>/dev/null \
+    && ok "证书就位（30 天内有效）" \
+    || warn "证书 $CERT_DIR 剩余有效期不足 30 天（已通过上面的检查，继续）"
 
   # -------------------------------------------------------------------------
   # 7. Caddy 反代 8443
   # -------------------------------------------------------------------------
   log "步骤 7/8：Caddy 反代 8443"
 
-  tee /etc/caddy/Caddyfile > /dev/null <<EOF
-{
-	https_port 8443
-	servers {
-		# 路由器只转 TCP：不通告 h3（想开 HTTP/3：路由器补转 UDP 8443 + 删本行 + 防火墙加 udp dport 8443）
-		protocols h1 h2
-	}
-}
-
+  CADDY_SITE_BLOCK="$(cat <<EOF
 ${DOH_DOMAIN}:8443 {
-	tls /etc/ssl/doh/fullchain.pem /etc/ssl/doh/privkey.pem
+	tls ${CERT_DIR}/fullchain.pem ${CERT_DIR}/privkey.pem
 
 	# /admin 永不对外（应用层另有 token 鉴权，这里降噪）
 	@admin path /admin/*
@@ -569,6 +663,54 @@ ${DOH_DOMAIN}:8443 {
 	}
 }
 EOF
+)"
+
+  if [[ "$CERT_DIR" == "/etc/ssl/doh" ]]; then
+    # 自签流程：Caddyfile 由本脚本全权管理（全局块 + 唯一站点），整写
+    tee "$CADDYFILE" > /dev/null <<EOF
+{
+	https_port 8443
+	servers {
+		# 路由器只转 TCP：不通告 h3（想开 HTTP/3：路由器补转 UDP 8443 + 删本行 + 防火墙加 udp dport 8443）
+		protocols h1 h2
+	}
+}
+
+${CADDY_SITE_BLOCK}
+EOF
+  else
+    # 复用机器统一证书：Caddyfile 归机器管（可能还有 vault 等别的站点），绝不整写——只动自己的站点块。
+    # 站点块定位用 awk 范围（${DOH_DOMAIN}:8443 { ... }），判定只看块内的 tls 行——
+    # 别的站点（vault 等）也指向同一份统一证书，全文件 grep 会被它们误命中。
+    CADDY_SITE_FILE="$(dirname "$CADDYFILE")/edge-smart-doh.caddy"
+    site_tls_line() {
+      awk -v site="${DOH_DOMAIN}:8443 {" '$0 == site {inblock=1; next} inblock && /^}/ {inblock=0} inblock && $1 == "tls"' "$CADDYFILE" 2>/dev/null
+    }
+    if grep -qF "${DOH_DOMAIN}:8443 {" "$CADDYFILE" 2>/dev/null; then
+      if site_tls_line | grep -qF "${CERT_DIR}/fullchain.pem"; then
+        ok "Caddyfile 站点 ${DOH_DOMAIN}:8443 已指向统一证书（$CERT_DIR），未改动"
+      elif site_tls_line | grep -qF "/etc/ssl/doh/fullchain.pem"; then
+        # 旧版脚本整写的 tls 行：外科手术切到统一证书
+        CADDY_BAK="$(backup_file "$CADDYFILE")" || die "备份 $CADDYFILE 失败"
+        sed -i "s|tls /etc/ssl/doh/fullchain.pem /etc/ssl/doh/privkey.pem|tls ${CERT_DIR}/fullchain.pem ${CERT_DIR}/privkey.pem|" "$CADDYFILE"
+        ok "站点 ${DOH_DOMAIN}:8443 的 tls 已从 /etc/ssl/doh 切到 $CERT_DIR（备份 $CADDY_BAK）"
+      else
+        warn "站点 ${DOH_DOMAIN}:8443 的 tls 行不是脚本管理的样式，未改动——请手工核对指向 ${CERT_DIR}"
+      fi
+    else
+      # 站点还不存在：写独立 site 文件 + import（全局选项块不能放 site 文件，需主文件已有 https_port 8443）
+      printf '%s\n' "$CADDY_SITE_BLOCK" > "$CADDY_SITE_FILE"
+      if ! grep -qE '^[[:space:]]*import[[:space:]]+edge-smart-doh\.caddy' "$CADDYFILE" 2>/dev/null; then
+        CADDY_BAK="$(backup_file "$CADDYFILE")" || die "备份 $CADDYFILE 失败"
+        printf '\nimport edge-smart-doh.caddy\n' >> "$CADDYFILE"
+        ok "站点写入 $CADDY_SITE_FILE 并在主 Caddyfile 追加 import（备份 $CADDY_BAK）"
+      else
+        ok "站点文件 $CADDY_SITE_FILE 已更新（import 已存在）"
+      fi
+      grep -q 'https_port 8443' "$CADDYFILE" \
+        || warn "主 Caddyfile 缺全局 https_port 8443（site 文件里放不了全局选项）：请手工加到最前面的全局块，否则 8443 不是 HTTPS"
+    fi
+  fi
 
   caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
     || die "Caddyfile 校验失败（未 reload）"
@@ -586,12 +728,25 @@ fi
 if [[ "$SETUP_FIREWALL" == "1" ]]; then
 log "步骤 8/8：防火墙（8787 仅内网${FIREWALL_8443:+；8443 公网}）"
 
-[[ -f /etc/nftables.conf ]] && cp -a /etc/nftables.conf "/etc/nftables.conf.pre-doh-$STAMP"
+# 本文件刻意没有 "flush ruleset"（为了不清掉 Docker 运行时生成的表），所以
+# `systemctl reload nftables`（= nft -f 整份文件）会在内核里把规则重复追加、越 reload 越多。
+# 本步骤一律不走 reload：写文件 → 语法校验 → 删掉本表的旧内容 → 整体载入。
+# 写前查一次内核：旧版部署可能残留 relay 的 443 放行规则（本文件无 flush，历次 reload 累积）。
+NFT_BAK=""
+if [[ -f /etc/nftables.conf ]]; then
+  NFT_BAK="$(backup_file /etc/nftables.conf)" || die "备份 /etc/nftables.conf 失败"
+  ok "旧 /etc/nftables.conf 已备份 → $NFT_BAK"
+fi
+NFT_RELAY_STALE="$(nft list ruleset 2>/dev/null | grep -cF 'tcp dport 443 accept' || true)"
+[[ "${NFT_RELAY_STALE:-0}" != "0" ]] \
+  && warn "内核里有 ${NFT_RELAY_STALE} 条旧 relay 443 放行规则——下方「先删本表再整体载入」会一并清掉"
 
 tee /etc/nftables.conf > /dev/null <<EOF
 #!/usr/sbin/nft -f
 # 由 contrib/home/deploy-home.sh 生成：最小入站 + edge-smart-doh 放行
-# 注意：不要加 "flush ruleset"，否则会清掉 Docker 运行时生成的规则
+# 注意：不要加 "flush ruleset"，否则会清掉 Docker 运行时生成的规则；
+#       正因如此，`systemctl reload nftables` 会重复追加规则、越积越多——
+#       改规则请重跑本脚本（先删本表再整体载入，可重复执行）
 
 table inet home_firewall {
   chain input {
@@ -617,6 +772,8 @@ table inet home_firewall {
 ${FIREWALL_8443}
     # 8787：明文 DoH 仅内网直连，绝不放公网
     ip saddr ${LAN_CIDR} tcp dport 8787 accept
+    # 8788：局域网监测站（应用层另有私网来源过滤，这里在网络层再限一次）
+    ip saddr ${LAN_CIDR} tcp dport 8788 accept
 
     # 其余入站：丢弃并计数
     counter drop
@@ -625,7 +782,7 @@ ${FIREWALL_8443}
 EOF
 
 nft -c -f /etc/nftables.conf >/dev/null 2>&1 || die "nft 语法校验失败（未做任何改动）"
-nft delete table inet home_firewall 2>/dev/null || true   # 重复 nft -f 会叠加规则，先删再载
+nft delete table inet home_firewall 2>/dev/null || true   # 文件没有 flush，重复 nft -f 会累积；先删本表再载（残留的 relay 443 规则随之消失）
 nft -f /etc/nftables.conf
 systemctl enable nftables >/dev/null 2>&1 || true
 nft list table inet home_firewall >/dev/null \
@@ -719,7 +876,7 @@ elif [[ -n "$PROXY_ADDR" ]]; then
 else
   printf '  上游模式     : 国内无代理（降级：被污染域名解析不到）\n'
 fi
-for S in edge-smart-doh cfhub-sync.timer caddy cf-ddns.timer; do
+for S in edge-smart-doh edge-smart-doh-monitor cfhub-sync.timer caddy cf-ddns.timer; do
   printf '  %-18s %s\n' "$S" "$(systemctl is-active "$S" 2>/dev/null || true)"
 done
 [[ -f /etc/ssl/doh/fullchain.pem ]] \
@@ -729,6 +886,7 @@ if [[ "$OPEN_PUBLIC" == "1" ]]; then
   cat <<EOF
 
   内网 DoH   : http://$IP_ADDR:8787/dns-query
+  内网监测   : http://$IP_ADDR:8788  （局域网监测站，仅内网可访问）
   公网 DoH   : https://$DOH_DOMAIN:8443/dns-query
 
   待办（脚本做不了的）：
@@ -743,6 +901,7 @@ else
   cat <<EOF
 
   内网 DoH   : http://$IP_ADDR:8787/dns-query
+  内网监测   : http://$IP_ADDR:8788  （局域网监测站，仅内网可访问）
   公网入口未开（OPEN_PUBLIC=0）。想开公网：改配置区 OPEN_PUBLIC=1 后重跑本脚本
 EOF
 fi

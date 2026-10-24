@@ -9,6 +9,14 @@ set -euo pipefail
 command -v node >/dev/null || { echo "node not found: not restarting" >&2; exit 1; }
 ENV_FILE=${ENV_FILE:-/etc/edge-smart-doh/env}
 ADMIN=${ADMIN:-http://127.0.0.1:8787}
+# A restart alone keeps running whatever is installed: deploy a newer repo build first, so
+# "改完代码 → 跑这个脚本" 也生效（正式部署由 deploy-home.sh 做，这里只做增量同步）。
+PROJECT_DIR=${PROJECT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
+if [[ -f /opt/edge-smart-doh/node.mjs && -f "$PROJECT_DIR/dist/node.mjs" \
+      && "$PROJECT_DIR/dist/node.mjs" -nt /opt/edge-smart-doh/node.mjs ]]; then
+  install -m 0644 "$PROJECT_DIR/dist/node.mjs" /opt/edge-smart-doh/node.mjs
+  echo "installed new build: $PROJECT_DIR/dist/node.mjs -> /opt/edge-smart-doh/node.mjs"
+fi
 TOKEN=$(grep '^ADMIN_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
 STATE=$(mktemp); HOSTPOOLS=$(mktemp)
 trap 'rm -f "$STATE" "$HOSTPOOLS"' EXIT
